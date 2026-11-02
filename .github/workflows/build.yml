@@ -2,13 +2,17 @@ name: Derleme
 
 # Her main gönderiminde Windows ve Mac derlenir, numaralı bir GitHub sürümü yayınlanır; uygulamalar
 # kendilerini bu sürümden günceller. Sürüm numarası = çalıştırma numarası.
+#
+# Güven: sürüm bildirgesi (manifest.txt: sürüm + dosya özetleri) projenin imza anahtarıyla
+# (MAC_SIGN_P12; Mac uygulamasını da imzalar) imzalanır; uygulamalar yalnız bu imzayı taşıyan
+# güncellemeyi kurar. Çatallar ve PR'lar bu iş akışını tetikleyemez (gizli değişkenlere erişemez).
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   AYNA_BUILD: ${{ github.run_number }}
@@ -19,14 +23,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Rust araç zinciri
         run: rustup toolchain install stable --profile minimal
       - name: Test
-        run: cargo test --release
+        run: cargo test --release --locked
       - name: Derle
         shell: bash
         run: |
-          cargo build --release
+          cargo build --release --locked
           cp target/release/iphone-ayna.exe iPhoneAyna.exe
       - uses: actions/upload-artifact@v4
         with:
@@ -38,6 +44,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Derle, imzala ve paketle
         env:
           MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
@@ -53,19 +61,38 @@ jobs:
   release:
     name: Sürüm yayınla
     needs: [windows, mac]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Bildirgeyi imzala
+        env:
+          MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
+          MAC_SIGN_PASSWORD: ${{ secrets.MAC_SIGN_PASSWORD }}
+        run: |
+          cd dist
+          umask 077
+          printf '%s' "$MAC_SIGN_P12" | base64 --decode > sign.p12
+          openssl pkcs12 -in sign.p12 -nocerts -nodes -legacy -passin env:MAC_SIGN_PASSWORD -out key.pem
+          openssl pkcs12 -in sign.p12 -nokeys -legacy -passin env:MAC_SIGN_PASSWORD | openssl x509 -pubkey -noout > pub.pem
+          rm -f sign.p12
+          { echo "AYNA-SURUM ${AYNA_BUILD}"; sha256sum iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg; } > manifest.txt
+          openssl dgst -sha256 -sign key.pem -out manifest.bin manifest.txt
+          rm -f key.pem
+          openssl dgst -sha256 -verify pub.pem -signature manifest.bin manifest.txt
+          od -An -tx1 -v manifest.bin | tr -d ' \n' > manifest.sig
+          rm -f manifest.bin pub.pem
+          cat manifest.txt
       - name: Yayınla
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg > SHA256SUMS.txt
-          gh release create "v${AYNA_BUILD}" iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg SHA256SUMS.txt \
+          gh release create "v${AYNA_BUILD}" iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Sürüm ${AYNA_BUILD}" --notes-file SHA256SUMS.txt
+            --title "Sürüm ${AYNA_BUILD}" --notes-file manifest.txt

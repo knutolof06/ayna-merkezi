@@ -42,6 +42,32 @@ pub fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8], len: usize) -> Option<Vec<u8>>
     Some(out)
 }
 
+/// RSA PKCS#1 v1.5 + SHA-256 imza doğrulaması (açık anahtar: büyük uçlu modül ve üs).
+pub fn rsa_sha256_verify(modulus: &[u8], exponent: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let Some(hash) = sha256(msg) else { return false };
+    let mut blob = Vec::with_capacity(24 + exponent.len() + modulus.len());
+    blob.extend_from_slice(&BCRYPT_RSAPUBLIC_MAGIC.0.to_le_bytes());
+    blob.extend_from_slice(&((modulus.len() * 8) as u32).to_le_bytes());
+    blob.extend_from_slice(&(exponent.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&(modulus.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(&0u32.to_le_bytes());
+    blob.extend_from_slice(exponent);
+    blob.extend_from_slice(modulus);
+    unsafe {
+        let mut key = BCRYPT_KEY_HANDLE::default();
+        if BCryptImportKeyPair(BCRYPT_RSA_ALG_HANDLE, BCRYPT_KEY_HANDLE::default(), BCRYPT_RSAPUBLIC_BLOB, &mut key, &blob, 0)
+            .is_err()
+        {
+            return false;
+        }
+        let pad = BCRYPT_PKCS1_PADDING_INFO { pszAlgId: BCRYPT_SHA256_ALGORITHM };
+        let ok = BCryptVerifySignature(key, Some(&pad as *const _ as *const core::ffi::c_void), &hash, sig, BCRYPT_PAD_PKCS1).is_ok();
+        let _ = BCryptDestroyKey(key);
+        ok
+    }
+}
+
 /// Sabit sürede karşılaştırma.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -243,6 +269,15 @@ mod tests {
         let info: Vec<u8> = (0xf0..=0xf9).collect();
         let okm = hkdf(&ikm, &salt, &info, 42).unwrap();
         assert_eq!(hex(&okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    }
+
+    #[test]
+    fn rsa_signature_verifies_and_rejects_tampering() {
+        let m = unhex("ba9db383ef417f28f92532aa438bed43bb05b3f60b7a2fdc6ce85a227c55d5b4194bd966ca133c0ffdd303b303b59e70a35fbb867e25ce3cf1a3bf188683f1d28f8f2754a209920be3b4b03bbaf0de84dbd5509f3dbcee22b33ec08ddc59ae5905c05203df0dba2b1c98abcf07fe9d6181ba4299b6b873ae87783421dc02447c2dd021d34af9c8a9a9ff8e6be60b2f2dfcd91c17e657d3d48451327cc33690eb07cd08b39e1049f09d2645d060c70a02646b3ef446157474acef0b27cead03f766b546c90f9ded73429e29d6f520a2356bd223d89d98d5a50a9897f3df4077847d5fbbb82f6eb3520bf9351bb95b5b261db1e32482d3c51c2a66228e84ce00fb").unwrap();
+        let sig = unhex("5d5009e79297aec1db3862d7a092533c8586ce487676d6e42ca9900630074e49a6887daf869ae6648149c2c2022ef1d62fd2daef4b7d5cabc2855c8e8561e189cb6473096b77777035c7763444edf986211650d074691a5557a7e34c10e2399a5a97933e5ad86445305588ac871371eb74751dcead7f206bbd395a11e7f9fce055ade17f4e7d392508cf4fbf05136156568627a992b357d774c225010db0babc80d728b5e21670561fea4dd825b25abe246a569ca1bf46afd63cb4dbe83806eb21e55e73c479e79b9dd4494427db10d9112f2c2cb167e2b3d61b5be4de894a8ef850f32b462a3c3e167d5b97ef1a62c2677ac3611bfc39eda460dab0b5f7a5e0").unwrap();
+        let msg = b"AYNA-SURUM 7\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  iPhoneAyna.exe\n";
+        assert!(rsa_sha256_verify(&m, &[1, 0, 1], msg, &sig));
+        assert!(!rsa_sha256_verify(&m, &[1, 0, 1], b"AYNA-SURUM 8", &sig));
     }
 
     #[test]

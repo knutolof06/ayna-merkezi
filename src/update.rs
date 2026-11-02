@@ -1,6 +1,11 @@
 //! Otomatik güncelleme: GitHub'daki son sürümü (herkese açık depo) denetler, yeni Windows exe'sini
-//! indirir, SHA-256 özetini sürüm notundakiyle karşılaştırır ve uygulama kullanılmıyorken kendini
-//! değiştirip yeniden başlar.
+//! indirir ve uygulama kullanılmıyorken kendini değiştirip yeniden başlar.
+//!
+//! Güven: her sürümde CI bir bildirge (`manifest.txt`: "AYNA-SURUM <n>" ve dosya özetleri) üretir
+//! ve onu projenin imza anahtarıyla (Mac uygulamasını imzalayan, yalnız GitHub gizli
+//! değişkenlerinde duran RSA anahtarı) imzalar (`manifest.sig`). Exe yalnız imzası doğrulanan,
+//! sürüm numarası etiketle aynı ve bu sürümden yeni olan bildirgedeki özetle eşleşirse kurulur:
+//! GitHub hesabı ele geçirilse de anahtar olmadan güncelleme üretilemez; eski sürüme dönülemez.
 //!
 //! Sürüm numarası, GitHub Actions'ın çalıştırma numarasıdır (derlemede `AYNA_BUILD`). Yerel
 //! geliştirme derlemelerinde numara yoktur ve güncelleme kapalıdır (geliştirilen exe ezilmesin).
@@ -19,7 +24,7 @@ use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::crypto::{self, hex};
+use crate::crypto::{self, hex, unhex};
 use crate::util;
 
 /// Bir güncelleme indirildi ve uygulanmaya hazır (iş parçacığı → ana pencere).
@@ -32,6 +37,8 @@ const LATEST: &str = "/repos/knutolof06/ayna-merkezi/releases/latest";
 /// İndirme bağlantısı yalnız bu depodan kabul edilir.
 const DOWNLOAD_PREFIX: &str = "https://github.com/knutolof06/ayna-merkezi/releases/download/";
 const ASSET: &str = "iPhoneAyna.exe";
+/// Sürüm imza anahtarının açık kısmı (RSA-2048, üs 65537; sertifika SHA-1 c7251ef4…5fa0).
+const RELEASE_KEY_MODULUS: &str = "b65d2f0e4e0132e42c1d8d53fd2c30b288dd69b45d1b3026421fe112f6ab598b586c76dca44fe705ba997cb6005b7adc846c2d80f7e8a96c2e91ac340993052f52e60104d04aed568c2062538b4e7ef811544cb4ab30dbbce105518bbd0f21caba6f867ad54078aeb5d5742e1833ce99aae71698aab0407a9274a86b4267cfe52c293cba4d56cd4a2cbb18b3ce50e833e1537e6b1e19dbf75e7efb8f1bb69774881c522a04f7cec7aeee8e85e0728db585a4738805670e82ca5f69abead33042fa7ca8942b168dc0bdc5ea6a697b1273a20aaf82a14ec55b02d432b40e5889c1b2cf5eaa892500cc3b08e1d9cc44ca792ddf2702991e6ab53b5c0ec84372c43b";
 const FIRST_CHECK: Duration = Duration::from_secs(60);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 const MAX_SIZE: usize = 64 << 20;
@@ -41,8 +48,8 @@ pub fn build() -> u32 {
     option_env!("AYNA_BUILD").and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// İndirilmiş, uygulanmayı bekleyen sürüm.
-static READY: Mutex<Option<(u32, PathBuf)>> = Mutex::new(None);
+/// İndirilmiş, uygulanmayı bekleyen sürüm: numara, dosya, beklenen özet.
+static READY: Mutex<Option<(u32, PathBuf, String)>> = Mutex::new(None);
 
 /// Arka planda denetimi başlatır; yeni sürüm indirilince `notify` penceresine `WM_APP_UPDATE`.
 pub fn start(notify: HWND) {
@@ -78,10 +85,19 @@ fn check() -> Result<Option<u32>, String> {
     if version <= build() {
         return Ok(None);
     }
-    let url = asset_url(&json, ASSET).ok_or("sürümde Windows dosyası yok")?;
-    let expected = expected_sha256(&json, ASSET).ok_or("sürüm notunda özet yok")?;
-    let rest = url.strip_prefix("https://github.com").ok_or("beklenmeyen indirme adresi")?;
-    let bytes = https_get("github.com", rest)?;
+    // İmzalı bildirge: sürüm numarası ve özetler yalnız buradan alınır.
+    let manifest = download(&json, "manifest.txt")?;
+    let sig = unhex(String::from_utf8_lossy(&download(&json, "manifest.sig")?).trim()).ok_or("imza okunamadı")?;
+    let modulus = unhex(RELEASE_KEY_MODULUS).ok_or("anahtar okunamadı")?;
+    if !crypto::rsa_sha256_verify(&modulus, &[1, 0, 1], &manifest, &sig) {
+        return Err("sürüm imzası doğrulanamadı".into());
+    }
+    let manifest = String::from_utf8_lossy(&manifest).to_string();
+    if manifest.lines().next() != Some(format!("AYNA-SURUM {version}").as_str()) {
+        return Err("bildirgedeki sürüm etiketle aynı değil".into());
+    }
+    let expected = expected_sha256(&manifest, ASSET).ok_or("bildirgede Windows dosyası yok")?;
+    let bytes = download(&json, ASSET)?;
     let digest = crypto::sha256(&bytes).ok_or("özet hesaplanamadı")?;
     if hex(&digest) != expected {
         return Err("indirilen dosyanın özeti tutmuyor".into());
@@ -92,14 +108,28 @@ fn check() -> Result<Option<u32>, String> {
     let exe = util::exe_path();
     let new = exe.with_extension("yeni.exe");
     std::fs::write(&new, &bytes).map_err(|e| format!("yazılamadı: {e}"))?;
-    *READY.lock().unwrap() = Some((version, new));
+    *READY.lock().unwrap() = Some((version, new, expected));
     Ok(Some(version))
+}
+
+/// Sürümdeki bir dosyayı (yalnız bu deponun indirme adresinden) indirir.
+fn download(json: &str, name: &str) -> Result<Vec<u8>, String> {
+    let url = asset_url(json, name).ok_or_else(|| format!("sürümde {name} yok"))?;
+    let rest = url.strip_prefix("https://github.com").ok_or("beklenmeyen indirme adresi")?;
+    https_get("github.com", rest)
 }
 
 /// İndirilmiş güncellemeyi uygular: dosyaları değiştirir ve yeni sürümü başlatır. `true` dönerse
 /// çağıran uygulamayı kapatmalıdır.
 pub fn apply() -> bool {
-    let Some((version, new)) = READY.lock().unwrap().take() else { return false };
+    let Some((version, new, expected)) = READY.lock().unwrap().take() else { return false };
+    // İndirmeyle kurulum arasında dosya değiştirilmiş olmasın: hemen önce yeniden doğrulanır.
+    let intact = std::fs::read(&new).ok().and_then(|b| crypto::sha256(&b)).is_some_and(|d| hex(&d) == expected);
+    if !intact {
+        util::log("Güncelleme dosyası değişmiş; kurulmadı.");
+        let _ = std::fs::remove_file(&new);
+        return false;
+    }
     let exe = util::exe_path();
     let old = exe.with_extension("eski.exe");
     let _ = std::fs::remove_file(&old);
@@ -140,12 +170,14 @@ pub fn on_startup() {
             }
         }
     }
+    // Eski sürüm, yeni sürüm bir dakika sorunsuz çalıştıktan sonra silinir (o zamana dek elle
+    // geri dönülebilir).
     let old = util::exe_path().with_extension("eski.exe");
-    for _ in 0..10 {
-        if !old.exists() || std::fs::remove_file(&old).is_ok() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(300));
+    if old.exists() {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            let _ = std::fs::remove_file(&old);
+        });
     }
 }
 
@@ -182,10 +214,9 @@ fn asset_url(json: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Sürüm notundaki `sha256sum` satırı: `<64 onaltılık>  <dosya>`.
-fn expected_sha256(json: &str, name: &str) -> Option<String> {
-    let body = json_str(json, "body")?.replace("\\r", "").replace("\\n", "\n");
-    body.lines().find_map(|l| {
+/// Bildirgedeki `sha256sum` satırı: `<64 onaltılık>  <dosya>`.
+fn expected_sha256(manifest: &str, name: &str) -> Option<String> {
+    manifest.lines().find_map(|l| {
         let mut parts = l.split_whitespace();
         let h = parts.next()?;
         let f = parts.next()?.trim_start_matches('*');
@@ -275,14 +306,15 @@ mod tests {
 
     #[test]
     fn reads_release_json() {
-        let json = r#"{"tag_name":"v12","assets":[{"browser_download_url":"https://evil.example/iPhoneAyna.exe"},{"browser_download_url":"https://github.com/knutolof06/ayna-merkezi/releases/download/v12/iPhoneAyna.exe"}],"body":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  iPhoneAyna.exe\r\nffff  x"}"#;
+        let json = r#"{"tag_name":"v12","assets":[{"browser_download_url":"https://evil.example/iPhoneAyna.exe"},{"browser_download_url":"https://github.com/knutolof06/ayna-merkezi/releases/download/v12/iPhoneAyna.exe"}]}"#;
+        let manifest = "AYNA-SURUM 12\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  iPhoneAyna.exe\nffff  x\n";
         assert_eq!(json_str(json, "tag_name").as_deref(), Some("v12"));
         assert_eq!(
             asset_url(json, "iPhoneAyna.exe").as_deref(),
             Some("https://github.com/knutolof06/ayna-merkezi/releases/download/v12/iPhoneAyna.exe")
         );
         assert_eq!(
-            expected_sha256(json, "iPhoneAyna.exe").as_deref(),
+            expected_sha256(manifest, "iPhoneAyna.exe").as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
     }

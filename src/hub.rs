@@ -448,8 +448,12 @@ fn apply_update_when_idle() {
         }
         UPDATE_PENDING.with(|p| p.set(false));
         if update::apply() {
-            if let Ok(m) = FindWindowW(mirror::CLASS, PCWSTR::null()) {
-                let _ = DestroyWindow(m);
+            // Yeni sürüm bu süreç kapanınca açılır.
+            match FindWindowW(mirror::CLASS, PCWSTR::null()) {
+                Ok(m) => {
+                    let _ = DestroyWindow(m);
+                }
+                Err(_) => PostQuitMessage(0),
             }
         }
     }

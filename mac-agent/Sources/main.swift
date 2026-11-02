@@ -28,6 +28,7 @@ import CoreMedia
 import CryptoKit
 import Network
 import ScreenCaptureKit
+import Security
 import ServiceManagement
 import VideoToolbox
 
@@ -874,9 +875,15 @@ final class Session {
 
 // MARK: - Otomatik güncelleme
 
-/// GitHub'daki son sürümü denetler; yeni sürümü indirir, SHA-256 özetini ve imzasını (bu projenin
-/// sabit imza anahtarı) doğrular, uygulamayı değiştirip yeniden başlatır. Sürüm numarası GitHub
-/// Actions çalıştırma numarasıdır (CFBundleVersion); 0 olan yerel derlemelerde kapalıdır.
+/// GitHub'daki son sürümü denetler; yeni sürümü indirip doğrular, uygulamayı değiştirip yeniden
+/// başlatır. Sürüm numarası GitHub Actions çalıştırma numarasıdır (CFBundleVersion); 0 olan yerel
+/// derlemelerde kapalıdır.
+///
+/// Güven: CI her sürümde bir bildirge ("AYNA-SURUM <n>" + dosya özetleri) üretip projenin imza
+/// anahtarıyla (bu uygulamayı imzalayan, yalnız GitHub gizli değişkenlerinde duran RSA anahtarı)
+/// imzalar. Güncelleme yalnız imzası doğrulanan, sürümü etiketle aynı ve bu sürümden yeni olan
+/// bildirgedeki özetle eşleşirse; açılan uygulama da aynı anahtarla imzalı ve içindeki sürüm
+/// numarası aynıysa kurulur.
 enum Updater {
     static let latest = URL(string: "https://api.github.com/repos/knutolof06/ayna-merkezi/releases/latest")!
     static let downloadPrefix = "https://github.com/knutolof06/ayna-merkezi/releases/download/"
@@ -884,12 +891,13 @@ enum Updater {
     /// Yalnız bu kimlik ve bu sertifikayla imzalanmış uygulama kabul edilir.
     static let requirement =
         "identifier \"tr.ayna.ajan\" and certificate leaf = H\"c7251ef44643fc0dcf58efe33fd4d5e02a215fa0\""
+    /// Sürüm imza anahtarının açık kısmı (PKCS#1, RSA-2048).
+    static let releaseKey = Data(base64Encoded: "MIIBCgKCAQEAtl0vDk4BMuQsHY1T/SwwsojdabRdGzAmQh/hEvarWYtYbHbcpE/nBbqZfLYAW3rchGwtgPfoqWwukaw0CZMFL1LmAQTQSu1WjCBiU4tOfvgRVEy0qzDbvOEFUYu9DyHKum+GetVAeK611XQuGDPOmarnFpiqsEB6knSoa0Jnz+UsKTy6TVbNSiy7GLPOUOgz4VN+ax4Z2/defvuPG7aXdIgcUioE987Hru6OheByjbWFpHOIBWcOgspfaavq0zBC+nyolCsWjcC9xepqaXsSc6IKr4KhTsVbAtQytA5YicGyz16qiSUAzDsI4dnMRMp5Ld8nApkearU7XA7IQ3LEOwIDAQAB")!
 
     static var build: Int { Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0 }
 
     private struct Release: Decodable {
         let tag_name: String
-        let body: String?
         let assets: [Asset]
     }
 
@@ -901,40 +909,53 @@ enum Updater {
     /// Yeni sürüm hazırlanırsa (indirilip doğrulandıysa) ana kuyrukta sürüm ve açılmış uygulama yolu.
     static func check(completion: @escaping (Int, URL) -> Void, failed: @escaping (String) -> Void) {
         guard build > 0 else { return }
-        var req = URLRequest(url: latest)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        URLSession.shared.dataTask(with: req) { data, _, error in
-            guard let data, error == nil, let release = try? JSONDecoder().decode(Release.self, from: data),
-                  let version = Int(release.tag_name.dropFirst()), version > build else { return }
-            guard let a = release.assets.first(where: { $0.name == asset }),
-                  a.browser_download_url.hasPrefix(downloadPrefix), let url = URL(string: a.browser_download_url),
-                  let expected = sha256(in: release.body ?? "", for: asset) else {
-                failed("Sürüm \(version) eksik yayınlanmış.")
-                return
-            }
-            URLSession.shared.dataTask(with: url) { zip, _, error in
-                guard let zip, error == nil, hex(SHA256.hash(data: zip)) == expected else {
-                    failed("İndirilen güncellemenin özeti tutmuyor.")
-                    return
+        DispatchQueue.global().async {
+            do {
+                var req = URLRequest(url: latest)
+                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+                let release = try JSONDecoder().decode(Release.self, from: try fetch(req))
+                guard let version = Int(release.tag_name.dropFirst()), version > build else { return }
+                func download(_ name: String) throws -> Data {
+                    guard let a = release.assets.first(where: { $0.name == name }),
+                          a.browser_download_url.hasPrefix(downloadPrefix), let url = URL(string: a.browser_download_url)
+                    else { throw UpdateError("Sürüm \(version) eksik yayınlanmış (\(name)).") }
+                    return try fetch(URLRequest(url: url))
                 }
+                let manifest = try download("manifest.txt")
+                let sigText = String(decoding: try download("manifest.sig"), as: UTF8.self)
+                guard let sig = unhex(sigText.trimmingCharacters(in: .whitespacesAndNewlines)), verify(manifest, sig) else {
+                    throw UpdateError("Güncellemenin imzası doğrulanamadı.")
+                }
+                let text = String(decoding: manifest, as: UTF8.self)
+                guard text.split(whereSeparator: \.isNewline).first.map(String.init) == "AYNA-SURUM \(version)",
+                      let expected = sha256(in: text, for: asset) else {
+                    throw UpdateError("Güncelleme bildirgesi sürümle uyuşmuyor.")
+                }
+                let zip = try download(asset)
+                guard hex(SHA256.hash(data: zip)) == expected else { throw UpdateError("İndirilen güncellemenin özeti tutmuyor.") }
                 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("AynaAjan-\(version)")
                 try? FileManager.default.removeItem(at: dir)
-                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 let zipURL = dir.appendingPathComponent(asset)
                 let app = dir.appendingPathComponent("Ayna Ajan.app")
-                guard (try? zip.write(to: zipURL)) != nil,
-                      run("/usr/bin/ditto", ["-x", "-k", zipURL.path, dir.path]),
-                      run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(requirement)", app.path]) else {
-                    failed("Güncelleme doğrulanamadı (imza).")
-                    return
+                try zip.write(to: zipURL)
+                guard run("/usr/bin/ditto", ["-x", "-k", zipURL.path, dir.path]), signatureValid(app),
+                      bundleVersion(app) == version else {
+                    throw UpdateError("Güncelleme doğrulanamadı (imza ya da sürüm).")
                 }
                 DispatchQueue.main.async { completion(version, app) }
-            }.resume()
-        }.resume()
+            } catch let e as UpdateError {
+                failed(e.message)
+            } catch {
+                // Ağ yok, GitHub'a ulaşılamadı: sessizce sonraki denemeye kalır.
+            }
+        }
     }
 
-    /// Yeni uygulamayı eskisinin yerine koyar ve yeniden başlatır.
+    /// Yeni uygulamayı eskisinin yerine koyar (hemen önce imzası yeniden doğrulanır) ve bu süreç
+    /// kapandıktan sonra yeniden açar.
     static func install(_ app: URL) -> Bool {
+        guard signatureValid(app) else { return false }
         let current = Bundle.main.bundleURL
         do {
             _ = try FileManager.default.replaceItemAt(current, withItemAt: app)
@@ -942,11 +963,52 @@ enum Updater {
             return false
         }
         let path = current.path.replacingOccurrences(of: "'", with: "'\\''")
+        let pid = ProcessInfo.processInfo.processIdentifier
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "sleep 1; /usr/bin/open '\(path)'"]
+        p.arguments = ["-c", "while kill -0 \(pid) 2>/dev/null; do sleep 0.2; done; /usr/bin/open '\(path)'"]
         try? p.run()
         return true
+    }
+
+    private struct UpdateError: Error {
+        let message: String
+        init(_ m: String) { message = m }
+    }
+
+    private static func fetch(_ req: URLRequest) throws -> Data {
+        var result: Result<Data, Error> = .failure(URLError(.unknown))
+        let done = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            if let data, (response as? HTTPURLResponse)?.statusCode == 200 {
+                result = .success(data)
+            } else {
+                result = .failure(error ?? URLError(.badServerResponse))
+            }
+            done.signal()
+        }.resume()
+        done.wait()
+        return try result.get()
+    }
+
+    private static func verify(_ manifest: Data, _ sig: Data) -> Bool {
+        let attrs: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPublic,
+            kSecAttrKeySizeInBits as String: 2048,
+        ]
+        guard let key = SecKeyCreateWithData(releaseKey as CFData, attrs as CFDictionary, nil) else { return false }
+        return SecKeyVerifySignature(key, .rsaSignatureMessagePKCS1v15SHA256, manifest as CFData, sig as CFData, nil)
+    }
+
+    private static func signatureValid(_ app: URL) -> Bool {
+        run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(requirement)", app.path])
+    }
+
+    private static func bundleVersion(_ app: URL) -> Int? {
+        let plist = app.appendingPathComponent("Contents/Info.plist")
+        guard let dict = NSDictionary(contentsOf: plist), let v = dict["CFBundleVersion"] as? String else { return nil }
+        return Int(v)
     }
 
     private static func sha256(in body: String, for name: String) -> String? {
