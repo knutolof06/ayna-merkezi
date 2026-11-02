@@ -47,9 +47,11 @@
 
 - 2026-11-03: workflow kapsamı verildi, main gönderildi. Actions: Windows derleme+test başarılı; macOS ilk denemede GitHub kapasite sorunuyla hiç başlamadı, yeniden çalıştırınca Swift uyarısız derlendi, AynaAjan.dmg (universal) artefakt olarak hazır.
 - 2026-11-03: Kullanıcı: RustDesk kurmadan çalışmalı; Mac ikonu iPhone'un yanında hep dursun, tıklayınca içinde kod ekranı; ayrı Mac programı kod versin; sağ tık boyut; iPhone gibi ama sağa genişleyen yatay pencere; gizlenince bağlantı gitmesin. → RustDesk kaldırıldı. Kendi motor: Mac ScreenCaptureKit+VideoToolbox H.264+CGEvent (Swift), Windows GStreamer d3d11 (bin\uxplay DLL'leri, gst.rs), AYNA2 protokolü (ECDH P-256, HKDF, AES-256-GCM, SAS, eşleşme anahtarı türetilir). macview.rs (pencere+kod+boyut), crypto.rs (CNG). Windows tarafı Python sahte Mac ile uçtan uca doğrulandı (görüntü, girdi, gizle/göster, kes, açılışta otomatik bağlanma).
+- 2026-11-03: Güvenlik incelemesi → COMMIT önce (SAS denenerek eşitlenemez), Windows'ta da "Kodlar aynı" onayı, Mac el sıkışma sınırı. Kullanıcı Mac'e kurdu (kod 336195237, "burhan Mac mini" 192.168.50.206) ama eski protokollü sürümdü.
+- 2026-11-03: Kullanıcı: otomatik güncelleme istedi. Kararlar: depo herkese açık (gizli bilgi taraması temiz), Mac sabit imza anahtarı (self-signed, GitHub secret MAC_SIGN_P12/MAC_SIGN_PASSWORD, sertifika SHA-1 c7251ef4…5fa0). CI her main gönderiminde vN sürümü yayınlar; bildirge (manifest.txt) aynı RSA anahtarıyla imzalı (manifest.sig); Windows (update.rs, CNG) ve Mac (Updater, Security) yalnız imzalı+daha yeni sürümü kurar. Ayrı sürüm anahtarı secret'ı otomatik onay katmanınca reddedildi → aynı anahtar kullanıldı. Sürüm 6 yayınlandı ve gerçek imza zinciri Windows kodu ile doğrulandı; bu PC'de v6 exe çalışıyor.
 
 ## Sonraki Adım
-Actions macOS derlemesi + iki review sonucu → düzeltmeler → commit/push. Sonra kullanıcı Mac mini'de AynaAjan.dmg'yi kurup dener (gerçek Mac'te hiç denenmedi).
+Kullanıcı Mac'e Sürüm 6'yı (v6 AynaAjan.dmg) kurup izinleri verir, Windows'ta Mac ikonundan kodla bağlanır (iki tarafta onay). Gerçek Mac'te görüntü/girdi henüz denenmedi.
 
 ## Açık Sorular / Bekleyen Onaylar
 - [x] Yerel doğrulama: derleme, birim testler, ikon konumu/aç-kapa, sağ tık menüsü, temiz çıkış, devre dışı çocuk pencere fare yönlendirmesi, BLE HID yayını başladı
