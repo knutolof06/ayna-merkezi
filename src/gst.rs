@@ -1,6 +1,10 @@
 //! Mac görüntüsünün çözülüp pencereye çizilmesi: UxPlay paketindeki GStreamer kütüphaneleri çalışma
 //! anında yüklenir (`bin\uxplay`). Hat: appsrc (H.264 Annex-B, erişim birimi başına) → h264parse →
 //! d3d11h264dec (donanım çözücü) → d3d11videosink (verilen pencerenin içine çizer).
+//!
+//! Gecikme: çözücü `compliance=flexible` ile kareyi DPB'de bekletmeden hemen verir (akışta B-kare
+//! yok; Mac ekranı yalnız değişince kare gönderdiği için bekletilen kare bir sonraki değişikliğe
+//! dek ekrana çıkmazdı), çizici saate göre beklemez (`sync=false`).
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::OnceLock;
@@ -102,7 +106,7 @@ impl Player {
         let desc = CString::new(
             "appsrc name=src is-live=true do-timestamp=true format=time \
              caps=video/x-h264,stream-format=byte-stream,alignment=au \
-             ! h264parse ! d3d11h264dec ! d3d11videosink name=sink sync=false",
+             ! h264parse ! d3d11h264dec compliance=flexible ! d3d11videosink name=sink sync=false",
         )
         .ok()?;
         unsafe {

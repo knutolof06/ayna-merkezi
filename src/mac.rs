@@ -568,8 +568,12 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         let _ = tx.send(vec![MSG_KEYFRAME]);
     }
     drop(tx);
-    std::thread::spawn(move || write_loop(writer, tx_aead, out));
+    // Ortak zaman başlangıcı: yoklama (ping) zaman damgası yanıtla (pong) geri gelir, gidiş-dönüş
+    // süresi ölçülür (Mac'te biriken gönderim kuyruğu da bunda görünür).
+    let epoch = Instant::now();
+    std::thread::spawn(move || write_loop(writer, tx_aead, out, epoch));
 
+    let mut stats = Stats::new();
     let mut last_data = Instant::now();
     loop {
         let mut len = [0u8; 4];
@@ -585,8 +589,10 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
             return Ok(false);
         }
         let plain = rx_aead.open(&frame).ok_or("Mac'ten gelen veri doğrulanamadı.")?;
+        stats.report(&peer.name);
         match plain[0] {
             MSG_VIDEO if plain.len() > 2 => {
+                stats.frame(plain.len(), plain[1] & 1 == 1);
                 if let Some(p) = shared.player.lock().unwrap().as_ref() {
                     p.push(&plain[2..]);
                 }
@@ -598,7 +604,10 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                     post(notify);
                 }
             }
-            MSG_PONG => {}
+            MSG_PONG if plain.len() >= 9 => {
+                let sent = u64::from_be_bytes(plain[1..9].try_into().unwrap_or([0; 8]));
+                stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
+            }
             MSG_BYE => return Ok(true),
             _ => {}
         }
@@ -640,9 +649,49 @@ fn wait_for_decision(
     }
 }
 
+/// Oturum ölçümleri: 10 sn'de bir günlüğe kare hızı, bant genişliği ve gidiş-dönüş süresi.
+struct Stats {
+    since: Instant,
+    frames: u32,
+    keys: u32,
+    bytes: usize,
+    rtts: Vec<u64>,
+}
+
+impl Stats {
+    fn new() -> Stats {
+        Stats { since: Instant::now(), frames: 0, keys: 0, bytes: 0, rtts: Vec::new() }
+    }
+
+    fn frame(&mut self, len: usize, key: bool) {
+        self.frames += 1;
+        self.keys += u32::from(key);
+        self.bytes += len;
+    }
+
+    fn rtt(&mut self, ms: u64) {
+        self.rtts.push(ms);
+    }
+
+    fn report(&mut self, name: &str) {
+        let secs = self.since.elapsed().as_secs_f32();
+        if secs < 10.0 {
+            return;
+        }
+        let avg = if self.rtts.is_empty() { 0 } else { self.rtts.iter().sum::<u64>() / self.rtts.len() as u64 };
+        let max = self.rtts.iter().copied().max().unwrap_or(0);
+        util::log(&format!(
+            "Mac {name}: {:.0} kare/sn ({} anahtar), {:.1} Mbit/sn, gidiş-dönüş ort {avg} ms en çok {max} ms",
+            self.frames as f32 / secs,
+            self.keys,
+            self.bytes as f32 * 8.0 / secs / 1_000_000.0,
+        ));
+        *self = Stats::new();
+    }
+}
+
 /// Giden mesajları şifreleyip yazar; arada bir canlılık yoklaması gönderir.
-fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>) {
-    let started = Instant::now();
+fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, started: Instant) {
     let mut last_ping = Instant::now();
     loop {
         let mut batch = Vec::new();

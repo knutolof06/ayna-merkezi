@@ -323,20 +323,30 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Düşük gecikmeli kodlayıcı: kare biriktirmez (MaxFrameDelayCount = 0), önce Apple'ın düşük
+    /// gecikme kipi denenir; açılmazsa olağan gerçek zamanlı kip.
     private func makeEncoder(width: Int, height: Int) {
-        var session: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
-            compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &session)
-        guard status == noErr, let s = session else {
-            onError("Görüntü kodlayıcı açılamadı (\(status)).")
+        func create(lowLatency: Bool) -> VTCompressionSession? {
+            var session: VTCompressionSession?
+            let spec: CFDictionary? = lowLatency
+                ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary : nil
+            let status = VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
+                codecType: kCMVideoCodecType_H264, encoderSpecification: spec, imageBufferAttributes: nil,
+                compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &session)
+            return status == noErr ? session : nil
+        }
+        let lowLatency = create(lowLatency: true)
+        guard let s = lowLatency ?? create(lowLatency: false) else {
+            onError("Görüntü kodlayıcı açılamadı.")
             return
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: 12_000_000))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: lowLatency != nil ? kVTProfileLevel_H264_ConstrainedHigh_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: 15_000_000))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 60))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: 600))
         VTCompressionSessionPrepareToEncodeFrames(s)
@@ -701,12 +711,13 @@ final class Session {
     private func sendVideo(_ data: Data, key: Bool) {
         sendQueue.async { [weak self] in
             guard let self else { return }
-            if self.inFlight > 4_000_000 {
+            // Gönderilmeyi bekleyen veri az tutulur (~0,3 sn): birikirse gecikme büyür.
+            if self.inFlight > 512_000 {
                 self.needKey = true
                 return
             }
             if self.needKey && !key {
-                if self.inFlight < 1_000_000 {
+                if self.inFlight < 128_000 {
                     DispatchQueue.main.async { self.capturer?.requestKeyframe() }
                 }
                 return
@@ -1140,7 +1151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return "AYNA1 HERE \(code) \(agentPort) \(proof) \(name)"
         }
         do {
-            let params = NWParameters.tcp
+            // Nagle kapalı: küçük paketler (fare, yoklama yanıtı) bekletilmeden gider.
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
             let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: agentPort)!)
             l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
