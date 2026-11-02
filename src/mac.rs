@@ -4,13 +4,15 @@
 //! 1. Bul (UDP 21130): `AYNA1 FIND <kod> <cihaz> <nonce>` →
 //!    `AYNA1 HERE <kod> <port> <imza|-> <ad>`. Eşleşilmiş Mac imzalı yanıt verir.
 //! 2. El sıkışma (TCP 21130, satırlar):
+//!    Windows: `AYNA2 COMMIT <cihaz> <SHA256(win-açık-anahtar|cihaz)>` (anahtara önceden bağlanma);
 //!    Mac: `AYNA2 HI <nonce> <mac-açık-anahtar>`;
-//!    Windows: `AYNA2 HELLO <cihaz> <imza|-> <win-açık-anahtar> <ad>`.
+//!    Windows: `AYNA2 HELLO <cihaz> <imza|-> <win-açık-anahtar> <ad>` (Mac özeti doğrular).
 //!    İki taraf geçici ECDH P-256 anahtarlarından ortak sır çıkarır;
-//!    T = `AYNA2|nonce|mac-anahtar|win-anahtar|cihaz` bağlamıyla HKDF-SHA256 yön başına AES-256-GCM
-//!    anahtarlarını, ilk eşleşme için 6 haneli doğrulama kodunu (iki ekranda aynı görünür) ve yeni
-//!    eşleşme anahtarını verir. Eşleşilmiş cihazlar T'yi anahtarla imzalar (HMAC): aradaki biri iki
-//!    tarafla ayrı ayrı anahtar değişse de imzayı üretemez.
+//!    T = `AYNA2|nonce|mac-anahtar|win-anahtar|cihaz|ad` bağlamıyla HKDF-SHA256 yön başına AES-256-GCM
+//!    anahtarlarını, ilk eşleşme için 6 haneli doğrulama kodunu ve yeni eşleşme anahtarını verir.
+//!    Windows anahtarını Mac'inkini görmeden önce bağladığı için aradaki biri iki ekranda aynı kod
+//!    çıkana dek anahtar deneyemez. İlk eşleşmede kodu iki tarafta da kullanıcı onaylar.
+//!    Eşleşilmiş cihazlar T'yi anahtarla imzalar (HMAC).
 //!    Mac: `AYNA2 WAIT` (onay soruluyor) … `AYNA2 OK NEW|SAME <imza>` | `DENY` | `OFF` | `BUSY`.
 //! 3. Şifreli çerçeveler: `u32 uzunluk || AES-GCM(şifreli metin || etiket)`, nonce = 4 sıfır bayt ||
 //!    64 bit sayaç (yön başına). Düz metnin ilk baytı mesaj türü (bkz. `MSG_*`).
@@ -65,6 +67,8 @@ pub enum State {
     Searching,
     /// Mac'te onay bekleniyor; iki ekranda aynı görünmesi gereken doğrulama kodu.
     Waiting { name: String, sas: String },
+    /// Mac onayladı; ilk eşleşmede Windows kullanıcısı da kodun aynı olduğunu onaylamalı.
+    Confirm { name: String, sas: String },
     Connecting(String),
     Connected(String),
     Failed(String),
@@ -76,6 +80,7 @@ impl State {
             State::Idle => "Bağlı değil".into(),
             State::Searching => "Ağda aranıyor…".into(),
             State::Waiting { name, .. } => format!("{name}: Mac'te onay bekleniyor…"),
+            State::Confirm { name, .. } => format!("{name}: doğrulama kodunu onaylayın"),
             State::Connecting(name) => format!("{name}: bağlanılıyor…"),
             State::Connected(name) => format!("Bağlı: {name}"),
             State::Failed(why) => why.clone(),
@@ -103,6 +108,8 @@ struct Inner {
     screen: Option<(u16, u16)>,
     /// Kopma kullanıcıdan değil ağdan: yeniden bağlanılabilir.
     dropped: bool,
+    /// İlk eşleşmede Windows kullanıcısının doğrulama kodu kararı (beklerken de verilebilir).
+    decision: Option<bool>,
 }
 
 struct Shared {
@@ -135,7 +142,15 @@ impl Mac {
         Mac {
             notify,
             shared: Arc::new(Shared {
-                inner: Mutex::new(Inner { state: State::Idle, attempt: 0, tx: None, socket: None, screen: None, dropped: false }),
+                inner: Mutex::new(Inner {
+                    state: State::Idle,
+                    attempt: 0,
+                    tx: None,
+                    socket: None,
+                    screen: None,
+                    dropped: false,
+                    decision: None,
+                }),
                 player: Mutex::new(None),
             }),
         }
@@ -165,10 +180,19 @@ impl Mac {
     /// Görüntünün çizileceği oynatıcı (pencere açılınca kurulur, kapanınca bırakılır).
     pub fn set_player(&self, player: Option<Player>) {
         let fresh = player.is_some();
-        *self.shared.player.lock().unwrap() = player;
+        let old = std::mem::replace(&mut *self.shared.player.lock().unwrap(), player);
+        // Eski hat kilit dışında ve ayrı iş parçacığında kapatılır (kapanırken ağ ve arayüz beklemesin).
+        if let Some(old) = old {
+            std::thread::spawn(move || drop(old));
+        }
         if fresh {
             self.send(vec![MSG_KEYFRAME]);
         }
+    }
+
+    /// İlk eşleşmede: iki ekrandaki doğrulama kodu aynı mı?
+    pub fn confirm(&self, same: bool) {
+        self.shared.inner.lock().unwrap().decision = Some(same);
     }
 
     pub fn has_player(&self) -> bool {
@@ -181,6 +205,7 @@ impl Mac {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.attempt = inner.attempt.wrapping_add(1);
             inner.state = State::Searching;
+            inner.decision = None;
             inner.attempt
         };
         let _ = util::write_text_setting(CODE_SETTING, code);
@@ -192,8 +217,13 @@ impl Mac {
                 inner.tx = None;
                 inner.socket = None;
                 match &result {
-                    Ok(()) => {
-                        // Mac oturumu kapattı ya da bağlantı koptu.
+                    // Mac'te bağlantı kesildi: kendiliğinden yeniden bağlanılmaz.
+                    Ok(true) => {
+                        inner.dropped = false;
+                        inner.state = State::Failed("Mac'te bağlantı kesildi.".into());
+                    }
+                    Ok(false) => {
+                        // Bağlantı koptu (ağ, uyku).
                         inner.dropped = true;
                         inner.state = State::Failed("Mac bağlantısı koptu; yeniden bağlanılıyor…".into());
                     }
@@ -261,7 +291,10 @@ impl Mac {
 
 /// Ağdan kaynaklanan, yeniden denemeye değer hatalar (ret ya da kimlik hatası değil).
 fn transient(why: &str) -> bool {
-    why.starts_with("Mac bulunamadı") || why.starts_with("Mac'teki Ayna Ajan'a bağlanılamadı") || why.starts_with("Mac bağlantıyı kapattı")
+    why.starts_with("Mac bulunamadı")
+        || why.starts_with("Mac'teki Ayna Ajan'a bağlanılamadı")
+        || why.starts_with("Mac bağlantıyı kapattı")
+        || why.starts_with("Mac'e şu an başka")
 }
 
 fn post(notify: isize) {
@@ -401,12 +434,14 @@ fn ask_repair(owner: isize, peer: &Peer) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Oturum
 
-/// Bulur, el sıkışır ve oturum bitene dek görüntüyü alır. `Ok(())`: oturum kurulmuştu ve sona erdi.
-fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Result<(), String> {
+/// Bulur, el sıkışır ve oturum bitene dek görüntüyü alır. `Ok(true)`: Mac oturumu kapattı;
+/// `Ok(false)`: bağlantı koptu ya da vazgeçildi.
+fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Result<bool, String> {
     let peer = match discover(code)? {
         Found::Signed(peer) | Found::FirstTime(peer) => peer,
         Found::UnsignedOnly(peer) => {
-            if !shared.alive(attempt) || !ask_repair(notify, &peer) {
+            // Soru açıkken vazgeçilmiş olabilir: eşleşme ancak deneme hâlâ geçerliyse silinir.
+            if !shared.alive(attempt) || !ask_repair(notify, &peer) || !shared.alive(attempt) {
                 return Err("Mac'in kimliği doğrulanamadı; eşleşme yenilenmedi.".into());
             }
             Mac::forget(code);
@@ -436,6 +471,14 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     let alive = || shared.alive(attempt);
 
     // --- El sıkışma
+    let id = device_id()?;
+    let ecdh = EcdhKey::generate().ok_or("Anahtar üretilemedi.")?;
+    let win_pub = hex(&ecdh.public_x963().ok_or("Anahtar üretilemedi.")?);
+    // Açık anahtar, Mac'inki görülmeden önce özetiyle bağlanır (doğrulama kodu denenerek eşitlenemesin).
+    let commit = hex(&crypto::sha256(format!("{win_pub}|{id}").as_bytes()).ok_or("Özet hesaplanamadı.")?);
+    writer
+        .write_all(format!("AYNA2 COMMIT {id} {commit}\n").as_bytes())
+        .map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
     let started = Instant::now();
     let mut pending = String::new();
     let first = read_line_limited(&mut reader, &mut pending, started, &alive)?;
@@ -449,17 +492,15 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         return Err("Mac'ten geçersiz el sıkışma.".into());
     }
     let mac_pub_bytes = unhex(mac_pub).filter(|b| b.len() == 65).ok_or("Mac'ten geçersiz anahtar.")?;
-    let ecdh = EcdhKey::generate().ok_or("Anahtar üretilemedi.")?;
-    let win_pub = hex(&ecdh.public_x963().ok_or("Anahtar üretilemedi.")?);
     let shared_secret = ecdh.agree(&mac_pub_bytes).ok_or("Mac'in anahtarı geçersiz.")?;
-    let id = device_id()?;
-    let t = format!("AYNA2|{nonce}|{mac_pub}|{win_pub}|{id}");
+    let name = clean_name(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into())).replace(' ', "_");
+    let name = if name.is_empty() { "Windows".to_string() } else { name };
+    let t = format!("AYNA2|{nonce}|{mac_pub}|{win_pub}|{id}|{name}");
     let key = mac_key(code);
     let proof = match &key {
         Some(k) => hex(&crypto::hmac(k, format!("hello|{t}").as_bytes()).ok_or("İmza hesaplanamadı.")?),
         None => "-".to_string(),
     };
-    let name = clean_name(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into()));
     writer
         .write_all(format!("AYNA2 HELLO {id} {proof} {win_pub} {name}\n").as_bytes())
         .map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
@@ -491,6 +532,9 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                         if !proof_matches(&token, &ok_msg, proof) {
                             return Err("Mac'in onayı doğrulanamadı.".into());
                         }
+                        // Sahte bir Mac de "OK" diyebilir: eşleşme, Windows kullanıcısı Mac'in
+                        // ekranında aynı kodu gördüğünü onaylamadan kurulmaz.
+                        wait_for_decision(shared, attempt, notify, &peer.name, &sas, &alive)?;
                         if !util::write_text_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()), &hex(&token)) {
                             util::log("Mac anahtarı kaydedilemedi; sonraki bağlantıda yeniden onay istenecek.");
                         }
@@ -530,7 +574,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     loop {
         let mut len = [0u8; 4];
         if !read_exact_patient(&mut reader, &mut len, &alive, &mut last_data) {
-            return Ok(());
+            return Ok(false);
         }
         let n = u32::from_be_bytes(len) as usize;
         if !(crypto::TAG_LEN + 1..=MAX_FRAME).contains(&n) {
@@ -538,7 +582,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         }
         let mut frame = vec![0u8; n];
         if !read_exact_patient(&mut reader, &mut frame, &alive, &mut last_data) {
-            return Ok(());
+            return Ok(false);
         }
         let plain = rx_aead.open(&frame).ok_or("Mac'ten gelen veri doğrulanamadı.")?;
         match plain[0] {
@@ -555,9 +599,44 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 }
             }
             MSG_PONG => {}
-            MSG_BYE => return Ok(()),
+            MSG_BYE => return Ok(true),
             _ => {}
         }
+    }
+}
+
+/// İlk eşleşmede kullanıcının "kodlar aynı" onayını bekler.
+fn wait_for_decision(
+    shared: &Shared,
+    attempt: u32,
+    notify: isize,
+    name: &str,
+    sas: &str,
+    alive: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let (n, s) = (name.to_string(), sas.to_string());
+    if !shared.publish(attempt, |i| {
+        if i.decision.is_none() {
+            i.state = State::Confirm { name: n, sas: s };
+        }
+    }) {
+        return Err(String::new());
+    }
+    post(notify);
+    let started = Instant::now();
+    loop {
+        if !alive() {
+            return Err(String::new());
+        }
+        match shared.inner.lock().unwrap().decision {
+            Some(true) => return Ok(()),
+            Some(false) => return Err("Doğrulama kodu onaylanmadı; eşleşme kurulmadı.".into()),
+            None => {}
+        }
+        if started.elapsed() > APPROVAL_TIMEOUT {
+            return Err("Doğrulama kodu onaylanmadı (süre doldu).".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

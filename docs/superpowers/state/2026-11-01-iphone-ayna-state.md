@@ -46,9 +46,10 @@
 - 2026-11-02: Özel depo oluşturuldu: https://github.com/knutolof06/ayna-merkezi (boş). Push reddedildi: gh belirtecinde `workflow` kapsamı yok. Kullanıcı `gh auth refresh -h github.com -s workflow` çalıştırınca `git push -u origin main`, sonra Actions sonucu (Swift derlemesi ilk kez orada doğrulanacak).
 
 - 2026-11-03: workflow kapsamı verildi, main gönderildi. Actions: Windows derleme+test başarılı; macOS ilk denemede GitHub kapasite sorunuyla hiç başlamadı, yeniden çalıştırınca Swift uyarısız derlendi, AynaAjan.dmg (universal) artefakt olarak hazır.
+- 2026-11-03: Kullanıcı: RustDesk kurmadan çalışmalı; Mac ikonu iPhone'un yanında hep dursun, tıklayınca içinde kod ekranı; ayrı Mac programı kod versin; sağ tık boyut; iPhone gibi ama sağa genişleyen yatay pencere; gizlenince bağlantı gitmesin. → RustDesk kaldırıldı. Kendi motor: Mac ScreenCaptureKit+VideoToolbox H.264+CGEvent (Swift), Windows GStreamer d3d11 (bin\uxplay DLL'leri, gst.rs), AYNA2 protokolü (ECDH P-256, HKDF, AES-256-GCM, SAS, eşleşme anahtarı türetilir). macview.rs (pencere+kod+boyut), crypto.rs (CNG). Windows tarafı Python sahte Mac ile uçtan uca doğrulandı (görüntü, girdi, gizle/göster, kes, açılışta otomatik bağlanma).
 
 ## Sonraki Adım
-Kullanıcı: (1) iPhone'da güç tuşunu birkaç kez dene (yöntem öğrenilir). (2) Mac mini'de RustDesk 1.5.1 + Actions'tan AynaAjan.dmg kur, kodla bağlan. Mac tarafı gerçek cihazda henüz test edilmedi. Dmg: Actions > son çalıştırma > AynaAjan-mac.
+Actions macOS derlemesi + iki review sonucu → düzeltmeler → commit/push. Sonra kullanıcı Mac mini'de AynaAjan.dmg'yi kurup dener (gerçek Mac'te hiç denenmedi).
 
 ## Açık Sorular / Bekleyen Onaylar
 - [x] Yerel doğrulama: derleme, birim testler, ikon konumu/aç-kapa, sağ tık menüsü, temiz çıkış, devre dışı çocuk pencere fare yönlendirmesi, BLE HID yayını başladı

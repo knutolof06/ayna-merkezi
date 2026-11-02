@@ -2,14 +2,15 @@
 
 iPhone ekranını Windows'a yansıtır ve bilgisayarın fare/klavyesiyle iPhone'u kontrol etmeyi sağlar.
 Aynı ağdaki bir Mac'e (ör. Mac mini) koduyla bağlanıp ekranını görmeyi ve kontrol etmeyi sağlar.
-iPhone için ek donanım ya da uygulama gerekmez; Mac'te küçük bir menü çubuğu yardımcısı (Ayna Ajan) çalışır.
+iPhone için ek donanım ya da uygulama gerekmez; Mac'te yalnız bu projenin küçük menü çubuğu programı
+(Ayna Ajan) çalışır, başka bir uzak masaüstü programı gerekmez.
 
 - **Ana uygulama (Ayna Merkezi):** `iPhoneAyna.exe`'yi açınca gelen pencere. iPhone'u açıp kapatma
   (kapalıyken yansıtma alıcısı durur, ikon kalkar), ekran boyutu, Mac bağlantısı, "Windows ile başlat" ve
   "Bağlanınca Büyütme'yi yenile". Ayrıca görev çubuğu ikonlarının sağ tık menüsündeki **Ayna Merkezi**'nden
   ya da uygulama çalışırken exe'yi yeniden açarak gelir.
-- **Görev çubuğu ikonları tüm monitörlerde:** Her görev çubuğunda Başlat'ın solunda iPhone ikonu; Mac
-  bağlıyken onun da solunda Mac ikonu. Pencere, tıklanan ikonun bulunduğu monitörde açılır.
+- **Görev çubuğu ikonları tüm monitörlerde:** Her görev çubuğunda Başlat'ın solunda iPhone ikonu, onun
+  solunda Mac ikonu (ana uygulamadan kapatılabilir). Pencere, tıklanan ikonun bulunduğu monitörde açılır.
 
 - **Yansıtma:** AirPlay (UxPlay alıcısı). Görüntü, görev çubuğundaki ikonun tam üstünde açılan çerçevesiz,
   köşeleri iPhone gibi yuvarlak (kenar yumuşatmalı) bir pencerede gösterilir. Pencere oranı iPhone'un bildirdiği
@@ -87,33 +88,40 @@ yapıp "iCloud Drive" kutusunu işaretlemek yeterli.
 
 ## Mac'e bağlanma
 
-Uzak masaüstünün kendisi (görüntü, kontrol, şifreleme) [RustDesk](https://github.com/rustdesk/rustdesk)'tir
-(1.5.1 ve üstü). Şimdilik yalnız **aynı yerel ağ**: sunucu ya da internet gerekmez.
+Şimdilik yalnız **aynı yerel ağ**: sunucu ya da internet gerekmez.
 
 **Mac'te (bir kez):**
-1. RustDesk'i kurun (`/Applications/RustDesk.app`), Sistem Ayarları → Gizlilik ve Güvenlik'te RustDesk'e
-   **Ekran Kaydı** ve **Erişilebilirlik** izni verin.
-2. GitHub Actions'ın ürettiği `AynaAjan.dmg`'den **Ayna Ajan**'ı Uygulamalar'a sürükleyin. İmzasız olduğu için
+1. GitHub Actions'ın ürettiği `AynaAjan.dmg`'den **Ayna Ajan**'ı Uygulamalar'a sürükleyin. İmzasız olduğu için
    ilk açılışta sağ tık → **Aç** deyin.
-3. İlk açılışta Ayna Ajan bağlantı parolasını sorar (en az 10 karakter) ve RustDesk'i ayarlar (macOS yönetici
-   parolası istenir): doğrudan IP erişimi, yalnız kalıcı parola, yalnız güvenilen bilgisayarların adresleri
-   (IP beyaz listesi; internet üzerinden gelen bağlantılar da bu yüzden reddedilir).
-4. Menü çubuğundaki ekran simgesinde Mac'in **kodu** görünür (RustDesk kimliği; tıklayınca kopyalanır).
+2. İlk açılışta macOS iki izin sorar: **Ekran Kaydı** (görüntü) ve **Erişilebilirlik** (fare/klavye). Sistem
+   Ayarları → Gizlilik ve Güvenlik'te Ayna Ajan'ı açın (gerekirse programı yeniden başlatın).
+3. Menü çubuğundaki ekran simgesinde Mac'in **kodu** görünür (9 hane, bu Mac'e özel; tıklayınca kopyalanır).
 
-**Windows'ta:** Ayna Merkezi → Mac → kodu yazıp **Bağlan**.
+**Windows'ta:** Görev çubuğundaki **Mac ikonuna** tıklayın; Mac penceresinde kodu yazıp **Bağlan**.
 1. Mac yerel ağda kodla bulunur.
-2. İlk seferde Mac'te "… bu Mac'e bağlanmak istiyor — Reddet / İzin ver" sorusu çıkar (varsayılan Reddet).
-   İzin verilince bu bilgisayar Mac'in güvenilenler listesine girer ve ikisi arasında bir anahtar paylaşılır:
-   sonraki bağlantılarda Mac'in yanıtı ve bu bilgisayarın kimliği bu anahtarla doğrulanır, aynı ağdaki başka
-   bir cihaz kendini Mac ya da bu bilgisayar gibi gösteremez.
-3. RustDesk penceresi açılır ve parolayı sorar ("Parolayı hatırla" işaretlenebilir). Parola Ayna
-   Merkezi'nden geçmez.
+2. İlk seferde Mac'te "… bu Mac'e bağlanmak istiyor — Reddet / İzin ver" sorusu çıkar; Windows'taki Mac
+   penceresinde de 6 haneli bir **doğrulama kodu** görünür. İki ekrandaki kod aynıysa Mac'te **İzin ver**'e,
+   Windows'ta **Kodlar aynı**'ya basın (Mac'te varsayılan düğme Reddet). İki taraf da onaylamadan eşleşme
+   kurulmaz: ağdaki başka bir cihaz kendini Mac ya da bu bilgisayar gibi gösteremez. İki taraf arasında bu
+   bilgisayara özel bir eşleşme anahtarı oluşur.
+3. Sonraki bağlantılarda soru çıkmaz: iki taraf kimliğini bu anahtarla kanıtlar. Uygulama açılışta eşleşilmiş
+   Mac'e arka planda bağlanır; Mac ikonuna tıklayınca ekran hemen gelir.
 
-Bağlıyken görev çubuklarında Mac ikonu çıkar: tıklamak Mac penceresini gösterir/gizler, sağ tık menüsünde
-"Mac bağlantısını kes" var. Pencere kapanınca ikon kalkar. RustDesk istemcisi uygulamanın yanındaki
-`bin\rustdesk\rustdesk.exe`'den (resmî 1.5.1 sürümü) ya da kurulu RustDesk'ten çalışır.
+**Mac penceresi:** Mac ikonunun üstünden sağa doğru açılan, çerçevesiz, köşeleri yuvarlak yatay bir pencere
+(Mac ekranının oranında). Fare ve klavye Mac'e gider: **Ctrl → Command**, **Alt → Option**, Windows tuşu →
+Control; tuşlar konuma göre eşlenir, iki tarafta aynı klavye düzeni (ör. Türkçe Q) seçili olmalı. Pencere
+gizlenince (ikona yeniden tıklayınca) **bağlantı açık kalır**, yalnız görüntü durur; açınca kaldığı yerden
+sürer. Bağlantı koparsa (Mac uykuya geçti, ağ gitti) kendiliğinden yeniden bağlanılır.
 
-Güvenilen bilgisayarlar, parola değişikliği ve "Bağlantılara izin ver" anahtarı Ayna Ajan menüsündedir.
+**Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı) ve "Bağlantıyı kes".
+
+**Teknik:** Görüntü Mac'te ScreenCaptureKit ile yakalanıp VideoToolbox ile donanımda H.264'e kodlanır (en uzun
+kenar 1920 piksel, 60 kare/sn'ye kadar, ~12 Mbit/sn), Windows'ta GStreamer ile donanımda çözülür (UxPlay'in
+`bin\uxplay` paketindeki kütüphaneler). Bağlantı şifrelidir: her oturumda geçici ECDH P-256 anahtar değişimi,
+HKDF-SHA256 ve yön başına AES-256-GCM. Ayrıntılı protokol `src/mac.rs` ve `mac-agent/Sources/main.swift`
+başındadır.
+
+Güvenilen bilgisayarlar ve "Bağlantılara izin ver" anahtarı Ayna Ajan menüsündedir.
 
 ## Bilinen sınırlar
 
@@ -133,12 +141,11 @@ Güvenilen bilgisayarlar, parola değişikliği ve "Bağlantılara izin ver" ana
 - Günlükler: `%TEMP%\iPhoneAyna.log` (uygulama: Bluetooth bağlantısı, dosya gönderimi) ve
   `%TEMP%\iPhoneAyna-uxplay.log` (yansıtma motoru; bir önceki çalıştırmanınki `.prev.log`). UxPlay gizli bir
   sözde konsolda çalışır, çıktısı satır satır ve anında günlüğe düşer.
-- Mac görüntüsü Ayna Merkezi'nin içine gömülü değil, RustDesk'in kendi penceresindedir (görev çubuğu düğmesi
-  kaldırılır, Mac ikonuyla yönetilir).
 - Mac bağlantısı yalnız aynı yerel ağda (aynı alt ağda) çalışır. Bilgisayarın IP adresi değişirse Mac'te
   "yeni bir adresten bağlanıyor" sorusu yeniden çıkar.
-- Bağlantı parolası RustDesk'e komut satırından verilir; Mac'te ayar sırasında kısa süre süreç listesinde
-  görünebilir.
+- Mac'te yalnız ana ekran gösterilir; ses aktarılmaz.
+- Ayna Ajan imzasız (ad-hoc) olduğundan her yeni sürümde macOS Ekran Kaydı ve Erişilebilirlik izinlerini
+  yeniden isteyebilir.
 - iOS 27+ için alternatif (henüz uygulanmadı): Apple'ın geliştirici kanalı (CoreDevice) Bluetooth ve Büyütme
   olmadan dokunma iletebiliyor; bir kerelik Geliştirici Modu + USB eşleme gerektirir
   ([go-ios#849](https://github.com/danielpaulus/go-ios/pull/849)).
@@ -150,15 +157,16 @@ cargo build --release
 copy target\release\iphone-ayna.exe iPhoneAyna.exe
 ```
 
-Rust + `windows` crate. Dosyalar: `hub.rs` (Ayna Merkezi penceresi), `mac.rs` (Mac'i bulma, güven, RustDesk
-oturumu), `mirror.rs` (iPhone penceresi, video gömme, girdi), `ble.rs` (HID over GATT), `hid.rs` (dokunmatik
+Rust + `windows` crate. Dosyalar: `hub.rs` (Ayna Merkezi penceresi), `mac.rs` (Mac'i bulma, şifreli oturum,
+girdi), `macview.rs` (Mac penceresi, kod ekranı, boyut penceresi), `gst.rs` (GStreamer ile H.264 çözme),
+`crypto.rs` (CNG: ECDH, HKDF, AES-GCM), `mirror.rs` (iPhone penceresi, video gömme, girdi), `ble.rs` (HID over GATT), `hid.rs` (dokunmatik
 ekran + klavye + tüketici rapor tanımı), `taskbar.rs` (tüm görev çubuklarında cihaz ikonları), `buttons.rs`
 (kenar tuşları), `uxplay.rs` (AirPlay motoru), `transfer.rs` (iCloud Drive'a dosya gönderme), `toast.rs`
 (bildirim balonu), `corners.rs` (yumuşak köşe katmanı).
 
 Mac yardımcısı: `mac-agent/` (Swift, AppKit + Network; `build.sh` evrensel .app ve .dmg üretir). Her `main`
 gönderiminde GitHub Actions Windows exe'sini ve Mac .dmg'sini derleyip artefakt olarak yükler
-(`.github/workflows/build.yml`). `bin\` (UxPlay ve RustDesk ikilileri) depoda değildir.
+(`.github/workflows/build.yml`). `bin\` (UxPlay ikilileri) depoda değildir.
 
 Yararlanılan açık kaynak çalışmalar:
 [abhishek-raj/windows-ble-hid](https://github.com/abhishek-raj/windows-ble-hid) (WinRT ile HOGP),

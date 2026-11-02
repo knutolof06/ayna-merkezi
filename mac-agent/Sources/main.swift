@@ -8,9 +8,12 @@
 //   Eşleşilmiş bilgisayara giden yanıt, onun anahtarıyla imzalanır:
 //     HMAC(anahtar, "here|kod|nonce|port|ad").
 // - El sıkışma, TCP 21130 (satırlar):
+//     Windows → "AYNA2 COMMIT <cihaz> <SHA256(win-açık|cihaz)>"   (anahtara önceden bağlanma)
 //     Mac → "AYNA2 HI <nonce> <mac-açık>"
-//     Windows → "AYNA2 HELLO <cihaz> <imza|-> <win-açık> <ad>"
-//   Geçici ECDH P-256 ile ortak sır elde edilir; T = "AYNA2|nonce|mac-açık|win-açık|cihaz".
+//     Windows → "AYNA2 HELLO <cihaz> <imza|-> <win-açık> <ad>"   (Mac özeti doğrular)
+//   Geçici ECDH P-256 ile ortak sır elde edilir; T = "AYNA2|nonce|mac-açık|win-açık|cihaz|ad".
+//   Windows anahtarını Mac'inkini görmeden bağladığı için aradaki biri doğrulama kodunu
+//   denenerek eşitleyemez; Mac de el sıkışmaları sınırlar.
 //   HKDF-SHA256 (tuz yok) şunları türetir:
 //     "keys|T"  → 64 bayt: [0..32] Windows→Mac, [32..64] Mac→Windows (AES-256-GCM)
 //     "sas|T"   → 4 bayt: 6 haneli doğrulama kodu
@@ -218,7 +221,8 @@ final class Discovery {
         guard n > 0 else { return }
         let message = String(decoding: buf[0..<n], as: UTF8.self)
         let ip = String(cString: inet_ntoa(from.sin_addr))
-        guard isLocalPeer(ip), let answer = reply(message, ip) else { return }
+        // Önce ucuz ayrıştırma (yanıt yoksa ağ arayüzleri hiç taranmaz).
+        guard let answer = reply(message, ip), isLocalPeer(ip) else { return }
         let bytes = Array(answer.utf8)
         _ = withUnsafePointer(to: &from) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(fd, bytes, bytes.count, 0, $0, len) }
@@ -230,7 +234,9 @@ final class Discovery {
 
 /// Ana ekranı yakalar, donanımla H.264'e kodlar; her kareyi Annex-B olarak verir.
 final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
-    private var stream: SCStream?
+    /// Yalnız `queue` üzerinde okunur/yazılır.
+    private var scStream: SCStream?
+    private var stopped = false
     private var encoder: VTCompressionSession?
     private let queue = DispatchQueue(label: "ayna.capture")
     private var paused = false
@@ -279,19 +285,34 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
                 return
             }
-            self.queue.sync { self.makeEncoder(width: w, height: h) }
-            self.stream = stream
+            // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
+            let proceed: Bool = self.queue.sync {
+                guard !self.stopped else { return false }
+                self.makeEncoder(width: w, height: h)
+                self.scStream = stream
+                return true
+            }
+            guard proceed else { return }
             stream.startCapture { [weak self] error in
-                if let error { self?.onError("Ekran yakalanamadı: \(error.localizedDescription)") }
+                guard let self else { return }
+                if let error {
+                    self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+                    return
+                }
+                // Başlarken durdurulduysa hemen kapat.
+                self.queue.async {
+                    if self.stopped { stream.stopCapture(completionHandler: nil) }
+                }
             }
             self.onSize(w, h)
         }
     }
 
     func stop() {
-        stream?.stopCapture(completionHandler: nil)
-        stream = nil
         queue.async {
+            self.stopped = true
+            self.scStream?.stopCapture(completionHandler: nil)
+            self.scStream = nil
             if let e = self.encoder {
                 VTCompressionSessionCompleteFrames(e, untilPresentationTimeStamp: .invalid)
                 VTCompressionSessionInvalidate(e)
@@ -417,10 +438,19 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
 final class Injector {
     private let source = CGEventSource(stateID: .hidSystemState)
-    private var flags: CGEventFlags = []
+    private var capsLock = false
     private var buttons: Set<UInt8> = []
     private var keys: Set<UInt16> = []
     private var lastClick = (time: Date.distantPast, button: UInt8(0), count: Int64(0), point: CGPoint.zero)
+    /// Düğme başına, basışta verilen tıklama sayısı (bırakış aynısını taşır).
+    private var clickCount: [UInt8: Int64] = [:]
+
+    /// Basılı değiştirici tuşlardan (sol/sağ ayrı) bayraklar.
+    private var flags: CGEventFlags {
+        var f: CGEventFlags = capsLock ? [.maskAlphaShift] : []
+        for k in keys { if let m = Injector.modifier(k) { f.insert(m) } }
+        return f
+    }
 
     private func point(_ x: UInt16, _ y: UInt16) -> CGPoint {
         let b = CGDisplayBounds(CGMainDisplayID())
@@ -451,18 +481,20 @@ final class Injector {
             let count: Int64 = (lastClick.button == b && near && Date().timeIntervalSince(lastClick.time) < NSEvent.doubleClickInterval)
                 ? lastClick.count + 1 : 1
             lastClick = (Date(), b, count, p)
+            clickCount[b] = count
             buttons.insert(b)
         } else {
             buttons.remove(b)
         }
         let e = CGEvent(mouseEventSource: source, mouseType: down ? downType : upType, mouseCursorPosition: p, mouseButton: mb)
-        e?.setIntegerValueField(.mouseEventClickState, value: lastClick.count)
+        e?.setIntegerValueField(.mouseEventClickState, value: clickCount[b] ?? 1)
         e?.flags = flags
         e?.post(tap: .cghidEventTap)
     }
 
     func scroll(dx: Int16, dy: Int16) {
-        let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0)
+        // CG'de yatay tekerleğin pozitif yönü sola; protokolde pozitif dx sağa.
+        let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(-Int(dx)), wheel3: 0)
         e?.flags = flags
         e?.post(tap: .cghidEventTap)
     }
@@ -478,8 +510,7 @@ final class Injector {
     }
 
     func key(_ code: UInt16, down: Bool) {
-        if let m = Injector.modifier(code) {
-            if down { flags.insert(m) } else { flags.remove(m) }
+        if Injector.modifier(code) != nil {
             if down { keys.insert(code) } else { keys.remove(code) }
             let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
             e?.type = .flagsChanged
@@ -487,8 +518,13 @@ final class Injector {
             e?.post(tap: .cghidEventTap)
             return
         }
-        if code == 0x39 && down { // Caps Lock
-            if flags.contains(.maskAlphaShift) { flags.remove(.maskAlphaShift) } else { flags.insert(.maskAlphaShift) }
+        if code == 0x39 { // Caps Lock: basışta durum değişir, flagsChanged olarak gider
+            if down { capsLock.toggle() }
+            let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
+            e?.type = .flagsChanged
+            e?.flags = flags
+            e?.post(tap: .cghidEventTap)
+            return
         }
         if down { keys.insert(code) } else { keys.remove(code) }
         let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
@@ -506,7 +542,7 @@ final class Injector {
                 .post(tap: .cghidEventTap)
         }
         buttons.removeAll()
-        flags = []
+        keys.removeAll()
     }
 }
 
@@ -517,8 +553,12 @@ final class Session {
     let ip: String
     private weak var app: AppDelegate?
     private var buffer = Data()
-    private enum Stage { case hello, approval, streaming, closed }
-    private var stage = Stage.hello
+    private enum Stage { case commit, hello, approval, streaming, closed }
+    private var stage = Stage.commit
+    private let started = Date()
+    private var approvalStarted = Date()
+    private var commitID = ""
+    private var commitHash = ""
     private let nonce = hex(randomBytes(16))
     private let ecdh = P256.KeyAgreement.PrivateKey()
     private lazy var macPub = hex(ecdh.publicKey.x963Representation)
@@ -534,6 +574,7 @@ final class Session {
     private var lastData = Date()
     private var watchdog: Timer?
     private(set) var name = "Windows"
+    private(set) var deviceID = ""
 
     init(conn: NWConnection, ip: String, app: AppDelegate) {
         self.conn = conn
@@ -549,13 +590,18 @@ final class Session {
             }
         }
         conn.start(queue: .main)
-        sendLine("AYNA2 HI \(nonce) \(macPub)")
         receive()
-        // Selamlaşma 10 sn'de gelmezse ya da oturum 10 sn sessiz kalırsa kapanır.
-        watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        // El sıkışma 10 sn'de biter (veri gelse de uzamaz); onay en çok 2 dk sürer; oturum 10 sn
+        // sessiz kalırsa kapanır.
+        watchdog = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self else { return }
-            let limit: TimeInterval = self.stage == .approval ? 120 : 10
-            if Date().timeIntervalSince(self.lastData) > limit { self.close() }
+            let now = Date()
+            switch self.stage {
+            case .commit, .hello: if now.timeIntervalSince(self.started) > 10 { self.close() }
+            case .approval: if now.timeIntervalSince(self.approvalStarted) > 120 { self.close() }
+            case .streaming: if now.timeIntervalSince(self.lastData) > 10 { self.close() }
+            case .closed: break
+            }
         }
     }
 
@@ -567,6 +613,11 @@ final class Session {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, error in
             guard let self, self.stage != .closed else { return }
             if let data, !data.isEmpty {
+                // Onay beklenirken Windows bir şey göndermez; gelen veri bağlantıyı kapatır.
+                if self.stage == .approval || self.buffer.count + data.count > 70_000 {
+                    self.close()
+                    return
+                }
                 self.buffer.append(data)
                 self.lastData = Date()
                 self.process()
@@ -584,20 +635,20 @@ final class Session {
     private func process() {
         while stage != .closed {
             switch stage {
-            case .hello:
+            case .commit, .hello:
                 guard let nl = buffer.firstIndex(of: 0x0A) else {
                     if buffer.count > 1024 { close() }
                     return
                 }
                 let line = String(decoding: take(nl - buffer.startIndex + 1).dropLast(), as: UTF8.self)
-                hello(line)
+                if stage == .commit { commit(line) } else { hello(line) }
             case .approval:
                 return
             case .streaming:
                 guard buffer.count >= 4 else { return }
                 let b = [UInt8](buffer.prefix(4))
                 let n = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
-                guard n >= 17, n <= 1 << 20 else { close(); return }
+                guard n >= 17, n <= 65_536 else { close(); return }
                 guard buffer.count >= 4 + n else { return }
                 _ = take(4)
                 let sealed = take(n)
@@ -654,7 +705,9 @@ final class Session {
                 return
             }
             if self.needKey && !key {
-                if self.inFlight < 1_000_000 { self.capturer?.requestKeyframe() }
+                if self.inFlight < 1_000_000 {
+                    DispatchQueue.main.async { self.capturer?.requestKeyframe() }
+                }
                 return
             }
             if key { self.needKey = false }
@@ -663,6 +716,28 @@ final class Session {
     }
 
     // --- El sıkışma
+
+    /// `AYNA2 COMMIT <cihaz> <özet>`: Windows açık anahtarına bağlanır; ancak bundan sonra Mac'in
+    /// anahtarı gönderilir.
+    private func commit(_ line: String) {
+        guard let app else { close(); return }
+        let parts = line.split(separator: " ").map(String.init)
+        guard parts.count == 4, parts[0] == "AYNA2", parts[1] == "COMMIT", isHex(parts[2], length: 32),
+              isHex(parts[3], length: 64) else {
+            sendLine("AYNA2 DENY")
+            close()
+            return
+        }
+        guard app.allowHandshake(ip: ip) else {
+            sendLine("AYNA2 BUSY")
+            close()
+            return
+        }
+        commitID = parts[2]
+        commitHash = parts[3]
+        stage = .hello
+        sendLine("AYNA2 HI \(nonce) \(macPub)")
+    }
 
     private func hello(_ line: String) {
         guard let app else { close(); return }
@@ -677,9 +752,16 @@ final class Session {
             return
         }
         let id = parts[2], proof = parts[3], winPub = parts[4]
-        name = cleanName(parts.count > 5 ? parts[5] : "Windows")
+        let rawName = parts.count > 5 ? parts[5] : ""
+        // Açılan anahtar, el sıkışmanın başında bağlanılanla aynı olmalı.
+        guard id == commitID, sameProof(hex(SHA256.hash(data: Data("\(winPub)|\(id)".utf8))), commitHash) else {
+            sendLine("AYNA2 DENY")
+            close()
+            return
+        }
+        name = cleanName(rawName.isEmpty ? "Windows" : rawName)
         let shared = secret.withUnsafeBytes { Data($0) }
-        let t = "AYNA2|\(nonce)|\(macPub)|\(winPub)|\(id)"
+        let t = "AYNA2|\(nonce)|\(macPub)|\(winPub)|\(id)|\(rawName)"
         let keys = hkdf(shared, "keys|" + t, 64)
         let sasBytes = [UInt8](hkdf(shared, "sas|" + t, 4))
         let sasN = (UInt32(sasBytes[0]) << 24 | UInt32(sasBytes[1]) << 16 | UInt32(sasBytes[2]) << 8 | UInt32(sasBytes[3])) % 1_000_000
@@ -691,12 +773,21 @@ final class Session {
         let known = Store.trusted.first { $0.id == id }
         let knownToken = known.flatMap { unhex($0.token) }
         let authenticated = knownToken.map { sameProof(hmacHex(key: $0, message: "hello|" + t), proof) } ?? false
+        deviceID = id
+        // Aynı anda tek oturum; ancak kimliğini kanıtlayan aynı bilgisayar (ağ kopup geri geldi)
+        // eski oturumu devralır.
+        if !app.mayStart(deviceID: id, authenticated: authenticated) {
+            sendLine("AYNA2 BUSY")
+            close()
+            return
+        }
 
         if authenticated, let known, let token = knownToken, known.ip == ip {
             approve(token: token, kind: "SAME", t: t)
             return
         }
         stage = .approval
+        approvalStarted = Date()
         app.ask(session: self, name: name, ip: ip, id: id, sas: sas, known: known, authenticated: authenticated) { [weak self] allowed in
             guard let self, self.stage == .approval else { return }
             guard allowed else {
@@ -769,9 +860,10 @@ final class Session {
         capturer = nil
         injector.releaseAll()
         if wasStreaming {
-            sendQueue.async { [weak self] in
-                self?.sendNow(Data([0x04]))
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.conn.cancel() }
+            // Güçlü yakalama: oturum listeden çıksa da veda iletisi gidip bağlantı kapanana dek yaşar.
+            sendQueue.async { [self] in
+                sendNow(Data([0x04]))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.conn.cancel() }
             }
         } else {
             conn.cancel()
@@ -793,6 +885,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Reddedilen adresler bir süre yeniden sorulmaz; ağdan gelen soru seli olmasın.
     private var deniedUntil: [String: Date] = [:]
     private var recentPrompts: [Date] = []
+    private var handshakes: [(Date, String)] = []
+    /// Bilgisayar adı bir kez okunur (her bulma isteğinde ağ adı çözümlemesi yapılmasın).
+    private lazy var macName = cleanName(Host.current().localizedName ?? "Mac")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -841,7 +936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let parts = message.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
             guard parts.count == 5, parts[0] == "AYNA1", parts[1] == "FIND", parts[2] == code,
                   isHex(parts[3], length: 32), isHex(parts[4], length: 32) else { return nil }
-            let name = cleanName(Host.current().localizedName ?? "Mac")
+            let name = macName
             let signed = "here|\(code)|\(parts[4])|\(agentPort)|\(name)"
             let proof = Store.trusted.first { $0.id == parts[3] }.flatMap { unhex($0.token) }
                 .map { hmacHex(key: $0, message: signed) } ?? "-"
@@ -862,16 +957,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func accept(_ conn: NWConnection) {
         guard let ip = ipv4String(conn.endpoint), isLocalPeer(ip), connectionsByIP[ip, default: 0] < 2,
               pending.count < 8 else { conn.cancel(); return }
-        if active != nil {
-            // Aynı anda tek oturum.
-            conn.start(queue: .main)
-            conn.send(content: Data("AYNA2 BUSY\n".utf8), completion: .contentProcessed { _ in conn.cancel() })
-            return
-        }
         connectionsByIP[ip, default: 0] += 1
         let s = Session(conn: conn, ip: ip, app: self)
         pending.append(s)
         s.start()
+    }
+
+    /// Etkin oturum varken yeni oturum yalnız aynı (kimliğini kanıtlamış) bilgisayardan olabilir.
+    func mayStart(deviceID: String, authenticated: Bool) -> Bool {
+        guard let a = active else { return true }
+        return authenticated && a.deviceID == deviceID
     }
 
     func sessionStarted(_ s: Session) {
@@ -891,6 +986,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// El sıkışma sınırı: adres başına dakikada 5, toplam dakikada 20. Doğrulama kodunu denenerek
+    /// eşitlemeye (ve yük bindirmeye) karşı.
+    func allowHandshake(ip: String) -> Bool {
+        let now = Date()
+        handshakes = handshakes.filter { now.timeIntervalSince($0.0) < 60 }
+        guard handshakes.count < 20, handshakes.filter({ $0.1 == ip }).count < 5 else { return false }
+        handshakes.append((now, ip))
+        return true
+    }
+
     /// Onay sorusu sınırı: adres başına reddedildikten sonra 10 dk; genel olarak 10 sn'de bir ve
     /// 10 dk'da en fazla 6 soru.
     private func mayAsk(ip: String) -> Bool {
@@ -908,8 +1013,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard mayAsk(ip: ip) else { completion(false); return }
         asking = true
         recentPrompts.append(Date())
-        // Satır "WAIT" gönderilsin diye soru bir sonraki turda açılır.
-        DispatchQueue.main.async { [self] in
+        // Soru, GCD ana kuyruğunun dışında (çalışma döngüsünde) açılır: kipli pencere açıkken ağ
+        // olayları (ana kuyruk) işlenmeye devam eder; "WAIT" de önce gönderilmiş olur.
+        RunLoop.main.perform(inModes: [.common]) { [self] in
             defer { asking = false }
             NSApp.activate(ignoringOtherApps: true)
             let alert = NSAlert()
@@ -1046,13 +1152,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
+    /// Uyarı, GCD ana kuyruğunun dışında açılır (açıkken oturumun ağ olayları durmasın).
     func show(error: String, detail: String = "") {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = error
-        alert.informativeText = detail
-        alert.runModal()
+        RunLoop.main.perform(inModes: [.common]) {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = error
+            alert.informativeText = detail
+            alert.runModal()
+        }
     }
 }
 

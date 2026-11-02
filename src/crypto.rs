@@ -17,6 +17,12 @@ pub fn hmac(key: &[u8], msg: &[u8]) -> Option<[u8; 32]> {
     status.is_ok().then_some(out)
 }
 
+pub fn sha256(msg: &[u8]) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    let status = unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, msg, &mut out) };
+    status.is_ok().then_some(out)
+}
+
 /// HKDF-SHA256; `salt` boşsa RFC 5869'daki gibi 32 sıfır bayt.
 pub fn hkdf(ikm: &[u8], salt: &[u8], info: &[u8], len: usize) -> Option<Vec<u8>> {
     let zero = [0u8; 32];
@@ -237,6 +243,11 @@ mod tests {
         let info: Vec<u8> = (0xf0..=0xf9).collect();
         let okm = hkdf(&ikm, &salt, &info, 42).unwrap();
         assert_eq!(hex(&okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    }
+
+    #[test]
+    fn sha256_known() {
+        assert_eq!(hex(&sha256(b"abc").unwrap()), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]

@@ -49,6 +49,8 @@ const MARGIN: f32 = 10.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ctl {
     Button,
+    /// İlk eşleşmede "Kodlar aynı".
+    Yes,
 }
 
 struct View {
@@ -72,6 +74,12 @@ struct View {
     /// AltGr'nin önündeki sahte sol Ctrl yutuldu; bırakılışı da yutulacak.
     fake_ctrl: bool,
     was_connected: bool,
+    /// İlk eşleşmede kullanıcı doğrulama kodunu onayladı.
+    decided: bool,
+    /// Son fare konumu (0..65535): odak giderken düğme bu noktada bırakılır.
+    last_pos: (u16, u16),
+    /// Zamanlayıcının en son gördüğü durum (pencere gizliyken de değişim anlaşılsın).
+    seen: Option<State>,
 }
 
 thread_local! {
@@ -267,6 +275,9 @@ pub fn create() -> Option<HWND> {
             keys: Vec::new(),
             fake_ctrl: false,
             was_connected: false,
+            decided: false,
+            last_pos: (u16::MAX / 2, u16::MAX / 2),
+            seen: None,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
@@ -408,6 +419,10 @@ unsafe fn update_mode(hwnd: HWND) {
     }) else {
         return;
     };
+    // Kod alanı gizlenmeden önce odak pencereye alınır (gizlenen denetimde kalmasın).
+    if connected && GetFocus() == edit {
+        let _ = SetFocus(hwnd);
+    }
     let _ = ShowWindow(video, if connected { SW_SHOWNA } else { SW_HIDE });
     let _ = ShowWindow(edit, if form_edit && !connected { SW_SHOWNA } else { SW_HIDE });
     if connected {
@@ -418,9 +433,6 @@ unsafe fn update_mode(hwnd: HWND) {
         }
         // GStreamer'ın çizim penceresi de devre dışı kalır: fare ve klavye bu pencereye gelsin.
         disable_children(video);
-        if GetFocus() == edit {
-            let _ = SetFocus(hwnd);
-        }
     } else {
         with(|v| {
             if v.mac.has_player() {
@@ -453,6 +465,7 @@ enum After {
     Mode,
     Sizer,
     Go,
+    Decide,
     Paint,
 }
 
@@ -517,6 +530,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if let Some(edit) = with(|v| v.edit) {
                     let _ = SetFocus(edit);
                 }
+            } else {
+                // Bağlıyken klavye Mac'e gitsin diye odak pencerenin kendisinde.
+                let _ = SetFocus(hwnd);
             }
             taskbar::refresh();
             After::None
@@ -616,6 +632,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with(|v| v.go());
             update_mode(hwnd);
         }
+        After::Decide => {
+            with(|v| {
+                v.decided = true;
+                v.mac.confirm(true);
+            });
+            hub::invalidate(hwnd);
+        }
         After::Paint => hub::invalidate(hwnd),
     }
     LRESULT(0)
@@ -628,6 +651,9 @@ struct Form {
     subtitle: [f32; 4],
     field: [f32; 4],
     button: [f32; 4],
+    /// Doğrulama kodu adımında iki düğme: "Kodlar aynı" ve "Vazgeç".
+    yes: [f32; 4],
+    no: [f32; 4],
     note: [f32; 4],
     sas: [f32; 4],
 }
@@ -644,6 +670,8 @@ fn form_layout(c: &RECT, s: f32) -> Form {
         subtitle: [x0 - 40.0 * s, top + 102.0 * s, x1 + 40.0 * s, top + 124.0 * s],
         field: [x0 + 30.0 * s, top + 140.0 * s, x1 - 30.0 * s, top + 182.0 * s],
         button: [x0 + 30.0 * s, top + 194.0 * s, x1 - 30.0 * s, top + 232.0 * s],
+        yes: [x0 + 30.0 * s, top + 194.0 * s, (x0 + x1) / 2.0 - 6.0 * s, top + 232.0 * s],
+        no: [(x0 + x1) / 2.0 + 6.0 * s, top + 194.0 * s, x1 - 30.0 * s, top + 232.0 * s],
         note: [x0 - 60.0 * s, top + 240.0 * s, x1 + 60.0 * s, top + 280.0 * s],
         sas: [x0, top + 132.0 * s, x1, top + 186.0 * s],
     }
@@ -677,7 +705,11 @@ impl View {
             }
         }
         self.was_connected = connected;
-        if self.painted.as_ref() != Some(&state) {
+        if matches!(state, State::Idle | State::Searching | State::Failed(_)) {
+            self.decided = false;
+        }
+        if self.seen.as_ref() != Some(&state) {
+            self.seen = Some(state);
             return After::Mode;
         }
         After::None
@@ -693,6 +725,7 @@ impl View {
     fn go(&mut self) {
         match self.mac.state() {
             State::Idle | State::Failed(_) => {
+                self.decided = false;
                 let code = self.code();
                 if code.len() < 6 {
                     self.mac.fail("Mac'teki Ayna Ajan menüsündeki kodu yazın.");
@@ -711,6 +744,7 @@ impl View {
     }
 
     fn release_input(&mut self) {
+        self.fake_ctrl = false;
         if !self.mac.connected() {
             self.keys.clear();
             self.buttons = 0;
@@ -719,13 +753,13 @@ impl View {
         for k in std::mem::take(&mut self.keys) {
             self.mac.send(mac::key(k, false));
         }
+        let (x, y) = self.last_pos;
         for b in 0..3u8 {
             if self.buttons & (1 << b) != 0 {
-                self.mac.send(mac::mouse_button(b, false, u16::MAX / 2, u16::MAX / 2));
+                self.mac.send(mac::mouse_button(b, false, x, y));
             }
         }
         self.buttons = 0;
-        self.fake_ctrl = false;
     }
 
     fn normalized(&self, (x, y): (i32, i32)) -> (u16, u16) {
@@ -753,6 +787,7 @@ impl View {
         }
         if self.mac.connected() {
             let (x, y) = self.normalized(pt);
+            self.last_pos = (x, y);
             self.mac.send(mac::mouse_move(x, y));
             return After::None;
         }
@@ -767,6 +802,7 @@ impl View {
     fn button(&mut self, button: u8, down: bool, pt: (i32, i32)) -> After {
         if self.mac.connected() {
             let (x, y) = self.normalized(pt);
+            self.last_pos = (x, y);
             unsafe {
                 if down {
                     SetCapture(self.hwnd);
@@ -788,11 +824,11 @@ impl View {
             self.pressed = self.control_at(pt);
             return After::Paint;
         }
-        let clicked = self.pressed.take().is_some() && self.control_at(pt) == Some(Ctl::Button);
-        if clicked {
-            After::Go
-        } else {
-            After::Paint
+        let pressed = self.pressed.take();
+        match (pressed, self.control_at(pt)) {
+            (Some(Ctl::Button), Some(Ctl::Button)) => After::Go,
+            (Some(Ctl::Yes), Some(Ctl::Yes)) => After::Decide,
+            _ => After::Paint,
         }
     }
 
@@ -802,7 +838,18 @@ impl View {
             let _ = GetClientRect(self.hwnd, &mut c);
         }
         let f = form_layout(&c, self.scale);
+        if self.asks_code() {
+            if hit(&f.yes, pt.0, pt.1) {
+                return Some(Ctl::Yes);
+            }
+            return hit(&f.no, pt.0, pt.1).then_some(Ctl::Button);
+        }
         (!self.mac.connected() && hit(&f.button, pt.0, pt.1)).then_some(Ctl::Button)
+    }
+
+    /// İlk eşleşmenin doğrulama kodu adımı (henüz onaylanmadı): iki düğme gösterilir.
+    fn asks_code(&self) -> bool {
+        !self.decided && matches!(self.mac.state(), State::Waiting { .. } | State::Confirm { .. })
     }
 
     /// Bağlıyken tuşları Mac'e iletir; iletildiyse true.
@@ -859,10 +906,21 @@ impl View {
 
             let (title, subtitle, button, note, note_color) = match &state {
                 State::Waiting { name, .. } => (
-                    "Mac'te onay bekleniyor".to_string(),
-                    format!("{name} ekranında bu kod görünmeli:"),
+                    "Doğrulama kodu".to_string(),
+                    format!("{name} ekranındaki kod bu mu?"),
                     "Vazgeç",
-                    "Kodlar aynıysa Mac'te \"İzin ver\"e basın.".to_string(),
+                    if self.decided {
+                        "Şimdi Mac'te \"İzin ver\"e basın.".to_string()
+                    } else {
+                        "Aynıysa burada \"Kodlar aynı\"ya, Mac'te \"İzin ver\"e basın.".to_string()
+                    },
+                    p.secondary,
+                ),
+                State::Confirm { name, .. } => (
+                    "Doğrulama kodu".to_string(),
+                    format!("{name} onayladı. Mac'in ekranındaki kod bu mu?"),
+                    "Vazgeç",
+                    "Kod farklıysa Vazgeç'e basın: ağdaki başka bir cihaz kendini Mac gibi gösteriyor olabilir.".to_string(),
                     p.secondary,
                 ),
                 State::Searching | State::Connecting(_) => (
@@ -891,19 +949,36 @@ impl View {
             if show_field {
                 card_bg(&mut c, f.field, p.field, 12.0 * s);
             }
-            let (btn_color, alpha) = match button {
-                "Bağlan" => (p.accent, if self.pressed.is_some() { 0.75 } else if self.hover.is_some() { 0.9 } else { 1.0 }),
-                _ => (p.switch_off, if self.pressed.is_some() { 0.75 } else { 1.0 }),
+            let two = self.asks_code();
+            let shade = |ctl: Ctl| {
+                if self.pressed == Some(ctl) {
+                    0.75
+                } else if self.hover == Some(ctl) {
+                    0.9
+                } else {
+                    1.0
+                }
             };
-            card_bg_alpha(&mut c, f.button, btn_color, 12.0 * s, alpha);
+            if two {
+                card_bg_alpha(&mut c, f.yes, p.accent, 12.0 * s, shade(Ctl::Yes));
+                card_bg_alpha(&mut c, f.no, p.switch_off, 12.0 * s, shade(Ctl::Button));
+            } else {
+                let color = if button == "Bağlan" { p.accent } else { p.switch_off };
+                card_bg_alpha(&mut c, f.button, color, 12.0 * s, shade(Ctl::Button));
+            }
             let fonts = &self.fonts;
             hub::blit(self.hwnd, w, h, &c, |mem| {
                 text(mem, fonts.title, p.text, &title, f.title, DT_CENTER);
                 text(mem, fonts.body, p.secondary, &subtitle, f.subtitle, DT_CENTER | DT_END_ELLIPSIS);
-                if let State::Waiting { sas, .. } = &state {
+                if let State::Waiting { sas, .. } | State::Confirm { sas, .. } = &state {
                     text(mem, fonts.big, p.text, sas, f.sas, DT_CENTER);
                 }
-                text(mem, fonts.body, [1.0, 1.0, 1.0], button, f.button, DT_CENTER);
+                if two {
+                    text(mem, fonts.body, [1.0, 1.0, 1.0], "Kodlar aynı", f.yes, DT_CENTER);
+                    text(mem, fonts.body, [1.0, 1.0, 1.0], "Vazgeç", f.no, DT_CENTER);
+                } else {
+                    text(mem, fonts.body, [1.0, 1.0, 1.0], button, f.button, DT_CENTER);
+                }
                 if !note.is_empty() {
                     let mut r = to_rect(&f.note);
                     let old = SelectObject(mem, fonts.small);
