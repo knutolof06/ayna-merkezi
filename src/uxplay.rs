@@ -43,6 +43,9 @@ pub const RECEIVER_NAME: &str = "Ayna";
 /// başlamaz uyuşmazlık hatasıyla kapanıyor ve iPhone bağlantıyı düşürüyordu.
 ///
 /// `-d 1`: hata ayıklama günlüğü (kare geometrisi için), ama her video paketini yazmadan.
+///
+/// Çözücüye özellik verilemiyor: uxplay-windows argümanları boşluktan böler (tırnak tanımaz), UxPlay
+/// de `-vd` değerindeki boşlukları siler. Çözücüyü `decodebin` seçer.
 fn arguments() -> String {
     format!("-n {RECEIVER_NAME} -nh -s 1440x2560@60 -fps 60 -vsync no -vs d3d11videosink -nohold -reset 0 -d 1\n")
 }

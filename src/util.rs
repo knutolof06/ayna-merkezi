@@ -156,3 +156,57 @@ pub fn set_autostart(on: bool) {
         }
     }
 }
+
+/// Başka iş parçacığının (ya da sürecin) penceresi bizim pencerenin çocuğu olunca Windows iki iş
+/// parçacığının girdi kuyruğunu birleştirir: görüntüyü çizen taraf her karede beklerken bizim fare ve
+/// klavye işlememiz de bekler (kontrolde gecikme ve takılma). Kuyruklar yeniden ayrılır.
+/// `HKCU\Software\iPhoneAyna\GirdiAyir` = 0 ile kapatılır (karşılaştırma için).
+pub fn detach_input(window: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if read_setting(w!("GirdiAyir")) == Some(0) {
+        return;
+    }
+    unsafe {
+        let theirs = GetWindowThreadProcessId(window, None);
+        let ours = GetCurrentThreadId();
+        if theirs != 0 && theirs != ours {
+            let _ = AttachThreadInput(ours, theirs, false);
+        }
+    }
+}
+
+thread_local! {
+    /// Pencere başına: ölçüm başlangıcı, ileti sayısı, toplam ve en büyük gecikme (ms).
+    static INPUT_LAG: std::cell::RefCell<Vec<(&'static str, std::time::Instant, u32, u64, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Şu an işlenen fare iletisinin ne kadar geç işlendiğini ölçer (iletinin oluştuğu an ile şimdi);
+/// 10 sn'de bir günlüğe yazar. Arayüz iş parçacığı takılırsa burada görünür.
+pub fn note_input_lag(label: &'static str) {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::WindowsAndMessaging::GetMessageTime;
+    let lag = unsafe { GetTickCount().wrapping_sub(GetMessageTime() as u32) };
+    if lag > 60_000 {
+        return; // ileti zamanı yok (gönderilen ileti)
+    }
+    INPUT_LAG.with(|c| {
+        let mut v = c.borrow_mut();
+        let i = match v.iter().position(|e| e.0 == label) {
+            Some(i) => i,
+            None => {
+                v.push((label, std::time::Instant::now(), 0, 0, 0));
+                v.len() - 1
+            }
+        };
+        let e = &mut v[i];
+        e.2 += 1;
+        e.3 += lag as u64;
+        e.4 = e.4.max(lag);
+        if e.1.elapsed().as_secs() >= 10 {
+            log(&format!("Girdi gecikmesi ({label}): ort {} ms, en çok {} ms, {} ileti", e.3 / e.2 as u64, e.4, e.2));
+            *e = (label, std::time::Instant::now(), 0, 0, 0);
+        }
+    });
+}

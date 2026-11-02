@@ -620,6 +620,7 @@ unsafe fn embed(host: HWND, video: HWND) {
     SetWindowLongPtrW(video, GWL_EXSTYLE, ex as isize);
     let _ = SetParent(video, host);
     let _ = EnableWindow(video, false);
+    util::detach_input(video);
 }
 
 impl Mirror {
@@ -746,6 +747,7 @@ impl Mirror {
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
+                util::note_input_lag("iPhone");
                 // Dokunmatik ekranda üzerinde gezinme yoktur: parmak yalnız basılıyken hareket eder.
                 // Bırakma mesajı kaçtıysa (capture başka yere geçti) tuş durumundan (MK_LBUTTON) anlaşılır.
                 if self.touching && wp.0 & 0x0001 == 0 {

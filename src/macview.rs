@@ -451,6 +451,8 @@ unsafe fn disable_children(parent: HWND) {
         if IsWindowEnabled(child).as_bool() {
             let _ = EnableWindow(child, false);
         }
+        // Çizim penceresi GStreamer'ın iş parçacığında: girdi kuyruğu bizimkinden ayrılır.
+        util::detach_input(child);
         TRUE
     }
     let _ = EnumChildWindows(parent, Some(each), LPARAM(0));
@@ -541,7 +543,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with(|v| v.release_input());
             After::None
         }
-        WM_MOUSEMOVE => with(|v| v.mouse_move(point(lp))).unwrap_or(After::None),
+        WM_MOUSEMOVE => {
+            util::note_input_lag("Mac");
+            with(|v| v.mouse_move(point(lp))).unwrap_or(After::None)
+        }
         hub::WM_MOUSELEAVE => with(|v| {
             v.tracking = false;
             v.hover = None;
@@ -691,6 +696,8 @@ impl View {
                 }
             }
             self.reconnect_at = None;
+            // GStreamer'ın çizim penceresi ilk kareyle oluşur: devre dışı ve girdi kuyruğu ayrı kalsın.
+            unsafe { disable_children(self.video) };
         } else if self.mac.dropped() && !self.user_closed && enabled() {
             match self.reconnect_at {
                 None => self.reconnect_at = Some(Instant::now() + self.backoff),
