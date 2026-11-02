@@ -930,13 +930,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Ağ
 
     private func startNetwork() {
-        discovery = Discovery(port: agentPort) { message, _ in
-            guard Store.accepting else { return nil }
+        discovery = Discovery(port: agentPort) { [weak self] message, _ in
+            guard let self, Store.accepting else { return nil }
             let code = Store.code
             let parts = message.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
             guard parts.count == 5, parts[0] == "AYNA1", parts[1] == "FIND", parts[2] == code,
                   isHex(parts[3], length: 32), isHex(parts[4], length: 32) else { return nil }
-            let name = macName
+            let name = self.macName
             let signed = "here|\(code)|\(parts[4])|\(agentPort)|\(name)"
             let proof = Store.trusted.first { $0.id == parts[3] }.flatMap { unhex($0.token) }
                 .map { hmacHex(key: $0, message: signed) } ?? "-"
