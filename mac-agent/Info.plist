@@ -22,6 +22,8 @@
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Windows'tan sürüklenen dosyaları bırakıldıkları Finder penceresinin klasörüne kaydetmek için.</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Windows'taki Ayna Merkezi'nin bu Mac'i yerel ağda bulabilmesi için.</string>
 </dict>

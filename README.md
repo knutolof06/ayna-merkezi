@@ -113,6 +113,23 @@ Control; tuşlar konuma göre eşlenir, iki tarafta aynı klavye düzeni (ör. T
 gizlenince (ikona yeniden tıklayınca) **bağlantı açık kalır**, yalnız görüntü durur; açınca kaldığı yerden
 sürer. Bağlantı koparsa (Mac uykuya geçti, ağ gitti) kendiliğinden yeniden bağlanılır.
 
+**Windows kısayolları Mac'te:** Windows'taki alışkanlık Mac'te aynı işi yapar.
+- Finder'da (yazı alanı dışında): **Delete** çöpe atar, **Shift+Delete** kalıcı siler (Finder onay sorar),
+  **Ctrl+D** çöpe atar, **Enter** açar, **F2** yeniden adlandırır, **Backspace** geri gider, **Alt+Enter**
+  bilgi penceresi, **Alt+↑** üst klasör, **Ctrl+X** sonra **Ctrl+V** taşır.
+- Yazı alanlarında: **Home/End** satır başı/sonu, **Ctrl+Home/End** metnin başı/sonu.
+- Her yerde: **Ctrl+←/→** kelime atlar, **Ctrl+Backspace/Delete** kelime siler, **Ctrl+Y** yineler,
+  **Ctrl+Tab** sekme değiştirir, **Alt+←/→** geri/ileri, **Alt+F4** ve **Ctrl+F4** pencereyi kapatır.
+
+Odak öğrenilemezse yazı alanı sayılır (Delete yanlışlıkla dosya silmesin).
+
+**Sürükle-bırak dosya:** Windows'tan dosya ya da klasörü Mac penceresine sürükleyip bırakın; bırakılan
+noktadaki Finder penceresinin klasörüne (yoksa Mac Masaüstü'ne) kopyalanır. İlk seferde Mac "Ayna Ajan,
+Finder'ı denetlemek istiyor" diye sorar (Otomasyon izni; verilmezse dosyalar Masaüstü'ne gider). Mac'te bir
+dosyayı tutup Mac penceresinin dışına sürükleyin: dosya Windows'a alınır ve fare nereye bırakılırsa (Masaüstü,
+Gezgin klasörü) oraya kopyalanır; fare dosya gelmeden bırakılırsa Windows Masaüstü'ne kaydedilir. Aktarım
+şifreli oturumun içinden gider; büyük dosyalar sırasında görüntü ve fare akmaya devam eder.
+
 **Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı) ve "Bağlantıyı kes".
 
 **Teknik:** Görüntü Mac'te ScreenCaptureKit ile yakalanıp VideoToolbox ile donanımda H.264'e kodlanır (en uzun

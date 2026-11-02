@@ -16,9 +16,17 @@
 //!    Mac: `AYNA2 WAIT` (onay soruluyor) … `AYNA2 OK NEW|SAME <imza>` | `DENY` | `OFF` | `BUSY`.
 //! 3. Şifreli çerçeveler: `u32 uzunluk || AES-GCM(şifreli metin || etiket)`, nonce = 4 sıfır bayt ||
 //!    64 bit sayaç (yön başına). Düz metnin ilk baytı mesaj türü (bkz. `MSG_*`).
+//! 4. Dosyalar aynı şifreli oturumdan geçer. Windows → Mac: `PUT_BEGIN` (toplu iş, dosya no, boyut,
+//!    bırakılan nokta, göreli ad) · `PUT_DATA` · `PUT_END`; Mac her dosyadan sonra `PUT_DONE`.
+//!    Mac → Windows: Windows `DRAG_QUERY` sorar (Mac'te dosya sürüklenip pencere dışına çıkıldı),
+//!    Mac `DRAG_LIST` ile sürüklenen dosyaları bildirir, Windows her birini `GET` ile ister, Mac
+//!    `GET_BEGIN` · `GET_DATA` · `GET_END` ile gönderir.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +68,33 @@ const MSG_KEYFRAME: u8 = 0x14;
 const MSG_PING: u8 = 0x15;
 const MSG_PAUSE: u8 = 0x16;
 const MSG_LEAVE: u8 = 0x17;
+const MSG_PUT_BEGIN: u8 = 0x20;
+const MSG_PUT_DATA: u8 = 0x21;
+const MSG_PUT_END: u8 = 0x22;
+const MSG_DRAG_QUERY: u8 = 0x23;
+const MSG_GET: u8 = 0x24;
+// Mac → Windows (dosyalar)
+const MSG_DRAG_LIST: u8 = 0x30;
+const MSG_GET_BEGIN: u8 = 0x31;
+const MSG_GET_DATA: u8 = 0x32;
+const MSG_GET_END: u8 = 0x33;
+const MSG_GET_ERROR: u8 = 0x34;
+const MSG_PUT_DONE: u8 = 0x35;
+
+/// Dosya olayı (iş parçacığı → Mac penceresi); WPARAM `FILES_*`.
+pub const WM_APP_FILES: u32 = WM_APP + 28;
+/// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
+pub const FILES_LISTED: usize = 1;
+/// Mac'ten sürüklenen dosyaların hepsi geldi.
+pub const FILES_READY: usize = 2;
+/// Mac'te dosya sürüklenmiyordu.
+pub const FILES_NONE: usize = 3;
+/// Kullanıcıya gösterilecek not var (`Mac::take_note`).
+pub const FILES_NOTE: usize = 4;
+/// Gönderim parçası ve gönderilmeyi bekleyen en çok dosya verisi.
+const CHUNK: usize = 60_000;
+const QUEUE_LIMIT: usize = 4 << 20;
+const MAX_ITEMS: usize = 2000;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum State {
@@ -115,7 +150,36 @@ struct Inner {
 struct Shared {
     inner: Mutex<Inner>,
     player: Mutex<Option<Player>>,
+    /// Yazıcı kuyruğundaki dosya verisi (bayt): gönderen bunu aşınca bekler. Oturum başına yenidir;
+    /// yazıcı biterken sıfırlanır (bekleyen gönderici uyanır, kapanmış kanalı görüp durur).
+    queued: Mutex<Arc<AtomicUsize>>,
+    /// Mac'e gönderilen toplu işler: beklenen ve tamamlanan dosya sayısı.
+    batches: Mutex<HashMap<u32, (usize, usize)>>,
+    /// Mac'ten gelen (sürüklenen) dosyalar.
+    incoming: Mutex<Option<DragIn>>,
+    /// Mac'e "dosya sürükleniyor mu?" soruldu; Mac'in listesi yalnız o zaman kabul edilir.
+    drag_asked: AtomicBool,
+    note: Mutex<Option<String>>,
 }
+
+/// Mac'ten sürüklenip alınan dosyalar.
+struct DragIn {
+    dir: PathBuf,
+    /// Doğrulanmış göreli yollar (`dir` altında kalır).
+    names: Vec<PathBuf>,
+    /// Mac'in bildirdiği boyut: fazlası yazılmaz.
+    left: Vec<u64>,
+    files: Vec<Option<std::fs::File>>,
+    /// Sıra başına: bitti mi (bitiş iletisi yinelenirse bir kez sayılır).
+    finished: Vec<bool>,
+    done: usize,
+}
+
+/// Dosya numaraları tüm toplu işlerde tektir (Mac dosyaları numarayla ayırır; üst üste iki
+/// bırakma karışmasın).
+static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(0);
+/// Mac'ten sürüklenen her parti kendi geçici klasörüne.
+static NEXT_DRAG_DIR: AtomicU32 = AtomicU32::new(0);
 
 impl Shared {
     fn publish(&self, attempt: u32, f: impl FnOnce(&mut Inner)) -> bool {
@@ -152,8 +216,88 @@ impl Mac {
                     decision: None,
                 }),
                 player: Mutex::new(None),
+                queued: Mutex::new(Arc::new(AtomicUsize::new(0))),
+                batches: Mutex::new(HashMap::new()),
+                incoming: Mutex::new(None),
+                drag_asked: AtomicBool::new(false),
+                note: Mutex::new(None),
             }),
         }
+    }
+
+    /// Dosya ve klasörleri Mac'e gönderir; (x, y) Mac penceresinde bırakılan nokta (0..65535).
+    /// Mac, o noktadaki Finder klasörüne (yoksa Masaüstü'ne) kaydeder. Bağlı değilse false.
+    pub fn send_files(&self, paths: Vec<PathBuf>, x: u16, y: u16) -> bool {
+        let Some(tx) = self.shared.inner.lock().unwrap().tx.clone() else { return false };
+        let queued = self.shared.queued.lock().unwrap().clone();
+        let (shared, notify) = (self.shared.clone(), self.notify.0 as isize);
+        std::thread::spawn(move || {
+            let mut files = Vec::new();
+            for p in &paths {
+                let base = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                collect(p, &base, &mut files, 0);
+            }
+            files.truncate(MAX_ITEMS);
+            if files.is_empty() {
+                return;
+            }
+            let batch = crypto::random::<4>().map_or(1, u32::from_be_bytes);
+            shared.batches.lock().unwrap().insert(batch, (files.len(), 0));
+            for (path, rel) in files {
+                let id = NEXT_FILE_ID.fetch_add(1, Ordering::SeqCst);
+                match send_file(&tx, &queued, batch, id, &path, &rel, x, y) {
+                    Sent::Done => {}
+                    Sent::Skipped => {
+                        let mut batches = shared.batches.lock().unwrap();
+                        if let Some(entry) = batches.get_mut(&batch) {
+                            entry.0 -= 1;
+                        }
+                        finish_batch(&shared, &mut batches, batch, None, notify);
+                    }
+                    Sent::Closed => break,
+                }
+            }
+        });
+        true
+    }
+
+    /// Mac'te dosya sürükleniyor mu? Yanıt `WM_APP_FILES` ile gelir.
+    pub fn query_drag(&self) {
+        self.shared.drag_asked.store(true, Ordering::SeqCst);
+        self.send(vec![MSG_DRAG_QUERY]);
+    }
+
+    /// Bildirilen sürüklenen dosyaları ister.
+    pub fn request_dragged(&self) {
+        let count = self.shared.incoming.lock().unwrap().as_ref().map_or(0, |d| d.names.len());
+        for i in 0..count as u32 {
+            let mut m = vec![MSG_GET];
+            m.extend_from_slice(&i.to_be_bytes());
+            self.send(m);
+        }
+    }
+
+    pub fn dragged_count(&self) -> usize {
+        self.shared.incoming.lock().unwrap().as_ref().map_or(0, |d| d.names.len())
+    }
+
+    /// Alınmış sürüklenen dosyalar: en üst düzey öğeler (dosya ya da klasör), hepsi aynı klasörde.
+    pub fn take_dragged(&self) -> Vec<PathBuf> {
+        let Some(d) = self.shared.incoming.lock().unwrap().take() else { return Vec::new() };
+        let mut top: Vec<PathBuf> = Vec::new();
+        for n in &d.names {
+            if let Some(first) = n.components().next() {
+                let p = d.dir.join(first);
+                if p.parent() == Some(d.dir.as_path()) && !top.contains(&p) && p.exists() {
+                    top.push(p);
+                }
+            }
+        }
+        top
+    }
+
+    pub fn take_note(&self) -> Option<String> {
+        self.shared.note.lock().unwrap().take()
     }
 
     pub fn state(&self) -> State {
@@ -571,7 +715,13 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     // Ortak zaman başlangıcı: yoklama (ping) zaman damgası yanıtla (pong) geri gelir, gidiş-dönüş
     // süresi ölçülür (Mac'te biriken gönderim kuyruğu da bunda görünür).
     let epoch = Instant::now();
-    std::thread::spawn(move || write_loop(writer, tx_aead, out, epoch));
+    let queued = Arc::new(AtomicUsize::new(0));
+    *shared.queued.lock().unwrap() = queued.clone();
+    shared.batches.lock().unwrap().clear();
+    std::thread::spawn(move || {
+        write_loop(writer, tx_aead, out, epoch, &queued);
+        queued.store(0, Ordering::SeqCst);
+    });
 
     let mut stats = Stats::new();
     let mut last_data = Instant::now();
@@ -609,6 +759,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
             }
             MSG_BYE => return Ok(true),
+            MSG_DRAG_LIST..=MSG_PUT_DONE => receive_file_message(shared, &plain, notify),
             _ => {}
         }
     }
@@ -646,6 +797,237 @@ fn wait_for_decision(
             return Err("Doğrulama kodu onaylanmadı (süre doldu).".into());
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dosyalar
+
+/// Bir dosyayı ya da klasörü (içiyle) göreli adlarla listeler; bağlantılar ve çok derin yapılar atlanır.
+fn collect(path: &Path, rel: &str, out: &mut Vec<(PathBuf, String)>, depth: usize) {
+    if out.len() >= MAX_ITEMS || depth > 32 {
+        return;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else { return };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            collect(&e.path(), &format!("{rel}/{name}"), out, depth + 1);
+        }
+    } else if meta.is_file() {
+        out.push((path.to_path_buf(), rel.to_string()));
+    }
+}
+
+enum Sent {
+    Done,
+    /// Açılamadı (kilitli, silinmiş): Mac'e hiç gitmedi.
+    Skipped,
+    /// Bağlantı kapandı.
+    Closed,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_file(tx: &Sender<Vec<u8>>, queued: &AtomicUsize, batch: u32, id: u32, path: &Path, rel: &str, x: u16, y: u16) -> Sent {
+    use std::io::Read as _;
+    let Ok(mut f) = std::fs::File::open(path) else { return Sent::Skipped };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let name = rel.as_bytes();
+    let mut m = vec![MSG_PUT_BEGIN];
+    m.extend_from_slice(&batch.to_be_bytes());
+    m.extend_from_slice(&id.to_be_bytes());
+    m.extend_from_slice(&size.to_be_bytes());
+    m.extend_from_slice(&x.to_be_bytes());
+    m.extend_from_slice(&y.to_be_bytes());
+    m.extend_from_slice(&(name.len().min(u16::MAX as usize) as u16).to_be_bytes());
+    m.extend_from_slice(&name[..name.len().min(u16::MAX as usize)]);
+    if tx.send(m).is_err() {
+        return Sent::Closed;
+    }
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        // Geri basınç: yazıcı yetişene dek beklenir (bellek şişmez, görüntü ve fare de akar).
+        while queued.load(Ordering::SeqCst) > QUEUE_LIMIT {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut d = Vec::with_capacity(5 + n);
+        d.push(MSG_PUT_DATA);
+        d.extend_from_slice(&id.to_be_bytes());
+        d.extend_from_slice(&buf[..n]);
+        queued.fetch_add(d.len(), Ordering::SeqCst);
+        if tx.send(d).is_err() {
+            return Sent::Closed;
+        }
+    }
+    let mut e = vec![MSG_PUT_END];
+    e.extend_from_slice(&id.to_be_bytes());
+    if tx.send(e).is_ok() { Sent::Done } else { Sent::Closed }
+}
+
+/// Toplu işte beklenen dosyaların hepsi Mac'e ulaştıysa bildirim yazılır.
+fn finish_batch(shared: &Shared, batches: &mut HashMap<u32, (usize, usize)>, batch: u32, dest: Option<&str>, notify: isize) {
+    let Some(&(expected, done)) = batches.get(&batch) else { return };
+    if done < expected && expected > 0 {
+        return;
+    }
+    batches.remove(&batch);
+    if done == 0 {
+        return;
+    }
+    let folder = dest.map(|d| d.trim_end_matches('/').rsplit('/').next().unwrap_or("Mac").to_string());
+    *shared.note.lock().unwrap() = Some(match folder {
+        Some(f) => format!("Mac'e kopyalandı: {done} dosya → {f}"),
+        None => format!("Mac'e kopyalandı: {done} dosya"),
+    });
+    post_files(notify, FILES_NOTE);
+}
+
+/// Mac'ten gelen göreli adı güvenli bir Windows yoluna çevirir (`..`, mutlak yol, sürücü yok).
+fn safe_relative(name: &str) -> Option<PathBuf> {
+    let mut p = PathBuf::new();
+    for part in name.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.contains(['\\', ':', '<', '>', '"', '|', '?', '*']) || part.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        // CON, NUL, COM1… ve sonda nokta/boşluk Windows'ta başka bir şeye (aygıta, kırpılmış ada) gider.
+        let stem = part.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit());
+        if reserved || part.ends_with(['.', ' ']) {
+            return None;
+        }
+        p.push(part);
+    }
+    (!p.as_os_str().is_empty()).then_some(p)
+}
+
+/// Önceki sürüklemelerin bir saatten eski geçici klasörleri (bu sürüklemeninki hariç).
+fn clean_old_drags(root: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(3600));
+        if path != keep && old {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+fn be32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn be64(b: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_be_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+fn post_files(notify: isize, what: usize) {
+    unsafe {
+        let _ = PostMessageW(HWND(notify as _), WM_APP_FILES, WPARAM(what), LPARAM(0));
+    }
+}
+
+fn receive_file_message(shared: &Shared, m: &[u8], notify: isize) {
+    use std::io::Write as _;
+    match m[0] {
+        MSG_DRAG_LIST => {
+            // Yalnız bizim sorumuza gelen yanıt; Mac kendiliğinden dosya dayatamaz.
+            if !shared.drag_asked.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let count = m.get(1..3).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]) as usize);
+            let mut names = Vec::new();
+            let mut left = Vec::new();
+            let mut at = 3;
+            for _ in 0..count.min(MAX_ITEMS) {
+                let (Some(size), Some(len)) = (be64(m, at), m.get(at + 8..at + 10)) else { break };
+                let len = u16::from_be_bytes([len[0], len[1]]) as usize;
+                let Some(name) = m.get(at + 10..at + 10 + len) else { break };
+                // Uygunsuz bir ad (mutlak yol, "..", sürücü, ağ yolu) varsa liste bütünüyle reddedilir.
+                let Some(rel) = std::str::from_utf8(name).ok().and_then(safe_relative) else {
+                    util::log("Mac'ten gelen sürükleme listesinde uygunsuz ad: reddedildi.");
+                    post_files(notify, FILES_NONE);
+                    return;
+                };
+                names.push(rel);
+                left.push(size);
+                at += 10 + len;
+            }
+            if names.is_empty() {
+                post_files(notify, FILES_NONE);
+                return;
+            }
+            // Her sürükleme kendi geçici klasörüne. Kabuk bırakmadan sonra da arka planda
+            // kopyalayabildiği için önceki klasörler hemen silinmez; bir saatten eskiler temizlenir.
+            let root = std::env::temp_dir().join("AynaMerkezi-Mac");
+            let n = NEXT_DRAG_DIR.fetch_add(1, Ordering::SeqCst);
+            let dir = root.join(format!("{}-{n}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let keep = dir.clone();
+            std::thread::spawn(move || clean_old_drags(&root, &keep));
+            let files = names.iter().map(|_| None).collect();
+            let finished = vec![false; names.len()];
+            *shared.incoming.lock().unwrap() = Some(DragIn { dir, names, left, files, finished, done: 0 });
+            post_files(notify, FILES_LISTED);
+        }
+        MSG_GET_BEGIN | MSG_GET_DATA | MSG_GET_END | MSG_GET_ERROR => {
+            let Some(index) = be32(m, 1).map(|i| i as usize) else { return };
+            let mut guard = shared.incoming.lock().unwrap();
+            let Some(d) = guard.as_mut() else { return };
+            if index >= d.names.len() {
+                return;
+            }
+            match m[0] {
+                MSG_GET_BEGIN => {
+                    if !d.finished[index] && d.files[index].is_none() {
+                        let path = d.dir.join(&d.names[index]);
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        d.files[index] = std::fs::File::create(path).ok();
+                    }
+                }
+                MSG_GET_DATA => {
+                    let data = &m[5..];
+                    let n = (data.len() as u64).min(d.left[index]) as usize;
+                    d.left[index] -= n as u64;
+                    if let Some(f) = d.files[index].as_mut() {
+                        let _ = f.write_all(&data[..n]);
+                    }
+                }
+                _ => {
+                    d.files[index] = None;
+                    if std::mem::replace(&mut d.finished[index], true) {
+                        return;
+                    }
+                    d.done += 1;
+                    if d.done == d.names.len() {
+                        drop(guard);
+                        post_files(notify, FILES_READY);
+                    }
+                }
+            }
+        }
+        MSG_PUT_DONE => {
+            let (Some(batch), Some(count)) = (be32(m, 1), m.get(5..7)) else { return };
+            let count = u16::from_be_bytes([count[0], count[1]]) as usize;
+            let dest = String::from_utf8_lossy(m.get(7..).unwrap_or_default()).to_string();
+            let mut batches = shared.batches.lock().unwrap();
+            if let Some(entry) = batches.get_mut(&batch) {
+                entry.1 = count;
+                finish_batch(shared, &mut batches, batch, Some(&dest), notify);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -691,7 +1073,7 @@ impl Stats {
 }
 
 /// Giden mesajları şifreleyip yazar; arada bir canlılık yoklaması gönderir.
-fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, started: Instant) {
+fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, started: Instant, queued: &AtomicUsize) {
     let mut last_ping = Instant::now();
     loop {
         let mut batch = Vec::new();
@@ -721,6 +1103,10 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
         }
         if writer.write_all(&bytes).is_err() {
             return;
+        }
+        let sent: usize = batch.iter().filter(|m| m.first() == Some(&MSG_PUT_DATA)).map(|m| m.len()).sum();
+        if sent > 0 {
+            queued.fetch_sub(sent.min(queued.load(Ordering::SeqCst)), Ordering::SeqCst);
         }
         if batch.iter().any(|m| m.first() == Some(&MSG_LEAVE)) {
             return;

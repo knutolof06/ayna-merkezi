@@ -17,9 +17,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryPoint, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::dragout;
 use crate::gst::{self, Player};
+use crate::toast;
+use crate::transfer;
 use crate::hub::{self, card_bg, card_bg_alpha, colorref, hit, palette, point, slider, text, to_rect, Fonts};
 use crate::mac::{self, Mac, State};
 use crate::mirror::{WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
@@ -80,6 +84,10 @@ struct View {
     last_pos: (u16, u16),
     /// Zamanlayıcının en son gördüğü durum (pencere gizliyken de değişim anlaşılsın).
     seen: Option<State>,
+    /// Basılı fareyle pencere dışına çıkıldı, Mac'e "dosya sürükleniyor mu?" soruldu.
+    drag_queried: bool,
+    /// Mac'ten sürüklenen dosyalar alınıyor; fare bırakılana dek Mac'e fare iletilmez.
+    dragging_out: bool,
 }
 
 thread_local! {
@@ -278,11 +286,15 @@ pub fn create() -> Option<HWND> {
             decided: false,
             last_pos: (u16::MAX / 2, u16::MAX / 2),
             seen: None,
+            drag_queried: false,
+            dragging_out: false,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
         SendMessageW(edit, WM_SETFONT, WPARAM(with(|v| v.fonts.code.0 as usize).unwrap_or(0)), LPARAM(1));
 
+        // Windows'tan sürüklenen dosyalar bu pencereye bırakılınca Mac'e gider.
+        DragAcceptFiles(hwnd, true);
         taskbar::set_target(Device::Mac, hwnd);
         taskbar::set_view(Device::Mac, hwnd);
         taskbar::set_enabled(Device::Mac, enabled());
@@ -510,6 +522,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             After::Mode
         }
         WM_APP_GO => After::Go,
+        WM_DROPFILES => {
+            let drop = HDROP(wp.0 as _);
+            let mut pt = POINT::default();
+            let _ = DragQueryPoint(drop, &mut pt);
+            if dragout::active() {
+                // Mac'ten gelen dosya yine Mac penceresine bırakıldı: geri gönderilmez.
+                DragFinish(drop);
+                return LRESULT(0);
+            }
+            if !connected() {
+                DragFinish(drop);
+                toast::show(hwnd, "Dosya göndermek için önce Mac'e bağlanın.");
+                return LRESULT(0);
+            }
+            let paths = transfer::dropped_paths(drop);
+            let sent = with(|v| {
+                let (x, y) = v.normalized((pt.x, pt.y));
+                v.mac.send_files(paths, x, y)
+            })
+            .unwrap_or(false);
+            if sent {
+                toast::show(hwnd, "Mac'e gönderiliyor…");
+            }
+            return LRESULT(0);
+        }
+        mac::WM_APP_FILES => {
+            files_event(hwnd, wp.0);
+            return LRESULT(0);
+        }
         WM_SIZE => {
             layout(hwnd);
             After::Paint
@@ -752,6 +793,8 @@ impl View {
 
     fn release_input(&mut self) {
         self.fake_ctrl = false;
+        self.drag_queried = false;
+        self.dragging_out = false;
         if !self.mac.connected() {
             self.keys.clear();
             self.buttons = 0;
@@ -793,6 +836,18 @@ impl View {
             }
         }
         if self.mac.connected() {
+            if self.dragging_out {
+                return After::None;
+            }
+            // Basılı fareyle pencerenin dışına çıkıldı: Mac'te dosya sürükleniyorsa Windows'a alınır.
+            let mut c = RECT::default();
+            unsafe {
+                let _ = GetClientRect(self.hwnd, &mut c);
+            }
+            if self.buttons & 1 != 0 && !self.drag_queried && !util::contains(&c, pt.0, pt.1) {
+                self.drag_queried = true;
+                self.mac.query_drag();
+            }
             let (x, y) = self.normalized(pt);
             self.last_pos = (x, y);
             self.mac.send(mac::mouse_move(x, y));
@@ -808,6 +863,18 @@ impl View {
 
     fn button(&mut self, button: u8, down: bool, pt: (i32, i32)) -> After {
         if self.mac.connected() {
+            if button == 0 && down {
+                self.drag_queried = false;
+            }
+            if button == 0 && !down {
+                self.drag_queried = false;
+                if std::mem::take(&mut self.dragging_out) {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    return After::None;
+                }
+            }
             let (x, y) = self.normalized(pt);
             self.last_pos = (x, y);
             unsafe {
@@ -996,6 +1063,78 @@ impl View {
                 }
             });
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mac'ten Windows'a sürüklenen dosyalar
+
+unsafe fn files_event(hwnd: HWND, what: usize) {
+    match what {
+        mac::FILES_LISTED => {
+            // Mac'teki sürükleme iptal edilir (Esc, sonra fare bırakılır): dosya orada bir yere
+            // düşmesin. Windows'ta fare hâlâ basılı; dosyalar gelince sürükleme burada sürer.
+            // Fare Windows'ta zaten bırakıldıysa (dosyalar Masaüstü'ne kaydedilir) iptal gerekmez.
+            let count = with(|v| {
+                if v.buttons & 1 != 0 {
+                    v.dragging_out = true;
+                    v.mac.send(mac::key(0x35, true));
+                    v.mac.send(mac::key(0x35, false));
+                    let (x, y) = v.last_pos;
+                    v.mac.send(mac::mouse_button(0, false, x, y));
+                    v.buttons &= !1;
+                }
+                v.mac.request_dragged();
+                v.mac.dragged_count()
+            })
+            .unwrap_or(0);
+            if count > 0 {
+                toast::show(hwnd, &format!("Mac'ten alınıyor: {count} dosya…"));
+            }
+        }
+        mac::FILES_READY => {
+            let Some(items) = with(|v| {
+                // OLE sürüklemesi fare bırakışını pencereye ulaştırmaz: bayraklar burada sıfırlanır.
+                v.dragging_out = false;
+                v.drag_queried = false;
+                v.mac.take_dragged()
+            }) else {
+                return;
+            };
+            let _ = ReleaseCapture();
+            if items.is_empty() {
+                toast::show(hwnd, "Mac'ten dosyalar alınamadı.");
+                return;
+            }
+            let held = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01 /* VK_LBUTTON */) < 0;
+            if held {
+                dragout::drag(&items);
+            } else {
+                // Fare dosyalar gelmeden bırakıldı: Masaüstü'ne kaydedilir.
+                let desktop = util::desktop_dir();
+                let mut saved = 0;
+                for item in &items {
+                    if let Some(name) = item.file_name() {
+                        let target = util::unique_in(&desktop, name);
+                        if util::move_path(item, &target) {
+                            saved += 1;
+                        }
+                    }
+                }
+                let note = if saved == items.len() {
+                    format!("Masaüstüne kaydedildi: {saved} öğe")
+                } else {
+                    format!("Masaüstüne kaydedildi: {saved}/{} öğe", items.len())
+                };
+                toast::show(hwnd, &note);
+            }
+        }
+        mac::FILES_NOTE => {
+            if let Some(note) = with(|v| v.mac.take_note()).flatten() {
+                toast::show(hwnd, &note);
+            }
+        }
+        _ => {}
     }
 }
 

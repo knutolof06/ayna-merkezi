@@ -4,6 +4,7 @@ mod ble;
 mod buttons;
 mod corners;
 mod crypto;
+mod dragout;
 mod gst;
 mod hid;
 mod hub;
@@ -50,6 +51,8 @@ fn main() {
         }
 
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // Sürükle-bırak (OLE) için.
+        let _ = windows::Win32::System::Ole::OleInitialize(None);
 
         let ble = ble::Ble::start();
         let engine = uxplay::Engine::new();

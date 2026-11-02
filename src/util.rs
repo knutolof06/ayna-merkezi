@@ -157,6 +157,58 @@ pub fn set_autostart(on: bool) {
     }
 }
 
+/// Kullanıcının Masaüstü klasörü (OneDrive'a yönlendirilmiş olabilir).
+pub fn desktop_dir() -> PathBuf {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG};
+    unsafe {
+        if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Desktop, KNOWN_FOLDER_FLAG(0), None) {
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            if !s.is_empty() {
+                return PathBuf::from(s);
+            }
+        }
+    }
+    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("Desktop")
+}
+
+/// Taşır; başka birime taşınamıyorsa (OneDrive'a yönlendirilmiş Masaüstü gibi) kopyalayıp siler.
+pub fn move_path(from: &std::path::Path, to: &std::path::Path) -> bool {
+    if std::fs::rename(from, to).is_ok() {
+        return true;
+    }
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+        if from.is_dir() {
+            std::fs::create_dir_all(to)?;
+            for e in std::fs::read_dir(from)? {
+                let e = e?;
+                copy_tree(&e.path(), &to.join(e.file_name()))?;
+            }
+            Ok(())
+        } else {
+            std::fs::copy(from, to).map(|_| ())
+        }
+    }
+    if copy_tree(from, to).is_err() {
+        return false;
+    }
+    let _ = if from.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) };
+    true
+}
+
+/// `dir` içinde `name` adı boştaysa onu, doluysa "ad (2).uzantı" biçiminde ilk boş adı verir.
+pub fn unique_in(dir: &std::path::Path, name: &std::ffi::OsStr) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = std::path::Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    (2..10_000).map(|i| dir.join(format!("{stem} ({i}){ext}"))).find(|c| !c.exists()).unwrap_or(first)
+}
+
 /// Başka iş parçacığının (ya da sürecin) penceresi bizim pencerenin çocuğu olunca Windows iki iş
 /// parçacığının girdi kuyruğunu birleştirir: görüntüyü çizen taraf her karede beklerken bizim fare ve
 /// klavye işlememiz de bekler (kontrolde gecikme ve takılma). Kuyruklar yeniden ayrılır.

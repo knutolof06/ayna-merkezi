@@ -22,6 +22,12 @@
 //   Mac yanıtı: "AYNA2 WAIT" … "AYNA2 OK NEW|SAME <HMAC(anahtar, "ok|T")>" | DENY | OFF | BUSY.
 // - Şifreli çerçeveler: u32 uzunluk || şifreli metin || etiket.
 //   nonce = 4 sıfır bayt || u64 sayaç (yön başına).
+// - Dosyalar (Windows → Mac): 0x20 PUT_BEGIN [toplu][no][boy u64][x][y][ad uz.][göreli ad],
+//   0x21 PUT_DATA [no][veri], 0x22 PUT_END [no]; Mac her dosyadan sonra 0x35 PUT_DONE
+//   [toplu][biten sayısı][hedef klasör]. Hedef, bırakılan noktadaki Finder penceresi ya da Masaüstü.
+// - Dosyalar (Mac → Windows, sürükleyip pencereden çıkarma): 0x23 DRAG_QUERY → 0x30 DRAG_LIST
+//   [sayı]{[boy u64][ad uz.][göreli ad]}; Windows her biri için 0x24 GET [sıra] ister, Mac 0x31
+//   GET_BEGIN [sıra][boy], 0x32 GET_DATA [sıra][veri], 0x33 GET_END | 0x34 GET_ERROR [sıra] yollar.
 
 import AppKit
 import CoreMedia
@@ -93,6 +99,18 @@ func be16(_ v: UInt16) -> [UInt8] { [UInt8(v >> 8), UInt8(v & 0xFF)] }
 func readBE16(_ d: Data, _ at: Int) -> UInt16 {
     let b = [UInt8](d)
     return UInt16(b[at]) << 8 | UInt16(b[at + 1])
+}
+
+func be32(_ v: UInt32) -> [UInt8] { [UInt8(v >> 24), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)] }
+
+func be64(_ v: UInt64) -> [UInt8] { (0..<8).map { UInt8((v >> (56 - 8 * UInt64($0))) & 0xFF) } }
+
+func readBE32(_ b: [UInt8], _ at: Int) -> UInt32 {
+    UInt32(b[at]) << 24 | UInt32(b[at + 1]) << 16 | UInt32(b[at + 2]) << 8 | UInt32(b[at + 3])
+}
+
+func readBE64(_ b: [UInt8], _ at: Int) -> UInt64 {
+    (0..<8).reduce(UInt64(0)) { $0 << 8 | UInt64(b[at + $1]) }
 }
 
 // MARK: - Kalıcı ayarlar
@@ -455,6 +473,13 @@ final class Injector {
     private var lastClick = (time: Date.distantPast, button: UInt8(0), count: Int64(0), point: CGPoint.zero)
     /// Düğme başına, basışta verilen tıklama sayısı (bırakış aynısını taşır).
     private var clickCount: [UInt8: Int64] = [:]
+    /// Windows kısayolunun Mac karşılığı: basışta seçilen çeviri bırakışta da aynen kullanılır.
+    private var mapped: [UInt16: Mapping] = [:]
+    /// Finder'da Ctrl+X: dosyalar kopyalanır, ardından gelen Ctrl+V taşır (Cmd+Opt+V). Kesme anındaki
+    /// pano sayacı: arada başka bir şey kopyalandıysa Ctrl+V yalnız yapıştırır.
+    private var finderCut: Int?
+
+    var leftDown: Bool { buttons.contains(0) }
 
     /// Basılı değiştirici tuşlardan (sol/sağ ayrı) bayraklar.
     private var flags: CGEventFlags {
@@ -538,9 +563,163 @@ final class Injector {
             return
         }
         if down { keys.insert(code) } else { keys.remove(code) }
-        let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
-        e?.flags = flags
+        let m: Mapping
+        if down {
+            // Basılı tutulup yinelenen tuş ilk basıştaki çeviriyi korur.
+            m = mapped[code] ?? translate(code)
+            mapped[code] = m
+        } else {
+            m = mapped.removeValue(forKey: code) ?? Mapping(code)
+        }
+        var f = flags
+        f.subtract(m.remove)
+        f.formUnion(m.add)
+        let e = CGEvent(keyboardEventSource: source, virtualKey: m.code, keyDown: down)
+        e?.flags = f
         e?.post(tap: .cghidEventTap)
+    }
+
+    struct Mapping {
+        var code: UInt16
+        var add: CGEventFlags = []
+        var remove: CGEventFlags = []
+        init(_ code: UInt16, add: CGEventFlags = [], remove: CGEventFlags = []) {
+            self.code = code
+            self.add = add
+            self.remove = remove
+        }
+    }
+
+    // Mac tuş kodları (kVK_*)
+    private static let kReturn: UInt16 = 0x24, kEnter: UInt16 = 0x4C, kTab: UInt16 = 0x30, kBackspace: UInt16 = 0x33
+    private static let kDelete: UInt16 = 0x75, kHome: UInt16 = 0x73, kEnd: UInt16 = 0x77, kF2: UInt16 = 0x78, kF4: UInt16 = 0x76
+    private static let kLeft: UInt16 = 0x7B, kRight: UInt16 = 0x7C, kDown: UInt16 = 0x7D, kUp: UInt16 = 0x7E
+    private static let kC: UInt16 = 0x08, kD: UInt16 = 0x02, kI: UInt16 = 0x22, kV: UInt16 = 0x09, kW: UInt16 = 0x0D
+    private static let kX: UInt16 = 0x07, kY: UInt16 = 0x10, kZ: UInt16 = 0x06, kOpenBracket: UInt16 = 0x21, kCloseBracket: UInt16 = 0x1E
+    /// Finder'da dosya işlemine çevrilen tuşlar (öbür tuşlarda odak sorulmaz).
+    private static let finderKeys: Set<UInt16> = [kDelete, kD, kReturn, kEnter, kF2, kBackspace, kUp, kX, kC, kV]
+
+    /// Windows alışkanlığı → Mac karşılığı. Windows'ta Ctrl Mac'e Cmd, Alt Option, Windows tuşu
+    /// Control olarak gelir; burada Windows'taki anlamı korunacak biçimde tuş/değiştirici değişir.
+    /// Finder'da dosya işlemleri (Delete çöpe atar, Enter açar, F2 yeniden adlandırır), yazı
+    /// alanlarında satır başı/sonu, her yerde kelime atlama ve geri al/yinele.
+    private func translate(_ code: UInt16) -> Mapping {
+        typealias K = Injector
+        let f = flags
+        let cmd = f.contains(.maskCommand), opt = f.contains(.maskAlternate), shift = f.contains(.maskShift)
+        if f.contains(.maskControl) { return Mapping(code) } // Windows tuşuyla basılanlar olduğu gibi
+        // Odak yalnız gerektiğinde sorulur (Erişilebilirlik çağrısı).
+        var textCache: Bool?
+        func text() -> Bool {
+            if textCache == nil { textCache = Injector.focusIsText() }
+            return textCache!
+        }
+        let finder = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder"
+        if finder && K.finderKeys.contains(code) && Injector.finderFileViewFocused() {
+            switch code {
+            case K.kDelete where !cmd && !opt:
+                // Delete: çöpe at; Shift+Delete: kalıcı sil (Finder yine onay sorar).
+                return shift ? Mapping(K.kBackspace, add: [.maskCommand, .maskAlternate], remove: [.maskShift])
+                             : Mapping(K.kBackspace, add: [.maskCommand])
+            case K.kD where cmd && !opt && !shift:
+                return Mapping(K.kBackspace)
+            case K.kReturn where !cmd && !opt && !shift, K.kEnter where !cmd && !opt && !shift:
+                return Mapping(K.kDown, add: [.maskCommand])
+            case K.kReturn where opt && !cmd, K.kEnter where opt && !cmd:
+                return Mapping(K.kI, add: [.maskCommand], remove: [.maskAlternate])
+            case K.kF2 where !cmd && !opt && !shift:
+                return Mapping(K.kReturn)
+            case K.kBackspace where !cmd && !opt && !shift:
+                return Mapping(K.kOpenBracket, add: [.maskCommand])
+            case K.kUp where opt && !cmd:
+                return Mapping(K.kUp, add: [.maskCommand], remove: [.maskAlternate])
+            case K.kX where cmd && !opt && !shift:
+                finderCut = NSPasteboard.general.changeCount
+                return Mapping(K.kC)
+            case K.kC where cmd && !opt:
+                finderCut = nil
+            case K.kV where cmd && !opt && !shift:
+                // Yalnız kesmenin kopyası panodaysa (sayaç bir arttı) taşınır.
+                defer { finderCut = nil }
+                if let base = finderCut, NSPasteboard.general.changeCount == base + 1 {
+                    return Mapping(K.kV, add: [.maskAlternate])
+                }
+            default:
+                break
+            }
+        }
+        switch code {
+        case K.kLeft where cmd && !opt, K.kRight where cmd && !opt,
+             K.kBackspace where cmd && !opt, K.kDelete where cmd && !opt:
+            // Ctrl+ok / Ctrl+Backspace / Ctrl+Delete: kelime kelime.
+            return Mapping(code, add: [.maskAlternate], remove: [.maskCommand])
+        case K.kY where cmd && !opt && !shift:
+            return Mapping(K.kZ, add: [.maskShift])
+        case K.kTab where cmd && !opt:
+            return Mapping(K.kTab, add: [.maskControl], remove: [.maskCommand])
+        case K.kHome where cmd && !opt, K.kEnd where cmd && !opt:
+            // Ctrl+Home/End: metnin başı/sonu.
+            return text() ? Mapping(code == K.kHome ? K.kUp : K.kDown) : Mapping(code, remove: [.maskCommand])
+        case K.kHome where !opt, K.kEnd where !opt:
+            return text() ? Mapping(code == K.kHome ? K.kLeft : K.kRight, add: [.maskCommand]) : Mapping(code)
+        case K.kLeft where opt && !cmd, K.kRight where opt && !cmd:
+            // Alt+ok: geri/ileri (yazı alanında Option+ok kelime atlar, dokunulmaz).
+            return text() ? Mapping(code)
+                          : Mapping(code == K.kLeft ? K.kOpenBracket : K.kCloseBracket, add: [.maskCommand], remove: [.maskAlternate])
+        case K.kF4 where opt && !cmd:
+            return Mapping(K.kW, add: [.maskCommand], remove: [.maskAlternate])
+        case K.kF4 where cmd && !opt:
+            return Mapping(K.kW)
+        default:
+            return Mapping(code)
+        }
+    }
+
+    /// Finder'da odak bir dosya görünümünde mi (simge, liste, sütun görünümü ya da Masaüstü)? Yalnız
+    /// bilinen roller ve olağan bir Finder penceresi (diyalog/sayfa değil) kabul edilir; herhangi bir
+    /// Erişilebilirlik çağrısı başarısızsa hayır: Delete dosya silmeye, Enter açmaya dönmez.
+    private static func finderFileViewFocused() -> Bool {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.15)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let f = focused, CFGetTypeID(f) == AXUIElementGetTypeID() else { return false }
+        let element = f as! AXUIElement
+        var role: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+              let r = role as? String,
+              ["AXList", "AXOutline", "AXBrowser", "AXTable", "AXScrollArea", "AXGroup"].contains(r) else { return false }
+        var window: CFTypeRef?
+        let ws = AXUIElementCopyAttributeValue(element, kAXWindowAttribute as CFString, &window)
+        // Masaüstü simgelerinin bir penceresi yoktur.
+        if ws == .noValue || ws == .attributeUnsupported { return true }
+        guard ws == .success, let w = window, CFGetTypeID(w) == AXUIElementGetTypeID() else { return false }
+        var subrole: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(w as! AXUIElement, kAXSubroleAttribute as CFString, &subrole) == .success else { return false }
+        return (subrole as? String) == (kAXStandardWindowSubrole as String)
+    }
+
+    /// Klavye odağı yazı yazılan bir alanda mı? Odak öğrenilemezse (izin yok, yanıt yok) evet
+    /// sayılır: dosya silme gibi çeviriler yanlışlıkla yazı alanında çalışmasın.
+    private static func focusIsText() -> Bool {
+        let system = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(system, 0.15)
+        var focused: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused)
+        if status == .noValue { return false }
+        guard status == .success, let f = focused, CFGetTypeID(f) == AXUIElementGetTypeID() else { return true }
+        let element = f as! AXUIElement
+        var role: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success else { return true }
+        if let r = role as? String, ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(r) { return true }
+        var subrole: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subrole)
+        if (subrole as? String) == "AXSearchField" { return true }
+        var settable: DarwinBoolean = false
+        var range: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &range) == .success
+            && AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success
+            && settable.boolValue
     }
 
     /// Oturum biterken basılı kalan her şey bırakılır.
@@ -554,6 +733,161 @@ final class Injector {
         }
         buttons.removeAll()
         keys.removeAll()
+        mapped.removeAll()
+    }
+}
+
+// MARK: - Dosya aktarımı
+
+/// Windows'tan gelmekte olan bir dosya: önce geçici dosyaya yazılır, bitince yerine taşınır.
+final class IncomingFile {
+    let batch: UInt32
+    let temp: URL
+    let target: URL?
+    let handle: FileHandle?
+    var remaining: UInt64
+
+    init(batch: UInt32, temp: URL, target: URL?, handle: FileHandle?, remaining: UInt64) {
+        self.batch = batch
+        self.temp = temp
+        self.target = target
+        self.handle = handle
+        self.remaining = remaining
+    }
+}
+
+struct IncomingBatch {
+    var dest: URL
+    /// Gelen en üst düzey ad → hedefte çakışmayan ad ("Rapor 2.pdf" gibi).
+    var names: [String: String] = [:]
+    var done: UInt16 = 0
+}
+
+enum Files {
+    static let maxItems = 2000
+    static let chunk = 60_000
+
+    static var desktop: URL { FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0] }
+
+    /// Windows'tan gelen göreli adın parçaları; "..", boş parça, mutlak yol kabul edilmez.
+    static func safeParts(_ name: String) -> [String]? {
+        let parts = name.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.count <= 33 else { return nil }
+        for p in parts where p.isEmpty || p == "." || p == ".." || p.contains(":") || p.unicodeScalars.contains(where: { $0.value < 0x20 }) {
+            return nil
+        }
+        return parts
+    }
+
+    /// Windows dosya adlarında olamayan karakterler "_" olur.
+    static func windowsSafe(_ part: String) -> String {
+        let bad = Set("\\:<>\"|?*")
+        let s = String(part.map { bad.contains($0) || ($0.unicodeScalars.first?.value ?? 32) < 0x20 ? "_" : $0 })
+        let trimmed = s.replacingOccurrences(of: "[ .]+$", with: "", options: .regularExpression)
+        if trimmed.isEmpty { return "_" }
+        let stem = (trimmed.split(separator: ".").first.map(String.init) ?? "").uppercased()
+        let reserved = ["CON", "PRN", "AUX", "NUL"].contains(stem)
+            || (stem.count == 4 && (stem.hasPrefix("COM") || stem.hasPrefix("LPT")) && stem.last!.isNumber)
+        return reserved ? "_" + trimmed : trimmed
+    }
+
+    /// `dir` içinde `name` boştaysa kendisi, doluysa Finder gibi "ad 2.uzantı".
+    static func unique(_ name: String, in dir: URL) -> String {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: dir.appendingPathComponent(name).path) { return name }
+        let ext = (name as NSString).pathExtension
+        let stem = (name as NSString).deletingPathExtension
+        for i in 2..<10_000 {
+            let candidate = ext.isEmpty ? "\(stem) \(i)" : "\(stem) \(i).\(ext)"
+            if !fm.fileExists(atPath: dir.appendingPathComponent(candidate).path) { return candidate }
+        }
+        return name
+    }
+
+    /// Başka bilgisayardan gelen dosya: Gatekeeper açılışta indirilmiş dosya gibi denetler.
+    static func quarantine(_ url: URL) {
+        let value = String(format: "0081;%08lx;Ayna Ajan;", Int(Date().timeIntervalSince1970))
+        _ = value.withCString { setxattr(url.path, "com.apple.quarantine", $0, strlen($0), 0, 0) }
+    }
+
+    /// Ekrandaki bir noktaya bırakılan dosyaların klasörü: noktadaki en üst pencere bir Finder
+    /// penceresiyse onun klasörü, değilse Masaüstü. Finder'a sormak Otomasyon izni ister (bir kez).
+    static func dropFolder(at point: CGPoint) -> URL {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return desktop }
+        var topIsFinder = false
+        for w in list {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let bounds = w[kCGWindowBounds as String],
+                  let r = CGRect(dictionaryRepresentation: bounds as! CFDictionary), r.contains(point) else { continue }
+            let pid = (w[kCGWindowOwnerPID as String] as? Int).map { pid_t($0) } ?? 0
+            topIsFinder = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.finder"
+            break
+        }
+        guard topIsFinder else { return desktop }
+        let script = """
+        tell application "Finder"
+            set out to ""
+            repeat with w in (every Finder window)
+                try
+                    set b to bounds of w
+                    set out to out & ((item 1 of b) as text) & "," & ((item 2 of b) as text) & "," & ((item 3 of b) as text) & "," & ((item 4 of b) as text) & "," & (POSIX path of (target of w as alias)) & linefeed
+                end try
+            end repeat
+            return out
+        end tell
+        """
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return desktop }
+        // İzin sorusu yanıtsız kalırsa beklemek sonsuza dek sürmesin.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { if proc.isRunning { proc.terminate() } }
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        proc.waitUntilExit()
+        // Finder pencereleri önden arkaya sıralı gelir; noktayı içeren ilk pencere.
+        for line in out.split(separator: "\n") {
+            let f = line.split(separator: ",", maxSplits: 4).map(String.init)
+            guard f.count == 5, let l = Double(f[0]), let t = Double(f[1]), let r = Double(f[2]), let b = Double(f[3]),
+                  CGRect(x: l, y: t, width: r - l, height: b - t).contains(point) else { continue }
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: f[4], isDirectory: &isDir), isDir.boolValue {
+                return URL(fileURLWithPath: f[4], isDirectory: true)
+            }
+            break
+        }
+        return desktop
+    }
+
+    /// Sürüklenen öğeler: dosyalar ve klasörlerin içindeki dosyalar (bağlantılar atlanır),
+    /// göreli adlarla ("Klasör/alt/dosya.txt").
+    static func expand(_ urls: [URL]) -> [(url: URL, name: String, size: UInt64)] {
+        var out: [(url: URL, name: String, size: UInt64)] = []
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        for u in urls {
+            let top = windowsSafe(u.lastPathComponent)
+            guard let v = try? u.resourceValues(forKeys: Set(keys + [.isDirectoryKey])), v.isSymbolicLink != true else { continue }
+            if v.isRegularFile == true {
+                out.append((u, top, UInt64(v.fileSize ?? 0)))
+            } else if v.isDirectory == true, let en = fm.enumerator(at: u, includingPropertiesForKeys: keys) {
+                let base = u.standardizedFileURL.path
+                for case let f as URL in en {
+                    guard out.count < maxItems else { return out }
+                    guard let fv = try? f.resourceValues(forKeys: Set(keys)), fv.isRegularFile == true, fv.isSymbolicLink != true,
+                          f.lastPathComponent != ".DS_Store" else { continue }
+                    let path = f.standardizedFileURL.path
+                    guard path.hasPrefix(base + "/") else { continue }
+                    let rel = path.dropFirst(base.count + 1).split(separator: "/").map { windowsSafe(String($0)) }
+                    out.append((f, ([top] + rel).joined(separator: "/"), UInt64(fv.fileSize ?? 0)))
+                }
+            }
+            if out.count >= maxItems { break }
+        }
+        return Array(out.prefix(maxItems))
     }
 }
 
@@ -584,6 +918,22 @@ final class Session {
     private let injector = Injector()
     private var lastData = Date()
     private var watchdog: Timer?
+    // Dosya aktarımı: dosya okuma/yazma kendi kuyruğunda (görüntü ve girdi beklemesin).
+    private let fileQueue = DispatchQueue(label: "ayna.files")
+    /// Mac'ten Windows'a dosya okuma ayrı kuyrukta (Finder'a sorarken yazma beklese de okuma sürer).
+    private let readQueue = DispatchQueue(label: "ayna.files.read")
+    /// Ana kuyrukta: dosya kuyruğuna verilmiş ama diske yazılmamış bayt. Çoksa okuma bekletilir
+    /// (Windows TCP'de durur, bellek şişmez).
+    private var pendingWrite = 0
+    /// Gönderim kuyruğunda: gönderilmeyi bekleyen dosya verisi ve oturum kapandı mı.
+    private var fileInFlight = 0
+    private var filesCancelled = false
+    /// Sol tuşa basıldığındaki sürükleme panosu sayacı: değiştiyse Mac'te bir şey sürükleniyor.
+    private var dragBaseline = NSPasteboard(name: .drag).changeCount
+    private var dragFiles: [URL] = []
+    /// Dosya kuyruğunda.
+    private var incoming: [UInt32: IncomingFile] = [:]
+    private var batches: [UInt32: IncomingBatch] = [:]
     private(set) var name = "Windows"
     private(set) var deviceID = ""
 
@@ -625,7 +975,7 @@ final class Session {
             guard let self, self.stage != .closed else { return }
             if let data, !data.isEmpty {
                 // Onay beklenirken Windows bir şey göndermez; gelen veri bağlantıyı kapatır.
-                if self.stage == .approval || self.buffer.count + data.count > 70_000 {
+                if self.stage == .approval || self.buffer.count + data.count > 140_000 {
                     self.close()
                     return
                 }
@@ -633,8 +983,19 @@ final class Session {
                 self.lastData = Date()
                 self.process()
             }
-            if complete || error != nil { self.close() } else { self.receive() }
+            if complete || error != nil { self.close() } else { self.receiveWhenReady() }
         }
+    }
+
+    private func receiveWhenReady() {
+        guard stage != .closed else { return }
+        if pendingWrite > 8_000_000 {
+            // Bilerek okunmuyor: sessizlik bekçisi bunu kopma saymasın.
+            lastData = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in self?.receiveWhenReady() }
+            return
+        }
+        receive()
     }
 
     private func take(_ n: Int) -> Data {
@@ -692,7 +1053,7 @@ final class Session {
         sendQueue.async { [weak self] in self?.sendNow(plain) }
     }
 
-    private func sendNow(_ plain: Data) {
+    private func sendNow(_ plain: Data, file: Bool = false) {
         guard let key = txKey, let box = try? AES.GCM.seal(plain, using: key, nonce: nonceData(txCounter)) else { return }
         txCounter += 1
         var frame = Data()
@@ -702,8 +1063,12 @@ final class Session {
         frame.append(sealed)
         let size = frame.count
         inFlight += size
+        if file { fileInFlight += size }
         conn.send(content: frame, completion: .contentProcessed { [weak self] _ in
-            self?.sendQueue.async { self?.inFlight -= size }
+            self?.sendQueue.async {
+                self?.inFlight -= size
+                if file { self?.fileInFlight -= size }
+            }
         })
     }
 
@@ -712,12 +1077,14 @@ final class Session {
         sendQueue.async { [weak self] in
             guard let self else { return }
             // Gönderilmeyi bekleyen veri az tutulur (~0,3 sn): birikirse gecikme büyür.
-            if self.inFlight > 512_000 {
+            // Dosya aktarımı kendi sınırıyla bekler; görüntü sınırı yalnız görüntü verisine bakar.
+            let pending = self.inFlight - self.fileInFlight
+            if pending > 512_000 {
                 self.needKey = true
                 return
             }
             if self.needKey && !key {
-                if self.inFlight < 128_000 {
+                if pending < 128_000 {
                     DispatchQueue.main.async { self.capturer?.requestKeyframe() }
                 }
                 return
@@ -845,6 +1212,11 @@ final class Session {
         case 0x10 where b.count >= 5:
             injector.move(readBE16(m, 1), readBE16(m, 3))
         case 0x11 where b.count >= 7:
+            if b[1] == 0 && b[2] == 1 {
+                // Yeni basış: önceki sürüklemenin dosyaları artık istenemez.
+                dragBaseline = NSPasteboard(name: .drag).changeCount
+                dragFiles = []
+            }
             injector.button(b[1], down: b[2] == 1, readBE16(m, 3), readBE16(m, 5))
         case 0x12 where b.count >= 5:
             injector.scroll(dx: Int16(bitPattern: readBE16(m, 1)), dy: Int16(bitPattern: readBE16(m, 3)))
@@ -858,9 +1230,168 @@ final class Session {
             capturer?.setPaused(b[1] == 1)
         case 0x17:
             close()
+        case 0x20 where b.count >= 23:
+            putBegin(b)
+        case 0x21 where b.count >= 5:
+            let id = readBE32(b, 1)
+            let data = Data(b[5...])
+            pendingWrite += data.count
+            fileQueue.async { [weak self] in
+                self?.putData(id, data)
+                DispatchQueue.main.async { self?.pendingWrite -= data.count }
+            }
+        case 0x22 where b.count >= 5:
+            let id = readBE32(b, 1)
+            fileQueue.async { [weak self] in self?.putEnd(id) }
+        case 0x23:
+            dragQuery()
+        case 0x24 where b.count >= 5:
+            get(readBE32(b, 1))
         default:
             break
         }
+    }
+
+    // --- Dosyalar: Windows → Mac
+
+    private func putBegin(_ b: [UInt8]) {
+        let batch = readBE32(b, 1), id = readBE32(b, 5), size = readBE64(b, 9)
+        let x = UInt16(b[17]) << 8 | UInt16(b[18]), y = UInt16(b[19]) << 8 | UInt16(b[20])
+        let len = Int(UInt16(b[21]) << 8 | UInt16(b[22]))
+        guard b.count >= 23 + len else { return }
+        let name = String(decoding: b[23..<(23 + len)], as: UTF8.self)
+        let screen = CGDisplayBounds(CGMainDisplayID())
+        let point = CGPoint(x: screen.minX + CGFloat(x) / 65535 * screen.width, y: screen.minY + CGFloat(y) / 65535 * screen.height)
+        fileQueue.async { [weak self] in self?.putOpen(batch: batch, id: id, size: size, point: point, name: name) }
+    }
+
+    private func putOpen(batch: UInt32, id: UInt32, size: UInt64, point: CGPoint, name: String) {
+        if let old = incoming.removeValue(forKey: id) { discard(old) }
+        if batches[batch] == nil {
+            if batches.count > 64 { batches.removeAll() }
+            batches[batch] = IncomingBatch(dest: Files.dropFolder(at: point))
+        }
+        let fm = FileManager.default
+        let temp = fm.temporaryDirectory.appendingPathComponent("ayna-\(UUID().uuidString)")
+        guard incoming.count < 8 else {
+            // Aynı anda çok dosya açılmaz; yine de "bitti" sayılır.
+            incoming[id] = IncomingFile(batch: batch, temp: temp, target: nil, handle: nil, remaining: size)
+            return
+        }
+        var target: URL?
+        var handle: FileHandle?
+        // Uygunsuz ad atlanır ama yine de "bitti" sayılır (Windows'taki sayaç tamamlansın).
+        if var b = batches[batch], let parts = Files.safeParts(name) {
+            let top = b.names[parts[0]] ?? Files.unique(parts[0], in: b.dest)
+            b.names[parts[0]] = top
+            batches[batch] = b
+            target = parts.dropFirst().reduce(b.dest.appendingPathComponent(top)) { $0.appendingPathComponent($1) }
+            if fm.createFile(atPath: temp.path, contents: nil) {
+                handle = try? FileHandle(forWritingTo: temp)
+            }
+        }
+        incoming[id] = IncomingFile(batch: batch, temp: temp, target: target, handle: handle, remaining: size)
+    }
+
+    private func putData(_ id: UInt32, _ data: Data) {
+        guard let f = incoming[id], let h = f.handle else { return }
+        let n = Int(min(UInt64(data.count), f.remaining))
+        guard n > 0 else { return }
+        if (try? h.write(contentsOf: data.prefix(n))) == nil {
+            discard(f)
+            incoming[id] = IncomingFile(batch: f.batch, temp: f.temp, target: nil, handle: nil, remaining: 0)
+            return
+        }
+        f.remaining -= UInt64(n)
+    }
+
+    private func putEnd(_ id: UInt32) {
+        guard let f = incoming.removeValue(forKey: id) else { return }
+        try? f.handle?.close()
+        // Bildirilen boyut gelmediyse dosya eksiktir, yerine konmaz.
+        if let target = f.target, f.handle != nil, f.remaining == 0 {
+            let fm = FileManager.default
+            let dir = target.deletingLastPathComponent()
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let final = dir.appendingPathComponent(Files.unique(target.lastPathComponent, in: dir))
+            if (try? fm.moveItem(at: f.temp, to: final)) == nil {
+                try? fm.removeItem(at: f.temp)
+            } else {
+                Files.quarantine(final)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: f.temp)
+        }
+        guard var b = batches[f.batch] else { return }
+        b.done &+= 1
+        batches[f.batch] = b
+        send(Data([0x35] + be32(f.batch) + be16(b.done)) + Data(b.dest.path.utf8))
+    }
+
+    private func discard(_ f: IncomingFile) {
+        try? f.handle?.close()
+        try? FileManager.default.removeItem(at: f.temp)
+    }
+
+    // --- Dosyalar: Mac → Windows
+
+    /// Windows sorar: fare basılıyken pencereden çıkıldı; Mac'te dosya sürükleniyor mu?
+    private func dragQuery() {
+        let pb = NSPasteboard(name: .drag)
+        var items: [(url: URL, name: String, size: UInt64)] = []
+        if injector.leftDown && pb.changeCount != dragBaseline,
+           let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            items = Files.expand(urls)
+        }
+        // Liste tek çerçeveye sığmalı.
+        var body = Data()
+        var count = 0
+        for item in items {
+            let name = Data(item.name.utf8)
+            guard name.count <= 4096, body.count + 10 + name.count < 60_000 else { break }
+            body.append(contentsOf: be64(item.size) + be16(UInt16(name.count)))
+            body.append(name)
+            count += 1
+        }
+        dragFiles = items.prefix(count).map { $0.url }
+        send(Data([0x30] + be16(UInt16(count))) + body)
+    }
+
+    private func get(_ index: UInt32) {
+        guard Int(index) < dragFiles.count else {
+            send(Data([0x34] + be32(index)))
+            return
+        }
+        let url = dragFiles[Int(index)]
+        readQueue.async { [weak self] in self?.stream(url, index) }
+    }
+
+    private func stream(_ url: URL, _ index: UInt32) {
+        // Listeden sonra bağlantıya dönüştürülmüş yol izlenmez; yalnız olağan dosya okunur.
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW)
+        var st = stat()
+        guard fd >= 0, fstat(fd, &st) == 0, (Int(st.st_mode) & Int(S_IFMT)) == Int(S_IFREG) else {
+            if fd >= 0 { Darwin.close(fd) }
+            send(Data([0x34] + be32(index)))
+            return
+        }
+        let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer { try? h.close() }
+        let size = UInt64(st.st_size)
+        send(Data([0x31] + be32(index) + be64(size)))
+        while true {
+            // Geri basınç: bekleyen dosya verisi ~1 MB'ı geçmez (görüntü ve girdi akmaya devam eder).
+            while true {
+                let (cancelled, pending) = sendQueue.sync { (filesCancelled, fileInFlight) }
+                if cancelled { return }
+                if pending < 1_000_000 { break }
+                usleep(2_000)
+            }
+            guard let chunk = try? h.read(upToCount: Files.chunk), !chunk.isEmpty else { break }
+            let message = Data([0x32] + be32(index)) + chunk
+            sendQueue.async { [weak self] in self?.sendNow(message, file: true) }
+        }
+        send(Data([0x33] + be32(index)))
     }
 
     func close() {
@@ -871,6 +1402,11 @@ final class Session {
         capturer?.stop()
         capturer = nil
         injector.releaseAll()
+        sendQueue.async { [self] in filesCancelled = true }
+        fileQueue.async { [self] in
+            for f in incoming.values { discard(f) }
+            incoming.removeAll()
+        }
         if wasStreaming {
             // Güçlü yakalama: oturum listeden çıksa da veda iletisi gidip bağlantı kapanana dek yaşar.
             sendQueue.async { [self] in

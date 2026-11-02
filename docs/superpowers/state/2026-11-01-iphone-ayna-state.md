@@ -51,7 +51,7 @@
 - 2026-11-03: Kullanıcı: otomatik güncelleme istedi. Kararlar: depo herkese açık (gizli bilgi taraması temiz), Mac sabit imza anahtarı (self-signed, GitHub secret MAC_SIGN_P12/MAC_SIGN_PASSWORD, sertifika SHA-1 c7251ef4…5fa0). CI her main gönderiminde vN sürümü yayınlar; bildirge (manifest.txt) aynı RSA anahtarıyla imzalı (manifest.sig); Windows (update.rs, CNG) ve Mac (Updater, Security) yalnız imzalı+daha yeni sürümü kurar. Ayrı sürüm anahtarı secret'ı otomatik onay katmanınca reddedildi → aynı anahtar kullanıldı. Sürüm 6 yayınlandı ve gerçek imza zinciri Windows kodu ile doğrulandı; bu PC'de v6 exe çalışıyor.
 
 ## Sonraki Adım
-Kullanıcı Mac'e Sürüm 6'yı (v6 AynaAjan.dmg) kurup izinleri verir, Windows'ta Mac ikonundan kodla bağlanır (iki tarafta onay). Gerçek Mac'te görüntü/girdi henüz denenmedi.
+Sürükle-bırak dosya aktarımı (iki yön) ve Windows kısayol çevirisi yazıldı (2026-11-03). Windows tarafı sahte Mac ile uçtan uca doğrulandı (gönderme + dışarı sürükleme, hash eşit); OLE DoDragDrop yolu ve Swift tarafı gerçek Mac'te denenmedi. Sıra: review düzeltmeleri → commit → push (kullanıcı onayı) → CI sürümü → kullanıcı Mac'te "Güncellemeleri denetle" + Finder Otomasyon izni. Girdi gecikmesi testinin sonucu (`%TEMP%\iPhoneAyna.log` "Girdi gecikmesi") hâlâ bekleniyor.
 
 ## Açık Sorular / Bekleyen Onaylar
 - [x] Yerel doğrulama: derleme, birim testler, ikon konumu/aç-kapa, sağ tık menüsü, temiz çıkış, devre dışı çocuk pencere fare yönlendirmesi, BLE HID yayını başladı

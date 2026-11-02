@@ -5,7 +5,12 @@ edition = "2021"
 description = "iPhone ekranını Windows'a yansıtır, PC'nin Bluetooth'uyla fare/klavye olarak kontrol eder"
 
 [dependencies]
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+  "implement",
+  "Win32_System_Ole",
+  "Win32_System_SystemServices",
+  "Win32_UI_Shell_Common",
   "Foundation",
   "Foundation_Collections",
   "Devices_Bluetooth",
