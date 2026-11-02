@@ -330,4 +330,15 @@ mod live {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("\"full_name\":\"knutolof06/ayna-merkezi\""), "{}", &text[..200.min(text.len())]);
     }
+
+    /// Ağ gerektirir: gerçek son sürümü imza ve özetiyle baştan sona doğrular.
+    #[test]
+    #[ignore]
+    fn latest_release_verifies() {
+        let got = super::check().unwrap();
+        assert!(got.is_some_and(|v| v >= 6), "{got:?}");
+        let new = crate::util::exe_path().with_extension("yeni.exe");
+        assert!(new.exists());
+        let _ = std::fs::remove_file(new);
+    }
 }
