@@ -43,8 +43,10 @@
 
 - 2026-11-02: Kullanıcı: ses tuşları çalışıyor, güç tuşu çalışmıyor; "geri kalan için her şeyi yap onaylıyorum". Güç tuşu: 6 kilitleme yöntemi sırayla denenir, yansıtma kesilmesiyle doğrulanıp hatırlanır (GucYontemi). Plan uygulandı: tüm monitörlerde ikonlar (iPhone + Mac), hub.rs (Ayna Merkezi), mac.rs (UDP bulma + TOFU/HMAC güven + RustDesk --connect), mac-agent (Swift). İki review (doğruluk + güvenlik) bulguları uygulandı. Windows zinciri sahte ajanla uçtan uca doğrulandı (eşleşme, imzalı yeniden bağlanma, sahte Mac reddi).
 
+- 2026-11-02: Özel depo oluşturuldu: https://github.com/knutolof06/ayna-merkezi (boş). Push reddedildi: gh belirtecinde `workflow` kapsamı yok. Kullanıcı `gh auth refresh -h github.com -s workflow` çalıştırınca `git push -u origin main`, sonra Actions sonucu (Swift derlemesi ilk kez orada doğrulanacak).
+
 ## Sonraki Adım
-Kullanıcı: (1) iPhone'da güç tuşunu birkaç kez dene (yöntem öğrenilir). (2) Mac mini'de RustDesk 1.5.1 + Actions'tan AynaAjan.dmg kur, kodla bağlan. Mac tarafı gerçek cihazda henüz test edilmedi.
+Push bekliyor (workflow kapsamı). Kullanıcı: (1) iPhone'da güç tuşunu birkaç kez dene (yöntem öğrenilir). (2) Mac mini'de RustDesk 1.5.1 + Actions'tan AynaAjan.dmg kur, kodla bağlan. Mac tarafı gerçek cihazda henüz test edilmedi.
 
 ## Açık Sorular / Bekleyen Onaylar
 - [x] Yerel doğrulama: derleme, birim testler, ikon konumu/aç-kapa, sağ tık menüsü, temiz çıkış, devre dışı çocuk pencere fare yönlendirmesi, BLE HID yayını başladı
