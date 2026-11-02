@@ -1,59 +1,71 @@
-//! Mac bağlantısı: aynı ağdaki Mac'i koduyla bulur, Mac'teki Ayna Ajan'dan güven onayı alır ve
-//! uzak masaüstünü RustDesk istemcisiyle açar.
+//! Mac bağlantısı (AYNA2): aynı ağdaki Mac'i koduyla bulur, Mac'teki Ayna Ajan'la şifreli bir oturum
+//! açar; Mac'in ekran görüntüsünü (H.264) alır, fareyi ve klavyeyi gönderir. Başka program gerekmez.
 //!
-//! Akış:
-//! 1. Bul: yerel ağa UDP yayını `AYNA1 FIND <kod>`; kod onunsa Ayna Ajan `AYNA1 HERE <kod> <port> <ad>`
-//!    ile yanıt verir (sunucu yok, yalnız aynı ağ).
-//! 2. Güven: Ajan'a TCP `AYNA1 HELLO <cihaz-kimliği> <bilgisayar-adı>`. Bu bilgisayar Mac'te daha önce
-//!    güvenilen listesinde değilse Mac'te "İzin ver / Reddet" sorulur. Ajan izin verilen bilgisayarın
-//!    adresini RustDesk'in IP beyaz listesine ekler; listede olmayan adresten RustDesk bağlantısı
-//!    kabul edilmez.
-//! 3. Bağlan: RustDesk istemcisi Mac'e doğrudan IP ile bağlanır; parolayı (Mac'te Ayna Ajan'da
-//!    belirlenen kalıcı parola) RustDesk'in kendi penceresi sorar. Parola bu uygulamadan geçmez.
-//!
-//! Oturum penceresi RustDesk'e aittir; görev çubuğundaki düğmesi kaldırılır, Mac ikonu onu
-//! gösterip gizler.
+//! 1. Bul (UDP 21130): `AYNA1 FIND <kod> <cihaz> <nonce>` →
+//!    `AYNA1 HERE <kod> <port> <imza|-> <ad>`. Eşleşilmiş Mac imzalı yanıt verir.
+//! 2. El sıkışma (TCP 21130, satırlar):
+//!    Mac: `AYNA2 HI <nonce> <mac-açık-anahtar>`;
+//!    Windows: `AYNA2 HELLO <cihaz> <imza|-> <win-açık-anahtar> <ad>`.
+//!    İki taraf geçici ECDH P-256 anahtarlarından ortak sır çıkarır;
+//!    T = `AYNA2|nonce|mac-anahtar|win-anahtar|cihaz` bağlamıyla HKDF-SHA256 yön başına AES-256-GCM
+//!    anahtarlarını, ilk eşleşme için 6 haneli doğrulama kodunu (iki ekranda aynı görünür) ve yeni
+//!    eşleşme anahtarını verir. Eşleşilmiş cihazlar T'yi anahtarla imzalar (HMAC): aradaki biri iki
+//!    tarafla ayrı ayrı anahtar değişse de imzayı üretemez.
+//!    Mac: `AYNA2 WAIT` (onay soruluyor) … `AYNA2 OK NEW|SAME <imza>` | `DENY` | `OFF` | `BUSY`.
+//! 3. Şifreli çerçeveler: `u32 uzunluk || AES-GCM(şifreli metin || etiket)`, nonce = 4 sıfır bayt ||
+//!    64 bit sayaç (yön başına). Düz metnin ilk baytı mesaj türü (bkz. `MSG_*`).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCryptHash, BCRYPT_ALG_HANDLE, BCRYPT_HMAC_SHA256_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-};
-use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::taskbar::{self, Device};
+use crate::crypto::{self, ct_eq, hex, unhex, Aead, EcdhKey};
+use crate::gst::Player;
 use crate::util;
 
-/// Ajan'dan gelen durum değişikliği (iş parçacığı → ana pencere).
+/// Durum değişti (iş parçacığı → Mac penceresi).
 pub const WM_APP_MAC: u32 = WM_APP + 23;
-/// Ayna Ajan'ın UDP (bulma) ve TCP (güven) bağlantı noktası.
+/// Ayna Ajan'ın UDP (bulma) ve TCP (oturum) bağlantı noktası.
 pub const AGENT_PORT: u16 = 21130;
-/// RustDesk'in doğrudan IP erişimi için varsayılan bağlantı noktası.
-const RUSTDESK_PORT: u16 = 21118;
 const DEVICE_SETTING: PCWSTR = w!("CihazKimligi");
+/// Son bağlanılan Mac'in kodu.
+pub const CODE_SETTING: PCWSTR = w!("MacKodu");
 /// Mac'teki onay sorusuna yanıt için bekleme süresi.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(90);
-/// RustDesk penceresi bu sürede açılmazsa bağlantı başarısız sayılır.
-const WINDOW_TIMEOUT: Duration = Duration::from_secs(45);
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// RustDesk'in (Flutter) oturum penceresi sınıfı; ana penceresi `FLUTTER_RUNNER_WIN32_WINDOW`.
-const SESSION_CLASS: &str = "RustdeskMultiWindow";
+/// Bu süre hiç veri gelmezse (Mac'ten yanıt yok) bağlantı kopmuş sayılır.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const PING_EVERY: Duration = Duration::from_secs(2);
+/// Bir çerçevenin en büyük boyu (4K anahtar kare bile bunun çok altında).
+const MAX_FRAME: usize = 16 << 20;
+
+// Mac → Windows
+const MSG_VIDEO: u8 = 0x01;
+const MSG_SCREEN: u8 = 0x02;
+const MSG_PONG: u8 = 0x03;
+const MSG_BYE: u8 = 0x04;
+// Windows → Mac
+pub const MSG_MOUSE_MOVE: u8 = 0x10;
+pub const MSG_MOUSE_BUTTON: u8 = 0x11;
+pub const MSG_SCROLL: u8 = 0x12;
+pub const MSG_KEY: u8 = 0x13;
+const MSG_KEYFRAME: u8 = 0x14;
+const MSG_PING: u8 = 0x15;
+const MSG_PAUSE: u8 = 0x16;
+const MSG_LEAVE: u8 = 0x17;
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum State {
     Idle,
     Searching,
-    Waiting(String),
-    Starting(String),
+    /// Mac'te onay bekleniyor; iki ekranda aynı görünmesi gereken doğrulama kodu.
+    Waiting { name: String, sas: String },
+    Connecting(String),
     Connected(String),
     Failed(String),
 }
@@ -63,8 +75,8 @@ impl State {
         match self {
             State::Idle => "Bağlı değil".into(),
             State::Searching => "Ağda aranıyor…".into(),
-            State::Waiting(name) => format!("{name}: Mac'te onay bekleniyor…"),
-            State::Starting(name) => format!("{name}: uzak masaüstü açılıyor…"),
+            State::Waiting { name, .. } => format!("{name}: Mac'te onay bekleniyor…"),
+            State::Connecting(name) => format!("{name}: bağlanılıyor…"),
             State::Connected(name) => format!("Bağlı: {name}"),
             State::Failed(why) => why.clone(),
         }
@@ -80,19 +92,25 @@ struct Peer {
 
 struct Inner {
     state: State,
-    /// Güven onayı alınan Mac; ana iş parçacığı RustDesk'i açar.
-    approved: Option<Peer>,
-    /// Her bağlanma denemesi bir numara alır; vazgeçilen eski denemenin sonucu yok sayılır.
-    /// Durumla aynı kilit altında: kontrol ile yazım arasına vazgeçme giremez.
+    /// Her deneme bir numara alır; vazgeçilen eski denemenin sonucu yok sayılır. Durumla aynı kilit
+    /// altında: kontrol ile yazım arasına vazgeçme giremez.
     attempt: u32,
+    /// Açık oturuma giden mesajlar.
+    tx: Option<Sender<Vec<u8>>>,
+    /// Açık oturumun soketi (vazgeçince hemen kapatmak için).
+    socket: Option<TcpStream>,
+    /// Mac ekranının görüntü boyutu.
+    screen: Option<(u16, u16)>,
+    /// Kopma kullanıcıdan değil ağdan: yeniden bağlanılabilir.
+    dropped: bool,
 }
 
 struct Shared {
     inner: Mutex<Inner>,
+    player: Mutex<Option<Player>>,
 }
 
 impl Shared {
-    /// Deneme hâlâ geçerliyse durumu günceller.
     fn publish(&self, attempt: u32, f: impl FnOnce(&mut Inner)) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.attempt != attempt {
@@ -107,28 +125,19 @@ impl Shared {
     }
 }
 
-struct Session {
-    peer: Peer,
-    started: Instant,
-    window: Option<HWND>,
-    /// Oturumdan önce açık olan RustDesk pencereleri (oturum penceresi yeni açılandır).
-    before: Vec<isize>,
-    /// Pencere açılmadan vazgeçildi: açılınca kapatılacak.
-    cancelled: bool,
-}
-
 pub struct Mac {
     notify: HWND,
     shared: Arc<Shared>,
-    session: Option<Session>,
 }
 
 impl Mac {
     pub fn new(notify: HWND) -> Mac {
         Mac {
             notify,
-            shared: Arc::new(Shared { inner: Mutex::new(Inner { state: State::Idle, approved: None, attempt: 0 }) }),
-            session: None,
+            shared: Arc::new(Shared {
+                inner: Mutex::new(Inner { state: State::Idle, attempt: 0, tx: None, socket: None, screen: None, dropped: false }),
+                player: Mutex::new(None),
+            }),
         }
     }
 
@@ -136,34 +145,64 @@ impl Mac {
         self.shared.inner.lock().unwrap().state.clone()
     }
 
-    fn set(&self, s: State) {
-        self.shared.inner.lock().unwrap().state = s;
+    pub fn connected(&self) -> bool {
+        matches!(self.state(), State::Connected(_))
+    }
+
+    /// Bağlantı ağ yüzünden koptu (kullanıcı kesmedi): yeniden denenebilir.
+    pub fn dropped(&self) -> bool {
+        self.shared.inner.lock().unwrap().dropped
+    }
+
+    pub fn screen(&self) -> Option<(u16, u16)> {
+        self.shared.inner.lock().unwrap().screen
     }
 
     pub fn fail(&self, why: &str) {
-        self.set(State::Failed(why.into()));
+        self.shared.inner.lock().unwrap().state = State::Failed(why.into());
+    }
+
+    /// Görüntünün çizileceği oynatıcı (pencere açılınca kurulur, kapanınca bırakılır).
+    pub fn set_player(&self, player: Option<Player>) {
+        let fresh = player.is_some();
+        *self.shared.player.lock().unwrap() = player;
+        if fresh {
+            self.send(vec![MSG_KEYFRAME]);
+        }
+    }
+
+    pub fn has_player(&self) -> bool {
+        self.shared.player.lock().unwrap().is_some()
     }
 
     pub fn connect(&mut self, code: &str) {
-        self.cancel();
+        self.disconnect();
         let attempt = {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.attempt = inner.attempt.wrapping_add(1);
             inner.state = State::Searching;
             inner.attempt
         };
+        let _ = util::write_text_setting(CODE_SETTING, code);
         util::log(&format!("Mac aranıyor (kod {code}), yerel adresler: {:?}", local_ipv4()));
         let (shared, notify, code) = (self.shared.clone(), self.notify.0 as isize, code.to_string());
         std::thread::spawn(move || {
-            let result = find_and_trust(&code, &shared, attempt, notify);
-            let applied = shared.publish(attempt, |inner| match result {
-                Ok(peer) => {
-                    inner.state = State::Starting(peer.name.clone());
-                    inner.approved = Some(peer);
-                }
-                Err(why) => {
-                    util::log(&format!("Mac bağlantısı başarısız: {why}"));
-                    inner.state = State::Failed(why);
+            let result = session(&code, &shared, attempt, notify);
+            let applied = shared.publish(attempt, |inner| {
+                inner.tx = None;
+                inner.socket = None;
+                match &result {
+                    Ok(()) => {
+                        // Mac oturumu kapattı ya da bağlantı koptu.
+                        inner.dropped = true;
+                        inner.state = State::Failed("Mac bağlantısı koptu; yeniden bağlanılıyor…".into());
+                    }
+                    Err(why) => {
+                        util::log(&format!("Mac bağlantısı başarısız: {why}"));
+                        // Mac uykuda/ağ geçici olarak yoksa eşleşilmiş Mac'e yeniden denenir.
+                        inner.dropped = transient(why) && Mac::paired(&code);
+                        inner.state = State::Failed(why.clone());
+                    }
                 }
             });
             if applied {
@@ -173,118 +212,56 @@ impl Mac {
     }
 
     /// Süren denemeden vazgeçer ya da açık oturumu kapatır.
-    pub fn cancel(&mut self) {
-        {
+    pub fn disconnect(&mut self) {
+        let (tx, socket) = {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.attempt = inner.attempt.wrapping_add(1);
-            inner.approved = None;
             inner.state = State::Idle;
+            inner.dropped = false;
+            inner.screen = None;
+            (inner.tx.take(), inner.socket.take())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(vec![MSG_LEAVE]);
         }
-        if let Some(mut s) = self.session.take() {
-            match s.window {
-                Some(w) => unsafe {
-                    let _ = PostMessageW(w, WM_CLOSE, WPARAM(0), LPARAM(0));
-                },
-                // RustDesk başladı ama penceresi henüz yok: açılınca kapatılmak üzere izlenir.
-                None => {
-                    s.cancelled = true;
-                    self.session = Some(s);
-                }
-            }
-        }
-        taskbar::set_enabled(Device::Mac, false);
-        taskbar::set_view(Device::Mac, HWND::default());
-    }
-
-    /// Uygulama kapanırken: gizlenmiş oturum penceresi görünür ve görev çubuğu düğmesiyle
-    /// bırakılır (yoksa erişilemez kalırdı).
-    pub fn release(&mut self) {
-        if let Some(w) = self.window() {
-            unsafe {
-                let _ = ShowWindow(w, SW_SHOW);
-                taskbar_button(w, true);
-            }
+        if let Some(s) = socket {
+            // Yazıcı LEAVE'i gönderebilsin diye kısa bir an tanınır, sonra soket kapanır.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = s.shutdown(Shutdown::Both);
+            });
         }
     }
 
-    /// Ana iş parçacığında, zamanlayıcıyla: onaylanan Mac için RustDesk'i başlatır, oturum
-    /// penceresini izler (açıldı, kapandı).
-    pub fn poll(&mut self) {
-        let approved = self.shared.inner.lock().unwrap().approved.take();
-        if let Some(peer) = approved {
-            match launch(&peer) {
-                Ok(before) => {
-                    self.session =
-                        Some(Session { peer, started: Instant::now(), window: None, before, cancelled: false });
-                }
-                Err(why) => self.set(State::Failed(why)),
-            }
-        }
-        let Some(s) = self.session.as_mut() else { return };
-        match s.window {
-            Some(w) if unsafe { IsWindow(w).as_bool() } => {}
-            Some(_) => {
-                // Pencere kapandı: oturum bitti.
-                util::log(&format!("Mac oturumu kapandı: {}", s.peer.name));
-                self.session = None;
-                self.set(State::Idle);
-                taskbar::set_enabled(Device::Mac, false);
-                taskbar::set_view(Device::Mac, HWND::default());
-            }
-            None => {
-                if let Some(w) = unsafe { session_window(&s.before, &s.peer.ip.to_string()) } {
-                    if s.cancelled {
-                        unsafe {
-                            let _ = PostMessageW(w, WM_CLOSE, WPARAM(0), LPARAM(0));
-                        }
-                        self.session = None;
-                        return;
-                    }
-                    s.window = Some(w);
-                    unsafe { taskbar_button(w, false) };
-                    let name = s.peer.name.clone();
-                    util::log(&format!("Mac oturum penceresi açıldı: {name}"));
-                    self.set(State::Connected(name));
-                    taskbar::set_view(Device::Mac, w);
-                    taskbar::set_enabled(Device::Mac, true);
-                } else if s.started.elapsed() > WINDOW_TIMEOUT {
-                    let cancelled = s.cancelled;
-                    self.session = None;
-                    if !cancelled {
-                        self.set(State::Failed("RustDesk penceresi açılmadı.".into()));
-                    }
-                }
-            }
+    /// Açık oturuma mesaj (fare, klavye…). Oturum yoksa yok sayılır.
+    pub fn send(&self, msg: Vec<u8>) {
+        if let Some(tx) = &self.shared.inner.lock().unwrap().tx {
+            let _ = tx.send(msg);
         }
     }
 
-    fn window(&self) -> Option<HWND> {
-        self.session.as_ref().and_then(|s| s.window).filter(|w| unsafe { IsWindow(*w).as_bool() })
-    }
-
-    /// Mac ikonuna tıklandı: önde ise gizler, değilse öne getirir.
-    pub fn toggle(&mut self) {
-        let Some(w) = self.window() else { return };
-        unsafe {
-            if IsWindowVisible(w).as_bool() && !IsIconic(w).as_bool() && GetForegroundWindow() == w {
-                let _ = ShowWindow(w, SW_HIDE);
-                taskbar::refresh();
-            } else {
-                self.show();
-            }
+    /// Pencere gizlenince görüntü durur (bağlantı açık kalır); açılınca anahtar kareyle sürer.
+    pub fn pause(&self, paused: bool) {
+        self.send(vec![MSG_PAUSE, u8::from(paused)]);
+        if !paused {
+            self.send(vec![MSG_KEYFRAME]);
         }
     }
 
-    pub fn show(&mut self) {
-        let Some(w) = self.window() else { return };
-        unsafe {
-            let cmd = if IsIconic(w).as_bool() { SW_RESTORE } else { SW_SHOW };
-            let _ = ShowWindow(w, cmd);
-            let _ = SetForegroundWindow(w);
-            taskbar_button(w, false);
-        }
-        taskbar::refresh();
+    /// Bu kodla daha önce eşleşildi mi (açılışta kendiliğinden bağlanmak için).
+    pub fn paired(code: &str) -> bool {
+        mac_key(code).is_some()
     }
+
+    /// Eşleşmeyi bu bilgisayardan siler (Mac'te de güven kaldırılmalı).
+    pub fn forget(code: &str) {
+        util::delete_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()));
+    }
+}
+
+/// Ağdan kaynaklanan, yeniden denemeye değer hatalar (ret ya da kimlik hatası değil).
+fn transient(why: &str) -> bool {
+    why.starts_with("Mac bulunamadı") || why.starts_with("Mac'teki Ayna Ajan'a bağlanılamadı") || why.starts_with("Mac bağlantıyı kapattı")
 }
 
 fn post(notify: isize) {
@@ -293,66 +270,22 @@ fn post(notify: isize) {
     }
 }
 
-fn find_and_trust(code: &str, shared: &Shared, attempt: u32, notify: isize) -> Result<Peer, String> {
-    let not_found = "Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?";
-    let peer = match discover(code)? {
-        Found::Signed(peer) | Found::FirstTime(peer) => peer,
-        Found::UnsignedOnly(peer) => {
-            // Eşleşilmiş Mac imzasız yanıt verdi: Mac'te güven kaldırılmış ya da Ayna Ajan yeniden
-            // kurulmuş olabilir; aynı ağdaki başka bir cihazın kendini Mac gibi göstermesi de olabilir.
-            // Karar kullanıcının.
-            if !shared.alive(attempt) || !ask_repair(notify, &peer) {
-                return Err("Mac'in kimliği doğrulanamadı; eşleşme yenilenmedi.".into());
-            }
-            util::delete_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()));
-            util::log(&format!("Mac kodu {code} için eşleşme kullanıcı onayıyla sıfırlandı."));
-            peer
-        }
-        Found::Nothing => return Err(not_found.into()),
-    };
-    util::log(&format!("Mac bulundu: {} ({}:{})", peer.name, peer.ip, peer.port));
-    if !shared.publish(attempt, |inner| inner.state = State::Waiting(peer.name.clone())) {
-        return Err(String::new());
-    }
-    post(notify);
-    trust(code, &peer, &|| shared.alive(attempt))?;
-    Ok(peer)
-}
-
-unsafe fn message_box(owner: isize, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
-    let text = util::wide(text);
-    MessageBoxW(HWND(owner as _), PCWSTR(text.as_ptr()), w!("Ayna Merkezi"), flags)
-}
-
-fn ask_repair(owner: isize, peer: &Peer) -> bool {
-    let text = format!(
-        "“{}” ({}) yanıt verdi ama bu bilgisayarla yapılmış eşleşmeyi kanıtlayamadı.\n\n\
-         Mac'te bu bilgisayarın güvenini kaldırdıysanız ya da Ayna Ajan'ı yeniden kurduysanız \
-         \"Evet\" deyin; Mac'te yeniden onay istenir.\n\n\
-         Böyle bir şey yapmadıysanız \"Hayır\" deyin: ağdaki başka bir cihaz kendini bu Mac gibi \
-         gösteriyor olabilir.\n\nYeniden eşleşilsin mi?",
-        peer.name, peer.ip
-    );
-    unsafe { message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
-}
+// ---------------------------------------------------------------------------------------------
+// Bulma
 
 enum Found {
-    /// Eşleşilmiş Mac, anahtarıyla imzalı yanıt verdi.
     Signed(Peer),
-    /// Bu kod için anahtar yok: ilk eşleşme.
     FirstTime(Peer),
-    /// Anahtar var ama yalnız imzasız (ya da yanlış imzalı) yanıt geldi.
+    /// Eşleşilmiş Mac'ten yalnız imzasız (ya da yanlış imzalı) yanıt geldi.
     UnsignedOnly(Peer),
     Nothing,
 }
 
-/// Yerel ağa (her ağ bağdaştırıcısından ayrı) kodu yayınlar.
-///
-/// Bu Mac'le daha önce eşleşildiyse (anahtar saklıysa) yanıt anahtarla imzalı olmalıdır (bağlantı
-/// noktası ve ad dahil): aynı ağdaki başka bir cihaz kodu bilse de kendini o Mac gibi gösteremez.
+/// Yerel ağa (her ağ bağdaştırıcısından ayrı) kodu yayınlar. Bu Mac'le daha önce eşleşildiyse yanıt
+/// anahtarla imzalı olmalıdır (bağlantı noktası ve ad dahil).
 fn discover(code: &str) -> Result<Found, String> {
     let key = mac_key(code);
-    let nonce = hex(&random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
+    let nonce = hex(&crypto::random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
     let query = format!("AYNA1 FIND {code} {} {nonce}", device_id()?);
     let mut sockets = Vec::new();
     for ip in local_ipv4() {
@@ -379,9 +312,8 @@ fn discover(code: &str) -> Result<Found, String> {
         while Instant::now() < until {
             for s in &sockets {
                 while let Ok((n, from)) = s.recv_from(&mut buf) {
-                    // Yalnız yerel (özel) ağ adreslerinden gelen yanıtlar.
                     let IpAddr::V4(ip) = from.ip() else { continue };
-                    if !is_private(ip) {
+                    if !(ip.is_private() || ip.is_link_local()) {
                         continue;
                     }
                     let msg = String::from_utf8_lossy(&buf[..n]);
@@ -401,18 +333,13 @@ fn discover(code: &str) -> Result<Found, String> {
     Ok(unsigned.map_or(Found::Nothing, Found::UnsignedOnly))
 }
 
-fn is_private(ip: Ipv4Addr) -> bool {
-    ip.is_private() || ip.is_link_local()
-}
-
 struct Here {
     peer: Peer,
     proof: String,
-    /// İmzalanan ad (temizlenmeden önceki hâli).
     raw_name: String,
 }
 
-/// `AYNA1 HERE <kod> <rustdesk-port> <imza|-> <ad…>`
+/// `AYNA1 HERE <kod> <port> <imza|-> <ad…>`
 fn parse_here(msg: &str, code: &str, ip: Ipv4Addr) -> Option<Here> {
     let mut parts = msg.trim().splitn(6, ' ');
     if parts.next()? != "AYNA1" || parts.next()? != "HERE" || parts.next()? != code {
@@ -426,8 +353,7 @@ fn parse_here(msg: &str, code: &str, ip: Ipv4Addr) -> Option<Here> {
     Some(Here { peer: Peer { ip, port, name }, proof, raw_name })
 }
 
-/// Ekranda gösterilen adlardan denetim, görünmez ve yön değiştiren karakterler atılır (ad
-/// sahteciliği: yön değiştiren karakterle ters yazılmış bir ad gibi).
+/// Ekranda gösterilen adlardan denetim, görünmez ve yön değiştiren karakterler atılır.
 pub(crate) fn clean_name(s: &str) -> String {
     s.chars()
         .filter(|&c| {
@@ -455,70 +381,252 @@ fn local_ipv4() -> Vec<Ipv4Addr> {
     out
 }
 
-/// Ajan'dan güven onayı ister. Mac'teki kullanıcı "İzin ver" diyene (ya da bu bilgisayar zaten
-/// güvenilenler listesindeyse ve anahtarıyla kanıtlarsa hemen) `OK` gelir. İlk onayda Ajan bu
-/// bilgisayara özel bir anahtar verir; sonraki bağlantılarda iki taraf da kimliğini bu anahtarla
-/// kanıtlar (`OK` satırı da imzalıdır).
-fn trust(code: &str, peer: &Peer, alive: &dyn Fn() -> bool) -> Result<(), String> {
-    let addr = SocketAddr::new(IpAddr::V4(peer.ip), AGENT_PORT);
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))
+unsafe fn message_box(owner: isize, text: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let text = util::wide(text);
+    MessageBoxW(HWND(owner as _), PCWSTR(text.as_ptr()), w!("Ayna Merkezi"), flags)
+}
+
+fn ask_repair(owner: isize, peer: &Peer) -> bool {
+    let text = format!(
+        "“{}” ({}) yanıt verdi ama bu bilgisayarla yapılmış eşleşmeyi kanıtlayamadı.\n\n\
+         Mac'te bu bilgisayarın güvenini kaldırdıysanız ya da Ayna Ajan'ı yeniden kurduysanız \
+         \"Evet\" deyin; Mac'te yeniden onay istenir.\n\n\
+         Böyle bir şey yapmadıysanız \"Hayır\" deyin: ağdaki başka bir cihaz kendini bu Mac gibi \
+         gösteriyor olabilir.\n\nYeniden eşleşilsin mi?",
+        peer.name, peer.ip
+    );
+    unsafe { message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Oturum
+
+/// Bulur, el sıkışır ve oturum bitene dek görüntüyü alır. `Ok(())`: oturum kurulmuştu ve sona erdi.
+fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Result<(), String> {
+    let peer = match discover(code)? {
+        Found::Signed(peer) | Found::FirstTime(peer) => peer,
+        Found::UnsignedOnly(peer) => {
+            if !shared.alive(attempt) || !ask_repair(notify, &peer) {
+                return Err("Mac'in kimliği doğrulanamadı; eşleşme yenilenmedi.".into());
+            }
+            Mac::forget(code);
+            util::log(&format!("Mac kodu {code} için eşleşme kullanıcı onayıyla sıfırlandı."));
+            peer
+        }
+        Found::Nothing => return Err("Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?".into()),
+    };
+    util::log(&format!("Mac bulundu: {} ({}:{})", peer.name, peer.ip, peer.port));
+    if !shared.publish(attempt, |i| i.state = State::Connecting(peer.name.clone())) {
+        return Err(String::new());
+    }
+    post(notify);
+
+    let addr = SocketAddr::new(IpAddr::V4(peer.ip), peer.port);
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))
         .map_err(|e| format!("Mac'teki Ayna Ajan'a bağlanılamadı ({e})."))?;
-    let started = Instant::now();
-    // Kısa okuma süresi: vazgeçme ve toplam süre her saniye denetlenir.
+    let _ = stream.set_nodelay(true);
+    // Kısa okuma süresi: vazgeçme ve süre aşımı her saniye denetlenir.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let socket = stream.try_clone().map_err(|e| e.to_string())?;
+    if !shared.publish(attempt, |i| i.socket = Some(socket)) {
+        return Err(String::new());
+    }
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let alive = || shared.alive(attempt);
+
+    // --- El sıkışma
+    let started = Instant::now();
     let mut pending = String::new();
-    let mut read = |reader: &mut BufReader<TcpStream>| read_line_limited(reader, &mut pending, started, alive);
-    let first = read(&mut reader)?;
-    let nonce = first.strip_prefix("AYNA1 NONCE ").filter(|n| n.len() == 32 && n.chars().all(|c| c.is_ascii_hexdigit()));
-    let Some(nonce) = nonce else { return Err(format!("Mac'ten beklenmeyen yanıt: {}", clean_name(&first))) };
-    let key = mac_key(code);
+    let first = read_line_limited(&mut reader, &mut pending, started, &alive)?;
+    let mut parts = first.split(' ');
+    let (Some("AYNA2"), Some("HI"), Some(nonce), Some(mac_pub), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(format!("Mac'ten beklenmeyen yanıt: {}", clean_name(&first)));
+    };
+    if nonce.len() != 32 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Mac'ten geçersiz el sıkışma.".into());
+    }
+    let mac_pub_bytes = unhex(mac_pub).filter(|b| b.len() == 65).ok_or("Mac'ten geçersiz anahtar.")?;
+    let ecdh = EcdhKey::generate().ok_or("Anahtar üretilemedi.")?;
+    let win_pub = hex(&ecdh.public_x963().ok_or("Anahtar üretilemedi.")?);
+    let shared_secret = ecdh.agree(&mac_pub_bytes).ok_or("Mac'in anahtarı geçersiz.")?;
     let id = device_id()?;
+    let t = format!("AYNA2|{nonce}|{mac_pub}|{win_pub}|{id}");
+    let key = mac_key(code);
     let proof = match &key {
-        Some(k) => hex(&hmac(k, &format!("hello|{nonce}")).ok_or("İmza hesaplanamadı.")?),
+        Some(k) => hex(&crypto::hmac(k, format!("hello|{t}").as_bytes()).ok_or("İmza hesaplanamadı.")?),
         None => "-".to_string(),
     };
     let name = clean_name(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into()));
-    let hello = format!("AYNA1 HELLO {id} {proof} {name}\n");
-    stream.write_all(hello.as_bytes()).map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
+    writer
+        .write_all(format!("AYNA2 HELLO {id} {proof} {win_pub} {name}\n").as_bytes())
+        .map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
+
+    let derive = |info: &str, n: usize| crypto::hkdf(&shared_secret, &[], format!("{info}|{t}").as_bytes(), n);
+    let keys = derive("keys", 64).ok_or("Anahtar türetilemedi.")?;
+    let sas_bytes = derive("sas", 4).ok_or("Anahtar türetilemedi.")?;
+    let sas_n = u32::from_be_bytes([sas_bytes[0], sas_bytes[1], sas_bytes[2], sas_bytes[3]]) % 1_000_000;
+    let sas = format!("{:03} {:03}", sas_n / 1000, sas_n % 1000);
+
     loop {
-        let line = read(&mut reader)?;
+        let line = read_line_limited(&mut reader, &mut pending, started, &alive)?;
         let parts: Vec<&str> = line.split(' ').collect();
         match parts.as_slice() {
-            ["AYNA1", "OK", token, proof] => {
-                let signed = format!("ok|{nonce}|{id}");
-                match &key {
-                    // Eşleşilmiş Mac onayını eski anahtarla imzalar; anahtar değiştirilemez.
-                    Some(k) => {
-                        if !proof_matches(k, &signed, proof) {
+            ["AYNA2", "WAIT"] => {
+                let (n, s) = (peer.name.clone(), sas.clone());
+                if !shared.publish(attempt, |i| i.state = State::Waiting { name: n, sas: s }) {
+                    return Err(String::new());
+                }
+                post(notify);
+            }
+            ["AYNA2", "OK", kind, proof] => {
+                let ok_msg = format!("ok|{t}");
+                match (&key, *kind) {
+                    // Eşleşilmiş Mac onayını kayıtlı anahtarla imzalar; anahtar değiştirilemez.
+                    (Some(k), "SAME") if proof_matches(k, &ok_msg, proof) => {}
+                    (None, "NEW") => {
+                        let token = derive("token", 32).ok_or("Anahtar türetilemedi.")?;
+                        if !proof_matches(&token, &ok_msg, proof) {
                             return Err("Mac'in onayı doğrulanamadı.".into());
                         }
-                    }
-                    // İlk eşleşme: yeni anahtar ve onunla imzalı onay.
-                    None => {
-                        let Some(new) = unhex(token).filter(|t| t.len() == 32) else {
-                            return Err("Mac anahtar vermedi.".into());
-                        };
-                        if !proof_matches(&new, &signed, proof) {
-                            return Err("Mac'in onayı doğrulanamadı.".into());
-                        }
-                        if !util::write_text_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()), token) {
+                        if !util::write_text_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()), &hex(&token)) {
                             util::log("Mac anahtarı kaydedilemedi; sonraki bağlantıda yeniden onay istenecek.");
                         }
                     }
+                    _ => return Err("Mac'in onayı doğrulanamadı.".into()),
                 }
-                return Ok(());
+                break;
             }
-            ["AYNA1", "WAIT"] => continue,
-            ["AYNA1", "DENY"] => return Err("Mac bu bilgisayarın bağlanmasını reddetti.".into()),
-            ["AYNA1", "OFF"] => return Err("Mac'te Ayna Ajan bağlantılara kapalı.".into()),
+            ["AYNA2", "DENY"] => return Err("Mac bu bilgisayarın bağlanmasını reddetti.".into()),
+            ["AYNA2", "OFF"] => return Err("Mac'te Ayna Ajan bağlantılara kapalı.".into()),
+            ["AYNA2", "BUSY"] => return Err("Mac'e şu an başka bir bilgisayar bağlı.".into()),
             _ => return Err(format!("Mac'ten beklenmeyen yanıt: {}", clean_name(&line))),
+        }
+    }
+
+    // --- Şifreli oturum
+    let mut rx_aead = Aead::new(&keys[32..64]).ok_or("Şifreleme başlatılamadı.")?;
+    let tx_aead = Aead::new(&keys[0..32]).ok_or("Şifreleme başlatılamadı.")?;
+    let (tx, out) = mpsc::channel::<Vec<u8>>();
+    let pname = peer.name.clone();
+    if !shared.publish(attempt, |i| {
+        i.tx = Some(tx.clone());
+        i.dropped = false;
+        i.state = State::Connected(pname);
+    }) {
+        return Err(String::new());
+    }
+    util::log(&format!("Mac oturumu açıldı: {}", peer.name));
+    post(notify);
+    if shared.player.lock().unwrap().is_some() {
+        let _ = tx.send(vec![MSG_KEYFRAME]);
+    }
+    drop(tx);
+    std::thread::spawn(move || write_loop(writer, tx_aead, out));
+
+    let mut last_data = Instant::now();
+    loop {
+        let mut len = [0u8; 4];
+        if !read_exact_patient(&mut reader, &mut len, &alive, &mut last_data) {
+            return Ok(());
+        }
+        let n = u32::from_be_bytes(len) as usize;
+        if !(crypto::TAG_LEN + 1..=MAX_FRAME).contains(&n) {
+            return Err("Mac'ten geçersiz veri geldi.".into());
+        }
+        let mut frame = vec![0u8; n];
+        if !read_exact_patient(&mut reader, &mut frame, &alive, &mut last_data) {
+            return Ok(());
+        }
+        let plain = rx_aead.open(&frame).ok_or("Mac'ten gelen veri doğrulanamadı.")?;
+        match plain[0] {
+            MSG_VIDEO if plain.len() > 2 => {
+                if let Some(p) = shared.player.lock().unwrap().as_ref() {
+                    p.push(&plain[2..]);
+                }
+            }
+            MSG_SCREEN if plain.len() >= 5 => {
+                let size = (u16::from_be_bytes([plain[1], plain[2]]), u16::from_be_bytes([plain[3], plain[4]]));
+                if size.0 > 0 && size.1 > 0 {
+                    shared.publish(attempt, |i| i.screen = Some(size));
+                    post(notify);
+                }
+            }
+            MSG_PONG => {}
+            MSG_BYE => return Ok(()),
+            _ => {}
         }
     }
 }
 
-/// Tek satır okur: en fazla 512 bayt (satır sonu göndermeyen karşı taraf belleği şişiremez),
-/// toplam onay süresi ve vazgeçme her saniye denetlenir.
+/// Giden mesajları şifreleyip yazar; arada bir canlılık yoklaması gönderir.
+fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>) {
+    let started = Instant::now();
+    let mut last_ping = Instant::now();
+    loop {
+        let mut batch = Vec::new();
+        match out.recv_timeout(PING_EVERY) {
+            Ok(m) => batch.push(m),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+        // Birikmiş fare hareketlerinden yalnız sonuncusu gönderilir.
+        while let Ok(m) = out.try_recv() {
+            if m.first() == Some(&MSG_MOUSE_MOVE) && batch.last().and_then(|l: &Vec<u8>| l.first()) == Some(&MSG_MOUSE_MOVE) {
+                batch.pop();
+            }
+            batch.push(m);
+        }
+        if last_ping.elapsed() >= PING_EVERY {
+            last_ping = Instant::now();
+            let mut ping = vec![MSG_PING];
+            ping.extend_from_slice(&(started.elapsed().as_millis() as u64).to_be_bytes());
+            batch.push(ping);
+        }
+        let mut bytes = Vec::new();
+        for m in &batch {
+            let Some(sealed) = aead.seal(m) else { return };
+            bytes.extend_from_slice(&(sealed.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&sealed);
+        }
+        if writer.write_all(&bytes).is_err() {
+            return;
+        }
+        if batch.iter().any(|m| m.first() == Some(&MSG_LEAVE)) {
+            return;
+        }
+    }
+}
+
+/// `buf`'ı tamamen doldurur; okuma zaman aşımlarında (1 sn) vazgeçmeyi ve sessizliği denetler.
+/// `false`: bağlantı kapandı, sustu ya da vazgeçildi.
+fn read_exact_patient(reader: &mut BufReader<TcpStream>, buf: &mut [u8], alive: &dyn Fn() -> bool, last_data: &mut Instant) -> bool {
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+    let mut filled = 0;
+    while filled < buf.len() {
+        if !alive() {
+            return false;
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(n) => {
+                filled += n;
+                *last_data = Instant::now();
+            }
+            Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => {
+                if last_data.elapsed() > IDLE_TIMEOUT {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Tek satır okur: en fazla 512 bayt, toplam onay süresi ve vazgeçme her saniye denetlenir.
 fn read_line_limited(
     reader: &mut BufReader<TcpStream>,
     pending: &mut String,
@@ -547,45 +655,26 @@ fn read_line_limited(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Anahtarlar
+
 fn key_setting(code: &str) -> String {
     format!("MacAnahtari{code}")
 }
 
-/// Bu Mac'in ilk onayda verdiği anahtar (yoksa daha önce eşleşilmemiştir).
+/// Bu Mac'le eşleşmenin anahtarı (yoksa daha önce eşleşilmemiştir).
 fn mac_key(code: &str) -> Option<Vec<u8>> {
     let name = util::wide(&key_setting(code));
     let text = util::read_text_setting(PCWSTR(name.as_ptr()))?;
     unhex(&text).filter(|k| k.len() == 32)
 }
 
-/// Sistemin güvenli rastgele kaynağı; çalışmıyorsa tahmin edilebilir bir değerle devam edilmez.
-fn random<const N: usize>() -> Option<[u8; N]> {
-    let mut bytes = [0u8; N];
-    let status = unsafe { BCryptGenRandom(BCRYPT_ALG_HANDLE::default(), &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
-    status.is_ok().then_some(bytes)
-}
-
-fn hmac(key: &[u8], msg: &str) -> Option<[u8; 32]> {
-    let mut out = [0u8; 32];
-    let status = unsafe { BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE, Some(key), msg.as_bytes(), &mut out) };
-    status.is_ok().then_some(out)
-}
-
 /// Sabit sürede karşılaştırma; HMAC hesaplanamazsa eşleşme yok sayılır.
 fn proof_matches(key: &[u8], msg: &str, proof: &str) -> bool {
-    let (Some(given), Some(expected)) = (unhex(proof), hmac(key, msg)) else { return false };
-    given.len() == expected.len() && given.iter().zip(expected.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
+    match (unhex(proof), crypto::hmac(key, msg.as_bytes())) {
+        (Some(given), Some(expected)) => ct_eq(&given, &expected),
+        _ => false,
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
 }
 
 /// Bu bilgisayarın Mac'teki güvenilenler listesinde tanındığı kalıcı rastgele kimlik.
@@ -593,107 +682,154 @@ fn device_id() -> Result<String, String> {
     if let Some(id) = util::read_text_setting(DEVICE_SETTING).filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())) {
         return Ok(id);
     }
-    let id = hex(&random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
-    util::write_text_setting(DEVICE_SETTING, &id);
+    let id = hex(&crypto::random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
+    let _ = util::write_text_setting(DEVICE_SETTING, &id);
     Ok(id)
 }
 
-/// Uygulamanın yanındaki `bin\rustdesk\rustdesk.exe` ya da kurulu RustDesk.
-fn rustdesk_exe() -> Option<PathBuf> {
-    let mut dir = util::exe_path().parent()?.to_path_buf();
-    // Exe'nin yanı ya da geliştirmede proje kökü (target\release'in üstü); sürücü köküne inilmez
-    // (C:\bin\… herkesin yazabildiği bir yer olabilir).
-    for _ in 0..3 {
-        let Some(up) = dir.parent() else { break };
-        let candidate = dir.join("bin").join("rustdesk").join("rustdesk.exe");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if up.parent().is_none() {
-            break;
-        }
-        dir = up.to_path_buf();
-    }
-    for var in ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"] {
-        if let Ok(base) = std::env::var(var) {
-            let candidate = PathBuf::from(base).join("RustDesk").join("rustdesk.exe");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+// ---------------------------------------------------------------------------------------------
+// Girdi mesajları
+
+/// 0..=65535 aralığına ölçeklenmiş konum.
+pub fn mouse_move(x: u16, y: u16) -> Vec<u8> {
+    let mut m = vec![MSG_MOUSE_MOVE];
+    m.extend_from_slice(&x.to_be_bytes());
+    m.extend_from_slice(&y.to_be_bytes());
+    m
 }
 
-fn launch(peer: &Peer) -> Result<Vec<isize>, String> {
-    let exe = rustdesk_exe().ok_or_else(|| {
-        "Bu bilgisayarda RustDesk bulunamadı (bin\\rustdesk\\rustdesk.exe).".to_string()
-    })?;
-    let before = unsafe { rustdesk_windows(&peer.ip.to_string()) };
-    let target = if peer.port == RUSTDESK_PORT { peer.ip.to_string() } else { format!("{}:{}", peer.ip, peer.port) };
-    util::log(&format!("RustDesk başlatılıyor: {} --connect {target}", exe.display()));
-    std::process::Command::new(&exe)
-        .arg("--connect")
-        .arg(&target)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("RustDesk başlatılamadı: {e}"))?;
-    Ok(before)
+/// `button`: 0 sol, 1 sağ, 2 orta.
+pub fn mouse_button(button: u8, down: bool, x: u16, y: u16) -> Vec<u8> {
+    let mut m = vec![MSG_MOUSE_BUTTON, button, u8::from(down)];
+    m.extend_from_slice(&x.to_be_bytes());
+    m.extend_from_slice(&y.to_be_bytes());
+    m
 }
 
-/// RustDesk süreçlerine ait görünür oturum pencereleri.
-unsafe fn rustdesk_windows(title_part: &str) -> Vec<isize> {
-    struct Found {
-        pids: Vec<u32>,
-        title: Vec<u16>,
-        out: Vec<isize>,
-    }
-    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
-        let f = &mut *(lp.0 as *mut Found);
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if f.pids.contains(&pid) && IsWindowVisible(hwnd).as_bool() {
-            // Uzak masaüstü (ve dosya aktarımı) pencereleri; ana RustDesk penceresi hariç.
-            let mut class = [0u16; 64];
-            let n = GetClassNameW(hwnd, &mut class) as usize;
-            let mut title = [0u16; 256];
-            let t = GetWindowTextW(hwnd, &mut title) as usize;
-            // Başlık "<adres> - Remote Desktop - RustDesk": başka bir RustDesk oturumu karışmasın.
-            let matches = f.title.is_empty() || title[..t].windows(f.title.len()).any(|w| w == f.title.as_slice());
-            if String::from_utf16_lossy(&class[..n]) == SESSION_CLASS && matches {
-                f.out.push(hwnd.0 as isize);
-            }
-        }
-        TRUE
-    }
-    let mut f = Found {
-        pids: crate::uxplay::processes_named("rustdesk.exe"),
-        title: title_part.encode_utf16().collect(),
-        out: Vec::new(),
-    };
-    if f.pids.is_empty() {
-        return Vec::new();
-    }
-    let _ = EnumWindows(Some(each), LPARAM(&mut f as *mut Found as isize));
-    f.out
+/// Piksel cinsinden kaydırma (pozitif dy: yukarı, pozitif dx: sağa).
+pub fn scroll(dx: i16, dy: i16) -> Vec<u8> {
+    let mut m = vec![MSG_SCROLL];
+    m.extend_from_slice(&dx.to_be_bytes());
+    m.extend_from_slice(&dy.to_be_bytes());
+    m
 }
 
-/// Oturum için yeni açılan RustDesk penceresi. `--connect` ile başlatılan süreç işi çalışan bir
-/// RustDesk'e (WM_COPYDATA ile) devredip kapanabildiği için süreç kimliğine değil "önceden
-/// yoktu"ya bakılır.
-unsafe fn session_window(before: &[isize], ip: &str) -> Option<HWND> {
-    rustdesk_windows(ip).into_iter().find(|h| !before.contains(h)).map(|h| HWND(h as _))
+/// macOS sanal tuş kodu (kVK_*).
+pub fn key(code: u16, down: bool) -> Vec<u8> {
+    let mut m = vec![MSG_KEY];
+    m.extend_from_slice(&code.to_be_bytes());
+    m.push(u8::from(down));
+    m
 }
 
-/// Oturum penceresinin kendi görev çubuğu düğmesi kalkar (giriş Başlat'ın solundaki Mac ikonu);
-/// uygulama kapanırken geri verilir.
-unsafe fn taskbar_button(hwnd: HWND, show: bool) {
-    let list: windows::core::Result<ITaskbarList> = CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER);
-    if let Ok(list) = list {
-        if list.HrInit().is_ok() {
-            let _ = if show { list.AddTab(hwnd) } else { list.DeleteTab(hwnd) };
-        }
-    }
+/// Windows tarama kodu (genişletilmiş tuşlarda 0xE000 eklenir) → macOS sanal tuş kodu. Konuma
+/// göre eşlenir: iki tarafta aynı klavye düzeni (ör. Türkçe Q) seçiliyse karakterler aynı çıkar.
+/// Ctrl → Command, Alt → Option, Windows tuşu → Control.
+pub fn mac_keycode(scan: u16) -> Option<u16> {
+    Some(match scan {
+        0x01 => 0x35,
+        0x02 => 0x12,
+        0x03 => 0x13,
+        0x04 => 0x14,
+        0x05 => 0x15,
+        0x06 => 0x17,
+        0x07 => 0x16,
+        0x08 => 0x1A,
+        0x09 => 0x1C,
+        0x0A => 0x19,
+        0x0B => 0x1D,
+        0x0C => 0x1B,
+        0x0D => 0x18,
+        0x0E => 0x33,
+        0x0F => 0x30,
+        0x10 => 0x0C,
+        0x11 => 0x0D,
+        0x12 => 0x0E,
+        0x13 => 0x0F,
+        0x14 => 0x11,
+        0x15 => 0x10,
+        0x16 => 0x20,
+        0x17 => 0x22,
+        0x18 => 0x1F,
+        0x19 => 0x23,
+        0x1A => 0x21,
+        0x1B => 0x1E,
+        0x1C => 0x24,
+        0x1D => 0x37,
+        0x1E => 0x00,
+        0x1F => 0x01,
+        0x20 => 0x02,
+        0x21 => 0x03,
+        0x22 => 0x05,
+        0x23 => 0x04,
+        0x24 => 0x26,
+        0x25 => 0x28,
+        0x26 => 0x25,
+        0x27 => 0x29,
+        0x28 => 0x27,
+        0x29 => 0x32,
+        0x2A => 0x38,
+        0x2B => 0x2A,
+        0x2C => 0x06,
+        0x2D => 0x07,
+        0x2E => 0x08,
+        0x2F => 0x09,
+        0x30 => 0x0B,
+        0x31 => 0x2D,
+        0x32 => 0x2E,
+        0x33 => 0x2B,
+        0x34 => 0x2F,
+        0x35 => 0x2C,
+        0x36 => 0x3C,
+        0x37 => 0x43,
+        0x38 => 0x3A,
+        0x39 => 0x31,
+        0x3A => 0x39,
+        0x3B => 0x7A,
+        0x3C => 0x78,
+        0x3D => 0x63,
+        0x3E => 0x76,
+        0x3F => 0x60,
+        0x40 => 0x61,
+        0x41 => 0x62,
+        0x42 => 0x64,
+        0x43 => 0x65,
+        0x44 => 0x6D,
+        0x45 => 0x47,
+        0x47 => 0x59,
+        0x48 => 0x5B,
+        0x49 => 0x5C,
+        0x4A => 0x4E,
+        0x4B => 0x56,
+        0x4C => 0x57,
+        0x4D => 0x58,
+        0x4E => 0x45,
+        0x4F => 0x53,
+        0x50 => 0x54,
+        0x51 => 0x55,
+        0x52 => 0x52,
+        0x53 => 0x41,
+        0x56 => 0x0A,
+        0x57 => 0x67,
+        0x58 => 0x6F,
+        0xE01C => 0x4C,
+        0xE01D => 0x36,
+        0xE035 => 0x4B,
+        0xE038 => 0x3D,
+        0xE047 => 0x73,
+        0xE048 => 0x7E,
+        0xE049 => 0x74,
+        0xE04B => 0x7B,
+        0xE04D => 0x7C,
+        0xE04F => 0x77,
+        0xE050 => 0x7D,
+        0xE051 => 0x79,
+        0xE052 => 0x72,
+        0xE053 => 0x75,
+        0xE05B => 0x3B,
+        0xE05C => 0x3E,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -703,23 +839,20 @@ mod tests {
     #[test]
     fn parses_agent_reply() {
         let ip = Ipv4Addr::new(192, 168, 1, 20);
-        let here = parse_here("AYNA1 HERE 123456789 21118 - Burhan's Mac mini\n", "123456789", ip).unwrap();
-        assert_eq!(here.peer.port, 21118);
+        let here = parse_here("AYNA1 HERE 123456789 21130 - Burhan's Mac mini\n", "123456789", ip).unwrap();
+        assert_eq!(here.peer.port, 21130);
         assert_eq!(here.proof, "-");
         assert_eq!(here.peer.name, "Burhan's Mac mini");
-        assert_eq!(here.raw_name, "Burhan's Mac mini");
-        assert!(parse_here("AYNA1 HERE 999 21118 - x", "123456789", ip).is_none());
-        assert!(parse_here("OTHER HERE 123456789 21118 - x", "123456789", ip).is_none());
+        assert!(parse_here("AYNA1 HERE 999 21130 - x", "123456789", ip).is_none());
+        assert_eq!(clean_name("a\u{202E}b\u{200B}c"), "abc");
     }
 
     #[test]
-    fn hmac_matches_rfc4231_case_2() {
-        // RFC 4231, 2. test: anahtar "Jefe".
-        let mac = hmac(b"Jefe", "what do ya want for nothing?").unwrap();
-        assert_eq!(hex(&mac), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
-        assert!(proof_matches(b"Jefe", "what do ya want for nothing?", &hex(&mac)));
-        assert!(!proof_matches(b"Jefe", "x", &hex(&mac)));
-        assert_eq!(unhex("0aff"), Some(vec![0x0a, 0xff]));
-        assert_eq!(clean_name("a\u{202E}b\u{200B}c"), "abc");
+    fn maps_keys_by_position() {
+        assert_eq!(mac_keycode(0x1E), Some(0x00)); // A
+        assert_eq!(mac_keycode(0x1D), Some(0x37)); // Ctrl → Command
+        assert_eq!(mac_keycode(0xE048), Some(0x7E)); // yukarı ok
+        assert_eq!(mac_keycode(0x5D), None);
+        assert_eq!(mouse_button(0, true, 1, 2), vec![MSG_MOUSE_BUTTON, 0, 1, 0, 1, 0, 2]);
     }
 }

@@ -1,46 +1,44 @@
-// Ayna Ajan: Mac'in menü çubuğunda duran yardımcı.
+// Ayna Ajan: Mac'in menü çubuğunda duran ve Mac'i Windows'taki Ayna Merkezi'ne açan program.
+// Başka program gerekmez: ekran yakalama (ScreenCaptureKit), donanım H.264 kodlama (VideoToolbox),
+// fare/klavye (CGEvent) ve şifreli bağlantı (CryptoKit) burada.
 //
-// - Mac'in kodunu (RustDesk kimliği) gösterir; Windows'taki Ayna Merkezi bu kodla Mac'i yerel ağda
-//   bulur (UDP 21130, "AYNA1 FIND <kod> <cihaz> <nonce>" → "AYNA1 HERE <kod> <port> <imza|-> <ad>").
-// - Bir Windows bilgisayarı ilk kez bağlanmak istediğinde "İzin ver / Reddet" sorar (TCP 21130:
-//   "AYNA1 NONCE <n>" → "AYNA1 HELLO <cihaz> <imza|-> <ad>" → "AYNA1 OK <anahtar|->"). İzin verilen
-//   bilgisayara özel bir anahtar verilir; sonraki bağlantılarda hem Mac'in yanıtı hem bilgisayarın
-//   kimliği bu anahtarla (HMAC-SHA256) kanıtlanır. İzin verilen adres RustDesk'in IP beyaz
-//   listesine yazılır; RustDesk listede olmayan adresten (internet üzerinden gelenler dahil)
-//   bağlantı kabul etmez.
-// - RustDesk'i doğrudan IP ve kalıcı parola ile çalışacak biçimde ayarlar (yönetici onayıyla).
-//
-// Uzak masaüstünün kendisi (görüntü, kontrol, şifreleme) RustDesk'tir; bu uygulama parolayı
-// saklamaz, yalnız RustDesk'e komut satırından iletir.
+// Protokol (AYNA2), Windows tarafı src/mac.rs ile birebir:
+// - Bulma, UDP 21130:
+//     "AYNA1 FIND <kod> <cihaz> <nonce>" → "AYNA1 HERE <kod> <port> <imza|-> <ad>".
+//   Eşleşilmiş bilgisayara giden yanıt, onun anahtarıyla imzalanır:
+//     HMAC(anahtar, "here|kod|nonce|port|ad").
+// - El sıkışma, TCP 21130 (satırlar):
+//     Mac → "AYNA2 HI <nonce> <mac-açık>"
+//     Windows → "AYNA2 HELLO <cihaz> <imza|-> <win-açık> <ad>"
+//   Geçici ECDH P-256 ile ortak sır elde edilir; T = "AYNA2|nonce|mac-açık|win-açık|cihaz".
+//   HKDF-SHA256 (tuz yok) şunları türetir:
+//     "keys|T"  → 64 bayt: [0..32] Windows→Mac, [32..64] Mac→Windows (AES-256-GCM)
+//     "sas|T"   → 4 bayt: 6 haneli doğrulama kodu
+//     "token|T" → 32 bayt: yeni eşleşme anahtarı
+//   Eşleşilmiş bilgisayar HELLO'yu HMAC(anahtar, "hello|T") ile imzalar.
+//   Mac yanıtı: "AYNA2 WAIT" … "AYNA2 OK NEW|SAME <HMAC(anahtar, "ok|T")>" | DENY | OFF | BUSY.
+// - Şifreli çerçeveler: u32 uzunluk || şifreli metin || etiket.
+//   nonce = 4 sıfır bayt || u64 sayaç (yön başına).
 
 import AppKit
+import CoreMedia
 import CryptoKit
 import Network
+import ScreenCaptureKit
 import ServiceManagement
+import VideoToolbox
 
 let agentPort: UInt16 = 21130
-let rustDeskPort = 21118
-let rustDeskApp = "/Applications/RustDesk.app"
-let rustDeskBinary = rustDeskApp + "/Contents/MacOS/RustDesk"
-/// Beyaz liste boşken RustDesk herkesi kabul eder; hiçbir bilgisayara güvenilmiyorsa yalnız bu Mac.
-let closedWhitelist = "127.0.0.1"
-let minPasswordLength = 10
-
-struct TrustedDevice: Codable, Equatable {
-    var id: String
-    var name: String
-    var ip: String
-    /// Bu bilgisayara verilen anahtar (64 onaltılık).
-    var token: String?
-}
+/// Görüntünün en uzun kenarı (bant genişliği ve gecikme dengesi).
+let maxVideoSide = 1920
 
 // MARK: - Yardımcılar
 
-func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
+func hex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 { bytes.map { String(format: "%02x", $0) }.joined() }
 
-func unhex(_ s: String) -> [UInt8]? {
+func unhex(_ s: String) -> Data? {
     guard s.count % 2 == 0 else { return nil }
-    var out: [UInt8] = []
+    var out = Data()
     var i = s.startIndex
     while i < s.endIndex {
         let j = s.index(i, offsetBy: 2)
@@ -53,15 +51,18 @@ func unhex(_ s: String) -> [UInt8]? {
 
 func isHex(_ s: String, length: Int) -> Bool { s.count == length && s.allSatisfy(\.isHexDigit) }
 
-func randomHex(_ count: Int) -> String {
+func randomBytes(_ count: Int) -> Data {
     var g = SystemRandomNumberGenerator()
-    return hex((0..<count).map { _ in UInt8.random(in: 0...255, using: &g) })
+    return Data((0..<count).map { _ in UInt8.random(in: 0...255, using: &g) })
 }
 
-func hmacHex(key: String, message: String) -> String? {
-    guard let k = unhex(key) else { return nil }
-    let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: k))
-    return hex(Array(mac))
+func hmacHex(key: Data, message: String) -> String {
+    hex(HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: SymmetricKey(data: key)))
+}
+
+func hkdf(_ ikm: Data, _ info: String, _ count: Int) -> Data {
+    HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: ikm), info: Data(info.utf8), outputByteCount: count)
+        .withUnsafeBytes { Data($0) }
 }
 
 /// Sabit sürede karşılaştırma.
@@ -71,7 +72,7 @@ func sameProof(_ a: String, _ b: String) -> Bool {
     return zip(x, y).reduce(0) { $0 | ($1.0 ^ $1.1) } == 0
 }
 
-/// Ekranda gösterilen adlardan denetim, görünmez ve yön değiştiren karakterler atılır (ad sahteciliği).
+/// Ekranda gösterilen adlardan denetim, görünmez ve yön değiştiren karakterler atılır.
 func cleanName(_ s: String) -> String {
     let scalars = s.unicodeScalars.filter { sc in
         switch sc.properties.generalCategory {
@@ -83,139 +84,47 @@ func cleanName(_ s: String) -> String {
     return cleaned.isEmpty ? "Windows" : cleaned
 }
 
+func be16(_ v: UInt16) -> [UInt8] { [UInt8(v >> 8), UInt8(v & 0xFF)] }
+
+func readBE16(_ d: Data, _ at: Int) -> UInt16 {
+    let b = [UInt8](d)
+    return UInt16(b[at]) << 8 | UInt16(b[at + 1])
+}
+
 // MARK: - Kalıcı ayarlar
+
+struct TrustedDevice: Codable, Equatable {
+    var id: String
+    var name: String
+    var ip: String
+    /// Bu bilgisayarla eşleşmenin anahtarı (64 onaltılık).
+    var token: String
+}
 
 enum Store {
     static let defaults = UserDefaults.standard
 
+    /// Bu Mac'e özel, değişmeyen 9 haneli kod.
+    static var code: String {
+        if let c = defaults.string(forKey: "code"), c.count == 9, c.allSatisfy(\.isNumber) { return c }
+        var g = SystemRandomNumberGenerator()
+        let c = String(UInt32.random(in: 100_000_000...999_999_999, using: &g))
+        defaults.set(c, forKey: "code")
+        return c
+    }
+
     static var trusted: [TrustedDevice] {
         get {
-            guard let data = defaults.data(forKey: "trusted"),
+            guard let data = defaults.data(forKey: "trusted2"),
                   let list = try? JSONDecoder().decode([TrustedDevice].self, from: data) else { return [] }
             return list
         }
-        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: "trusted") }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: "trusted2") }
     }
 
     static var accepting: Bool {
         get { defaults.object(forKey: "accepting") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "accepting") }
-    }
-
-    static var configured: Bool {
-        get { defaults.bool(forKey: "configured") }
-        set { defaults.set(newValue, forKey: "configured") }
-    }
-
-    static func whitelist(_ list: [TrustedDevice]) -> String {
-        let ips = Array(Set(list.map(\.ip))).sorted()
-        return ips.isEmpty ? closedWhitelist : ips.joined(separator: ",")
-    }
-}
-
-// MARK: - RustDesk komut satırı
-
-enum RustDesk {
-    static var installed: Bool { FileManager.default.isExecutableFile(atPath: rustDeskBinary) }
-
-    /// Yönetici gerektirmeyen `--get-id`.
-    static func id(completion: @escaping (String?) -> Void) {
-        guard installed else { completion(nil); return }
-        DispatchQueue.global().async {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: rustDeskBinary)
-            p.arguments = ["--get-id"]
-            let out = Pipe()
-            p.standardOutput = out
-            p.standardError = FileHandle.nullDevice
-            do { try p.run() } catch { DispatchQueue.main.async { completion(nil) }; return }
-            DispatchQueue.global().asyncAfter(deadline: .now() + 10) { if p.isRunning { p.terminate() } }
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let text = String(decoding: data, as: UTF8.self)
-            let id = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
-                .last { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" } }
-            DispatchQueue.main.async { completion(id) }
-        }
-    }
-
-    /// RustDesk ayar komutları yönetici (root) ister; hepsi tek parola sorusunda çalışır. RustDesk
-    /// hatayı çıkış koduyla bildirmediği için sonuç, çıktının son satırının `expected` olmasıyla
-    /// doğrulanır (betik, ayarları geri okuyup karşılaştırarak bu satırı yazar).
-    static func runAsAdmin(_ commands: [[String]], expected: String? = nil) -> (Bool, String) {
-        runShellAsAdmin(commands.map { $0.map(shellQuote).joined(separator: " ") }.joined(separator: " ; "), expected: expected)
-    }
-
-    static func runShellAsAdmin(_ shell: String, expected: String?) -> (Bool, String) {
-        let source = "do shell script \"\(appleScriptEscape(shell))\" with administrator privileges"
-        var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else { return (false, "Komut hazırlanamadı.") }
-        let result = script.executeAndReturnError(&error)
-        if let error {
-            let message = error[NSAppleScript.errorMessage] as? String ?? "İptal edildi."
-            return (false, message)
-        }
-        let output = result.stringValue ?? ""
-        let lines = output.components(separatedBy: CharacterSet.newlines).map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        if lines.contains(where: { $0.contains("required") || $0.contains("disabled") }) {
-            return (false, output)
-        }
-        if let expected, lines.last != expected {
-            return (false, "RustDesk ayarı doğrulanamadı (okunan: \(lines.last ?? "boş")).")
-        }
-        return (true, output)
-    }
-
-    static func option(_ key: String, _ value: String) -> [String] {
-        [rustDeskBinary, "--option", key, value]
-    }
-
-    static func read(_ key: String) -> [String] {
-        [rustDeskBinary, "--option", key]
-    }
-
-    static func shellQuote(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    static func appleScriptEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
-    static var bin: String { shellQuote(rustDeskBinary) }
-
-    /// Beyaz listeyi yazar ve geri okuyarak doğrular; tutmazsa eski değeri geri yazar (RustDesk'te
-    /// izinli olup listede görünmeyen adres kalmasın).
-    static func setWhitelist(_ list: [TrustedDevice], previous: [TrustedDevice]) -> (Bool, String) {
-        let new = shellQuote(Store.whitelist(list)), old = shellQuote(Store.whitelist(previous))
-        let shell = """
-            \(bin) --option whitelist \(new); \
-            if [ "$(\(bin) --option whitelist)" = \(new) ]; then echo AYNA_OK; \
-            else \(bin) --option whitelist \(old); echo AYNA_FAIL; fi
-            """
-        return runShellAsAdmin(shell, expected: "AYNA_OK")
-    }
-
-    /// İlk kurulum: önce beyaz liste yazılıp doğrulanır; ancak tuttuysa doğrudan IP erişimi ve parola
-    /// açılır. Beyaz liste tutmazsa RustDesk her adresten parolayla erişilebilir hâle gelmez.
-    static func configure(whitelist: [TrustedDevice], password: String) -> (Bool, String) {
-        let w = shellQuote(Store.whitelist(whitelist))
-        let options = [
-            option("direct-access-port", String(rustDeskPort)),
-            option("approve-mode", "password"),
-            option("verification-method", "use-permanent-password"),
-            option("enable-lan-discovery", "N"),
-            [rustDeskBinary, "--password", password],
-            option("direct-server", "Y"),
-        ].map { $0.map(shellQuote).joined(separator: " ") }.joined(separator: " ; ")
-        let shell = """
-            \(bin) --option whitelist \(w); \
-            if [ "$(\(bin) --option whitelist)" = \(w) ]; then \(options); \
-            if [ "$(\(bin) --option direct-server)" = Y ]; then echo AYNA_OK; else echo AYNA_FAIL; fi; \
-            else echo AYNA_FAIL; fi
-            """
-        return runShellAsAdmin(shell, expected: "AYNA_OK")
     }
 }
 
@@ -248,7 +157,7 @@ func localSubnets() -> [(UInt32, UInt32)] {
     return out
 }
 
-/// Yalnız bu Mac'in kendi alt ağlarındaki özel adresler kabul edilir (yönlendirilmiş/VPN ağları değil).
+/// Yalnız bu Mac'in kendi alt ağlarındaki özel adresler kabul edilir.
 func isLocalPeer(_ ip: String) -> Bool {
     guard let v = ipValue(ip) else { return false }
     let o = v >> 24, o2 = (v >> 16) & 0xFF
@@ -317,47 +226,591 @@ final class Discovery {
     }
 }
 
+// MARK: - Ekran yakalama + H.264
+
+/// Ana ekranı yakalar, donanımla H.264'e kodlar; her kareyi Annex-B olarak verir.
+final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
+    private var stream: SCStream?
+    private var encoder: VTCompressionSession?
+    private let queue = DispatchQueue(label: "ayna.capture")
+    private var paused = false
+    private var forceKey = true
+    private var lastBuffer: CVPixelBuffer?
+    private var frameIndex: Int64 = 0
+    let onFrame: (Data, Bool) -> Void
+    let onSize: (Int, Int) -> Void
+    let onError: (String) -> Void
+
+    init(onFrame: @escaping (Data, Bool) -> Void, onSize: @escaping (Int, Int) -> Void, onError: @escaping (String) -> Void) {
+        self.onFrame = onFrame
+        self.onSize = onSize
+        self.onError = onError
+    }
+
+    func start() {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, _ in
+            guard let self else { return }
+            guard let content,
+                  let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
+            else {
+                self.onError("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).")
+                return
+            }
+            // Gerçek piksel boyutu (Retina), en uzun kenar sınırına ölçeklenir; kodlayıcı çift sayı ister.
+            var pw = display.width, ph = display.height
+            if let mode = CGDisplayCopyDisplayMode(display.displayID) {
+                pw = mode.pixelWidth
+                ph = mode.pixelHeight
+            }
+            let scale = min(1.0, Double(maxVideoSide) / Double(max(pw, ph)))
+            let w = Int(Double(pw) * scale) & ~1, h = Int(Double(ph) * scale) & ~1
+            let config = SCStreamConfiguration()
+            config.width = w
+            config.height = h
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            config.showsCursor = true
+            config.queueDepth = 5
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let stream = SCStream(filter: filter, configuration: config, delegate: self)
+            do {
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+            } catch {
+                self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+                return
+            }
+            self.queue.sync { self.makeEncoder(width: w, height: h) }
+            self.stream = stream
+            stream.startCapture { [weak self] error in
+                if let error { self?.onError("Ekran yakalanamadı: \(error.localizedDescription)") }
+            }
+            self.onSize(w, h)
+        }
+    }
+
+    func stop() {
+        stream?.stopCapture(completionHandler: nil)
+        stream = nil
+        queue.async {
+            if let e = self.encoder {
+                VTCompressionSessionCompleteFrames(e, untilPresentationTimeStamp: .invalid)
+                VTCompressionSessionInvalidate(e)
+            }
+            self.encoder = nil
+            self.lastBuffer = nil
+        }
+    }
+
+    private func makeEncoder(width: Int, height: Int) {
+        var session: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault, width: Int32(width), height: Int32(height),
+            codecType: kCMVideoCodecType_H264, encoderSpecification: nil, imageBufferAttributes: nil,
+            compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &session)
+        guard status == noErr, let s = session else {
+            onError("Görüntü kodlayıcı açılamadı (\(status)).")
+            return
+        }
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: 12_000_000))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 60))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: 600))
+        VTCompressionSessionPrepareToEncodeFrames(s)
+        encoder = s
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sampleBuffer.isValid, let pb = sampleBuffer.imageBuffer else { return }
+        if let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let raw = arr.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw), status != .complete {
+            return
+        }
+        lastBuffer = pb
+        encode(pb)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        onError("Ekran yakalama durdu: \(error.localizedDescription)")
+    }
+
+    /// Kuyrukta çağrılır.
+    private func encode(_ pb: CVPixelBuffer) {
+        guard !paused, let e = encoder else { return }
+        frameIndex += 1
+        var props: CFDictionary?
+        if forceKey {
+            props = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+            forceKey = false
+        }
+        VTCompressionSessionEncodeFrame(e, imageBuffer: pb, presentationTimeStamp: CMTime(value: frameIndex, timescale: 60),
+                                        duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sbuf in
+            guard status == noErr, let sbuf, let frame = Capturer.annexB(sbuf) else { return }
+            self?.onFrame(frame.0, frame.1)
+        }
+    }
+
+    /// Anahtar kare: ekran değişmiyorsa son kare yeniden kodlanır.
+    func requestKeyframe() {
+        queue.async {
+            self.forceKey = true
+            if let pb = self.lastBuffer { self.encode(pb) }
+        }
+    }
+
+    func setPaused(_ p: Bool) {
+        queue.async {
+            self.paused = p
+            if !p {
+                self.forceKey = true
+                if let pb = self.lastBuffer { self.encode(pb) }
+            }
+        }
+    }
+
+    /// VideoToolbox çıktısı (uzunluk önekli NAL'lar) → Annex-B; anahtar karede SPS/PPS başa eklenir.
+    static func annexB(_ sb: CMSampleBuffer) -> (Data, Bool)? {
+        guard let block = CMSampleBufferGetDataBuffer(sb) else { return nil }
+        var key = true
+        if let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as NSArray?,
+           let d = arr.firstObject as? NSDictionary {
+            key = !((d[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
+        }
+        let start: [UInt8] = [0, 0, 0, 1]
+        var out = Data()
+        if key, let fmt = CMSampleBufferGetFormatDescription(sb) {
+            var count = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                                                               parameterSetSizeOut: nil, parameterSetCountOut: &count,
+                                                               nalUnitHeaderLengthOut: nil)
+            for i in 0..<count {
+                var p: UnsafePointer<UInt8>?
+                var n = 0
+                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, parameterSetIndex: i, parameterSetPointerOut: &p,
+                                                                      parameterSetSizeOut: &n, parameterSetCountOut: nil,
+                                                                      nalUnitHeaderLengthOut: nil) == noErr, let p {
+                    out.append(contentsOf: start)
+                    out.append(p, count: n)
+                }
+            }
+        }
+        var total = 0
+        var ptr: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &total,
+                                          dataPointerOut: &ptr) == kCMBlockBufferNoErr, let base = ptr else { return nil }
+        let bytes = UnsafeRawPointer(base).assumingMemoryBound(to: UInt8.self)
+        var off = 0
+        while off + 4 <= total {
+            let n = Int(bytes[off]) << 24 | Int(bytes[off + 1]) << 16 | Int(bytes[off + 2]) << 8 | Int(bytes[off + 3])
+            off += 4
+            guard n > 0, off + n <= total else { break }
+            out.append(contentsOf: start)
+            out.append(bytes + off, count: n)
+            off += n
+        }
+        return (out, key)
+    }
+}
+
+// MARK: - Fare ve klavye
+
+final class Injector {
+    private let source = CGEventSource(stateID: .hidSystemState)
+    private var flags: CGEventFlags = []
+    private var buttons: Set<UInt8> = []
+    private var keys: Set<UInt16> = []
+    private var lastClick = (time: Date.distantPast, button: UInt8(0), count: Int64(0), point: CGPoint.zero)
+
+    private func point(_ x: UInt16, _ y: UInt16) -> CGPoint {
+        let b = CGDisplayBounds(CGMainDisplayID())
+        return CGPoint(x: b.minX + CGFloat(x) / 65535 * b.width, y: b.minY + CGFloat(y) / 65535 * b.height)
+    }
+
+    func move(_ x: UInt16, _ y: UInt16) {
+        let type: CGEventType, button: CGMouseButton
+        if buttons.contains(0) { (type, button) = (.leftMouseDragged, .left) }
+        else if buttons.contains(1) { (type, button) = (.rightMouseDragged, .right) }
+        else if buttons.contains(2) { (type, button) = (.otherMouseDragged, .center) }
+        else { (type, button) = (.mouseMoved, .left) }
+        let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point(x, y), mouseButton: button)
+        e?.flags = flags
+        e?.post(tap: .cghidEventTap)
+    }
+
+    func button(_ b: UInt8, down: Bool, _ x: UInt16, _ y: UInt16) {
+        let p = point(x, y)
+        let (downType, upType, mb): (CGEventType, CGEventType, CGMouseButton) = switch b {
+        case 0: (.leftMouseDown, .leftMouseUp, .left)
+        case 1: (.rightMouseDown, .rightMouseUp, .right)
+        default: (.otherMouseDown, .otherMouseUp, .center)
+        }
+        if down {
+            // Çift tıklama: aynı düğme, kısa süre ve yakın nokta.
+            let near = abs(p.x - lastClick.point.x) < 5 && abs(p.y - lastClick.point.y) < 5
+            let count: Int64 = (lastClick.button == b && near && Date().timeIntervalSince(lastClick.time) < NSEvent.doubleClickInterval)
+                ? lastClick.count + 1 : 1
+            lastClick = (Date(), b, count, p)
+            buttons.insert(b)
+        } else {
+            buttons.remove(b)
+        }
+        let e = CGEvent(mouseEventSource: source, mouseType: down ? downType : upType, mouseCursorPosition: p, mouseButton: mb)
+        e?.setIntegerValueField(.mouseEventClickState, value: lastClick.count)
+        e?.flags = flags
+        e?.post(tap: .cghidEventTap)
+    }
+
+    func scroll(dx: Int16, dy: Int16) {
+        let e = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0)
+        e?.flags = flags
+        e?.post(tap: .cghidEventTap)
+    }
+
+    private static func modifier(_ code: UInt16) -> CGEventFlags? {
+        switch code {
+        case 0x37, 0x36: return .maskCommand
+        case 0x38, 0x3C: return .maskShift
+        case 0x3A, 0x3D: return .maskAlternate
+        case 0x3B, 0x3E: return .maskControl
+        default: return nil
+        }
+    }
+
+    func key(_ code: UInt16, down: Bool) {
+        if let m = Injector.modifier(code) {
+            if down { flags.insert(m) } else { flags.remove(m) }
+            if down { keys.insert(code) } else { keys.remove(code) }
+            let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
+            e?.type = .flagsChanged
+            e?.flags = flags
+            e?.post(tap: .cghidEventTap)
+            return
+        }
+        if code == 0x39 && down { // Caps Lock
+            if flags.contains(.maskAlphaShift) { flags.remove(.maskAlphaShift) } else { flags.insert(.maskAlphaShift) }
+        }
+        if down { keys.insert(code) } else { keys.remove(code) }
+        let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down)
+        e?.flags = flags
+        e?.post(tap: .cghidEventTap)
+    }
+
+    /// Oturum biterken basılı kalan her şey bırakılır.
+    func releaseAll() {
+        for k in keys { key(k, down: false) }
+        for b in buttons {
+            let p = CGEvent(source: nil)?.location ?? .zero
+            let t: CGEventType = b == 0 ? .leftMouseUp : b == 1 ? .rightMouseUp : .otherMouseUp
+            CGEvent(mouseEventSource: source, mouseType: t, mouseCursorPosition: p, mouseButton: b == 0 ? .left : b == 1 ? .right : .center)?
+                .post(tap: .cghidEventTap)
+        }
+        buttons.removeAll()
+        flags = []
+    }
+}
+
+// MARK: - Oturum
+
+final class Session {
+    let conn: NWConnection
+    let ip: String
+    private weak var app: AppDelegate?
+    private var buffer = Data()
+    private enum Stage { case hello, approval, streaming, closed }
+    private var stage = Stage.hello
+    private let nonce = hex(randomBytes(16))
+    private let ecdh = P256.KeyAgreement.PrivateKey()
+    private lazy var macPub = hex(ecdh.publicKey.x963Representation)
+    private var txKey: SymmetricKey?
+    private var rxKey: SymmetricKey?
+    private var txCounter: UInt64 = 0
+    private var rxCounter: UInt64 = 0
+    private let sendQueue = DispatchQueue(label: "ayna.send")
+    private var inFlight = 0
+    private var needKey = false
+    private var capturer: Capturer?
+    private let injector = Injector()
+    private var lastData = Date()
+    private var watchdog: Timer?
+    private(set) var name = "Windows"
+
+    init(conn: NWConnection, ip: String, app: AppDelegate) {
+        self.conn = conn
+        self.ip = ip
+        self.app = app
+    }
+
+    func start() {
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled: self?.close()
+            default: break
+            }
+        }
+        conn.start(queue: .main)
+        sendLine("AYNA2 HI \(nonce) \(macPub)")
+        receive()
+        // Selamlaşma 10 sn'de gelmezse ya da oturum 10 sn sessiz kalırsa kapanır.
+        watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let limit: TimeInterval = self.stage == .approval ? 120 : 10
+            if Date().timeIntervalSince(self.lastData) > limit { self.close() }
+        }
+    }
+
+    private func sendLine(_ s: String) {
+        conn.send(content: Data((s + "\n").utf8), completion: .contentProcessed { _ in })
+    }
+
+    private func receive() {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, error in
+            guard let self, self.stage != .closed else { return }
+            if let data, !data.isEmpty {
+                self.buffer.append(data)
+                self.lastData = Date()
+                self.process()
+            }
+            if complete || error != nil { self.close() } else { self.receive() }
+        }
+    }
+
+    private func take(_ n: Int) -> Data {
+        let d = Data(buffer.prefix(n))
+        buffer = Data(buffer.dropFirst(n))
+        return d
+    }
+
+    private func process() {
+        while stage != .closed {
+            switch stage {
+            case .hello:
+                guard let nl = buffer.firstIndex(of: 0x0A) else {
+                    if buffer.count > 1024 { close() }
+                    return
+                }
+                let line = String(decoding: take(nl - buffer.startIndex + 1).dropLast(), as: UTF8.self)
+                hello(line)
+            case .approval:
+                return
+            case .streaming:
+                guard buffer.count >= 4 else { return }
+                let b = [UInt8](buffer.prefix(4))
+                let n = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
+                guard n >= 17, n <= 1 << 20 else { close(); return }
+                guard buffer.count >= 4 + n else { return }
+                _ = take(4)
+                let sealed = take(n)
+                guard let plain = open(sealed) else { close(); return }
+                handle(plain)
+            case .closed:
+                return
+            }
+        }
+    }
+
+    private func nonceData(_ c: UInt64) -> AES.GCM.Nonce {
+        var b = [UInt8](repeating: 0, count: 12)
+        for i in 0..<8 { b[4 + i] = UInt8((c >> (56 - 8 * UInt64(i))) & 0xFF) }
+        return try! AES.GCM.Nonce(data: b)
+    }
+
+    private func open(_ sealed: Data) -> Data? {
+        guard let key = rxKey, sealed.count >= 16 else { return nil }
+        let n = nonceData(rxCounter)
+        rxCounter += 1
+        guard let box = try? AES.GCM.SealedBox(nonce: n, ciphertext: sealed.prefix(sealed.count - 16), tag: sealed.suffix(16)) else {
+            return nil
+        }
+        return try? AES.GCM.open(box, using: key)
+    }
+
+    /// Şifreleyip gönderir (gönderim kuyruğunda; sayaç sırası korunur).
+    private func send(_ plain: Data) {
+        sendQueue.async { [weak self] in self?.sendNow(plain) }
+    }
+
+    private func sendNow(_ plain: Data) {
+        guard let key = txKey, let box = try? AES.GCM.seal(plain, using: key, nonce: nonceData(txCounter)) else { return }
+        txCounter += 1
+        var frame = Data()
+        let sealed = box.ciphertext + box.tag
+        let n = UInt32(sealed.count)
+        frame.append(contentsOf: [UInt8(n >> 24), UInt8((n >> 16) & 0xFF), UInt8((n >> 8) & 0xFF), UInt8(n & 0xFF)])
+        frame.append(sealed)
+        let size = frame.count
+        inFlight += size
+        conn.send(content: frame, completion: .contentProcessed { [weak self] _ in
+            self?.sendQueue.async { self?.inFlight -= size }
+        })
+    }
+
+    /// Ağ yavaşsa kareler biriktirilmez: bekleyen veri çoksa kare atlanır, sonra anahtar kareyle sürer.
+    private func sendVideo(_ data: Data, key: Bool) {
+        sendQueue.async { [weak self] in
+            guard let self else { return }
+            if self.inFlight > 4_000_000 {
+                self.needKey = true
+                return
+            }
+            if self.needKey && !key {
+                if self.inFlight < 1_000_000 { self.capturer?.requestKeyframe() }
+                return
+            }
+            if key { self.needKey = false }
+            self.sendNow(Data([0x01, key ? 1 : 0]) + data)
+        }
+    }
+
+    // --- El sıkışma
+
+    private func hello(_ line: String) {
+        guard let app else { close(); return }
+        let parts = line.split(separator: " ", maxSplits: 5).map(String.init)
+        guard parts.count >= 5, parts[0] == "AYNA2", parts[1] == "HELLO", isHex(parts[2], length: 32),
+              isHex(parts[4], length: 130), let winPubData = unhex(parts[4]),
+              let peerKey = try? P256.KeyAgreement.PublicKey(x963Representation: winPubData),
+              let secret = try? ecdh.sharedSecretFromKeyAgreement(with: peerKey)
+        else {
+            sendLine("AYNA2 DENY")
+            close()
+            return
+        }
+        let id = parts[2], proof = parts[3], winPub = parts[4]
+        name = cleanName(parts.count > 5 ? parts[5] : "Windows")
+        let shared = secret.withUnsafeBytes { Data($0) }
+        let t = "AYNA2|\(nonce)|\(macPub)|\(winPub)|\(id)"
+        let keys = hkdf(shared, "keys|" + t, 64)
+        let sasBytes = [UInt8](hkdf(shared, "sas|" + t, 4))
+        let sasN = (UInt32(sasBytes[0]) << 24 | UInt32(sasBytes[1]) << 16 | UInt32(sasBytes[2]) << 8 | UInt32(sasBytes[3])) % 1_000_000
+        let sas = String(format: "%03d %03d", Int(sasN / 1000), Int(sasN % 1000))
+        rxKey = SymmetricKey(data: keys.prefix(32))
+        txKey = SymmetricKey(data: keys.suffix(32))
+
+        guard Store.accepting else { sendLine("AYNA2 OFF"); close(); return }
+        let known = Store.trusted.first { $0.id == id }
+        let knownToken = known.flatMap { unhex($0.token) }
+        let authenticated = knownToken.map { sameProof(hmacHex(key: $0, message: "hello|" + t), proof) } ?? false
+
+        if authenticated, let known, let token = knownToken, known.ip == ip {
+            approve(token: token, kind: "SAME", t: t)
+            return
+        }
+        stage = .approval
+        app.ask(session: self, name: name, ip: ip, id: id, sas: sas, known: known, authenticated: authenticated) { [weak self] allowed in
+            guard let self, self.stage == .approval else { return }
+            guard allowed else {
+                self.sendLine("AYNA2 DENY")
+                self.close()
+                return
+            }
+            let token = authenticated ? (knownToken ?? Data()) : hkdf(shared, "token|" + t, 32)
+            var list = Store.trusted.filter { $0.id != id }
+            list.append(TrustedDevice(id: id, name: self.name, ip: self.ip, token: hex(token)))
+            Store.trusted = list
+            self.approve(token: token, kind: authenticated ? "SAME" : "NEW", t: t)
+        }
+        if stage == .approval {
+            sendLine("AYNA2 WAIT")
+        }
+    }
+
+    private func approve(token: Data, kind: String, t: String) {
+        sendLine("AYNA2 OK \(kind) \(hmacHex(key: token, message: "ok|" + t))")
+        stage = .streaming
+        lastData = Date()
+        app?.sessionStarted(self)
+        let cap = Capturer(
+            onFrame: { [weak self] data, key in self?.sendVideo(data, key: key) },
+            onSize: { [weak self] w, h in
+                self?.send(Data([0x02] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
+            },
+            onError: { [weak self] message in
+                DispatchQueue.main.async { self?.app?.show(error: message) }
+            })
+        capturer = cap
+        cap.start()
+        process()
+    }
+
+    // --- Oturum mesajları
+
+    private func handle(_ m: Data) {
+        guard let type = m.first else { return }
+        let b = [UInt8](m)
+        switch type {
+        case 0x10 where b.count >= 5:
+            injector.move(readBE16(m, 1), readBE16(m, 3))
+        case 0x11 where b.count >= 7:
+            injector.button(b[1], down: b[2] == 1, readBE16(m, 3), readBE16(m, 5))
+        case 0x12 where b.count >= 5:
+            injector.scroll(dx: Int16(bitPattern: readBE16(m, 1)), dy: Int16(bitPattern: readBE16(m, 3)))
+        case 0x13 where b.count >= 4:
+            injector.key(readBE16(m, 1), down: b[3] == 1)
+        case 0x14:
+            capturer?.requestKeyframe()
+        case 0x15 where b.count >= 9:
+            send(Data([0x03]) + m.dropFirst().prefix(8))
+        case 0x16 where b.count >= 2:
+            capturer?.setPaused(b[1] == 1)
+        case 0x17:
+            close()
+        default:
+            break
+        }
+    }
+
+    func close() {
+        guard stage != .closed else { return }
+        let wasStreaming = stage == .streaming
+        stage = .closed
+        watchdog?.invalidate()
+        capturer?.stop()
+        capturer = nil
+        injector.releaseAll()
+        if wasStreaming {
+            sendQueue.async { [weak self] in
+                self?.sendNow(Data([0x04]))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.conn.cancel() }
+            }
+        } else {
+            conn.cancel()
+        }
+        app?.sessionEnded(self)
+    }
+}
+
 // MARK: - Uygulama
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var code: String?
     private var discovery: Discovery?
     private var listener: NWListener?
-    private var openConnections = 0
-    /// Adres başına açık bağlantı (tek bir cihaz bütün yuvaları tutamasın).
+    private var active: Session?
+    private var pending: [Session] = []
     private var connectionsByIP: [String: Int] = [:]
-    /// Aynı anda tek onay sorusu.
     private var asking = false
     /// Reddedilen adresler bir süre yeniden sorulmaz; ağdan gelen soru seli olmasın.
     private var deniedUntil: [String: Date] = [:]
-    /// Son onay sorularının zamanları (genel sınır).
     private var recentPrompts: [Date] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "display", accessibilityDescription: "Ayna Ajan")
-        }
+        updateIcon()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
-        refreshCode()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshCode() }
         startNetwork()
-        if RustDesk.installed && !Store.configured {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setup() }
-        }
+        requestPermissions()
     }
 
-    private func refreshCode() {
-        RustDesk.id { [weak self] id in self?.code = id }
+    private func updateIcon() {
+        let symbol = active == nil ? "display" : "display.and.arrow.down"
+        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Ayna Ajan")
+            ?? NSImage(systemSymbolName: "display", accessibilityDescription: "Ayna Ajan")
     }
-
-    private var plainCode: String? { code?.filter { !$0.isWhitespace } }
 
     private func formatted(_ code: String) -> String {
-        guard code.allSatisfy(\.isNumber) else { return code }
         var out = ""
         for (i, c) in code.enumerated() {
             if i > 0 && (code.count - i) % 3 == 0 { out.append(" ") }
@@ -366,24 +819,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return out
     }
 
-    private func device(_ id: String) -> TrustedDevice? {
-        Store.trusted.first { $0.id == id }
+    // MARK: İzinler
+
+    private var screenAllowed: Bool { CGPreflightScreenCaptureAccess() }
+    private var inputAllowed: Bool { AXIsProcessTrusted() }
+
+    private func requestPermissions() {
+        if !screenAllowed { CGRequestScreenCaptureAccess() }
+        if !inputAllowed {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        }
     }
 
     // MARK: Ağ
 
     private func startNetwork() {
-        discovery = Discovery(port: agentPort) { [weak self] message, _ in
-            guard let self, Store.accepting, let code = self.plainCode else { return nil }
+        discovery = Discovery(port: agentPort) { message, _ in
+            guard Store.accepting else { return nil }
+            let code = Store.code
             let parts = message.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ").map(String.init)
             guard parts.count == 5, parts[0] == "AYNA1", parts[1] == "FIND", parts[2] == code,
                   isHex(parts[3], length: 32), isHex(parts[4], length: 32) else { return nil }
-            // Daha önce eşleşilmiş bilgisayara yanıt, onun anahtarıyla imzalanır: aynı ağdaki başka bir
-            // cihaz kendini bu Mac gibi gösteremez.
             let name = cleanName(Host.current().localizedName ?? "Mac")
-            let signed = "here|\(code)|\(parts[4])|\(rustDeskPort)|\(name)"
-            let proof = self.device(parts[3])?.token.flatMap { hmacHex(key: $0, message: signed) } ?? "-"
-            return "AYNA1 HERE \(code) \(rustDeskPort) \(proof) \(name)"
+            let signed = "here|\(code)|\(parts[4])|\(agentPort)|\(name)"
+            let proof = Store.trusted.first { $0.id == parts[3] }.flatMap { unhex($0.token) }
+                .map { hmacHex(key: $0, message: signed) } ?? "-"
+            return "AYNA1 HERE \(code) \(agentPort) \(proof) \(name)"
         }
         do {
             let params = NWParameters.tcp
@@ -393,62 +855,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             l.start(queue: .main)
             listener = l
         } catch {
-            NSLog("Ayna Ajan: TCP dinlenemedi: \(error)")
+            show(error: "Bağlantı noktası \(agentPort) açılamadı: \(error.localizedDescription)")
         }
     }
 
     private func accept(_ conn: NWConnection) {
-        guard openConnections < 8, let ip = ipv4String(conn.endpoint), isLocalPeer(ip),
-              connectionsByIP[ip, default: 0] < 2 else { conn.cancel(); return }
-        openConnections += 1
+        guard let ip = ipv4String(conn.endpoint), isLocalPeer(ip), connectionsByIP[ip, default: 0] < 2,
+              pending.count < 8 else { conn.cancel(); return }
+        if active != nil {
+            // Aynı anda tek oturum.
+            conn.start(queue: .main)
+            conn.send(content: Data("AYNA2 BUSY\n".utf8), completion: .contentProcessed { _ in conn.cancel() })
+            return
+        }
         connectionsByIP[ip, default: 0] += 1
-        // .failed ardından .cancelled da gelir: sayaç bir kez düşer.
-        var counted = true
-        conn.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .cancelled, .failed:
-                if counted, let self {
-                    counted = false
-                    self.openConnections -= 1
-                    self.connectionsByIP[ip, default: 1] -= 1
-                    if self.connectionsByIP[ip] == 0 { self.connectionsByIP[ip] = nil }
-                }
-            default: break
-            }
-        }
-        conn.start(queue: .main)
-        let nonce = randomHex(16)
-        send(conn, "AYNA1 NONCE \(nonce)")
-        var greeted = false
-        readLine(conn, buffer: Data()) { [weak self] line in
-            greeted = true
-            guard let self, let line else { conn.cancel(); return }
-            self.hello(line, nonce: nonce, ip: ip, conn: conn)
-        }
-        // Selamlaşma 10 sn'de gelmezse bağlantı kapanır.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { if !greeted { conn.cancel() } }
-        // Yanıtsız kalan bağlantılar kapanır.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { conn.cancel() }
+        let s = Session(conn: conn, ip: ip, app: self)
+        pending.append(s)
+        s.start()
     }
 
-    private func readLine(_ conn: NWConnection, buffer: Data, done: @escaping (String?) -> Void) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 512) { [weak self] data, _, complete, error in
-            var buf = buffer
-            if let data { buf.append(data) }
-            if let nl = buf.firstIndex(of: 0x0A) {
-                done(String(decoding: buf[..<nl], as: UTF8.self))
-            } else if error != nil || complete || buf.count > 512 {
-                done(nil)
-            } else {
-                self?.readLine(conn, buffer: buf, done: done)
-            }
-        }
+    func sessionStarted(_ s: Session) {
+        pending.removeAll { $0 === s }
+        active?.close()
+        active = s
+        updateIcon()
     }
 
-    private func send(_ conn: NWConnection, _ text: String, close: Bool = false) {
-        conn.send(content: (text + "\n").data(using: .utf8), completion: .contentProcessed { _ in
-            if close { conn.cancel() }
-        })
+    func sessionEnded(_ s: Session) {
+        pending.removeAll { $0 === s }
+        connectionsByIP[s.ip, default: 1] -= 1
+        if connectionsByIP[s.ip] == 0 { connectionsByIP[s.ip] = nil }
+        if active === s {
+            active = nil
+            updateIcon()
+        }
     }
 
     /// Onay sorusu sınırı: adres başına reddedildikten sonra 10 dk; genel olarak 10 sn'de bir ve
@@ -462,104 +902,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return recentPrompts.count < 6
     }
 
-    /// `AYNA1 HELLO <32 onaltılık kimlik> <imza|-> <ad…>`
-    private func hello(_ line: String, nonce: String, ip: String, conn: NWConnection) {
-        let parts = line.split(separator: " ", maxSplits: 4).map(String.init)
-        guard parts.count >= 4, parts[0] == "AYNA1", parts[1] == "HELLO", isHex(parts[2], length: 32) else {
-            send(conn, "AYNA1 DENY", close: true)
-            return
-        }
-        let id = parts[2], proof = parts[3]
-        let name = cleanName(parts.count > 4 ? parts[4] : "Windows")
-        guard Store.accepting else { send(conn, "AYNA1 OFF", close: true); return }
-
-        let known = device(id)
-        let authenticated = known?.token.flatMap { hmacHex(key: $0, message: "hello|\(nonce)") }
-            .map { sameProof($0, proof) } ?? false
-        /// Onay satırı, kullanılan anahtarla imzalanır: Windows, eşleşilmiş Mac'in onayını doğrular.
-        func approve(token: String, issue: Bool) {
-            let proof = hmacHex(key: token, message: "ok|\(nonce)|\(id)") ?? "-"
-            send(conn, "AYNA1 OK \(issue ? token : "-") \(proof)", close: true)
-        }
-        if authenticated, let known, let token = known.token, known.ip == ip {
-            approve(token: token, issue: false)
-            return
-        }
-        guard mayAsk(ip: ip) else { send(conn, "AYNA1 DENY", close: true); return }
+    /// Yeni (ya da kimliğini kanıtlayamayan, ya da adresi değişen) bilgisayar için onay sorusu.
+    func ask(session: Session, name: String, ip: String, id: String, sas: String, known: TrustedDevice?,
+             authenticated: Bool, completion: @escaping (Bool) -> Void) {
+        guard mayAsk(ip: ip) else { completion(false); return }
         asking = true
-        defer { asking = false }
-        send(conn, "AYNA1 WAIT")
-
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        let shortID = String(id.suffix(6)).uppercased()
-        switch (known, authenticated) {
-        case (.some(let k), true):
-            alert.messageText = "“\(k.name)” yeni bir adresten bağlanıyor"
-            alert.informativeText = "Güvenilen bu bilgisayar artık \(ip) adresinde (önceden \(k.ip))."
-        case (.some(let k), false):
-            alert.alertStyle = .critical
-            alert.messageText = "“\(name)” kimliğini kanıtlayamadı"
-            alert.informativeText = """
-                Bu cihaz kendini güvendiğiniz “\(k.name)” gibi gösteriyor ama onun anahtarına sahip değil. \
-                Kendi bilgisayarınızın Ayna Merkezi'ni yeniden kurmadıysanız reddedin.
-                """
-        default:
-            alert.messageText = "“\(name)” bu Mac'e bağlanmak istiyor"
-            alert.informativeText = """
-                İzin verirseniz bu bilgisayar güvenilenler listesine eklenir ve Mac'in ekranını görüp \
-                kontrol edebilir. Bağlantı için yine RustDesk parolası gerekir.
-                """
-        }
-        alert.informativeText += "\n\nAdres: \(ip)   Cihaz: …\(shortID)"
-        // Varsayılan (Enter) düğme "Reddet": o an yazı yazan kullanıcı yanlışlıkla izin vermesin.
-        alert.addButton(withTitle: "Reddet")
-        alert.addButton(withTitle: "İzin ver")
-        // Bağlantı soru açılmadan koptuysa sorulmaz.
-        guard case .ready = conn.state else { conn.cancel(); return }
         recentPrompts.append(Date())
-        let allowed = alert.runModal() == .alertSecondButtonReturn
-        // Yanıt geç verildiyse Windows çoktan vazgeçmiştir: hiçbir şey kaydedilmez.
-        guard case .ready = conn.state else { conn.cancel(); return }
-        guard allowed else {
-            deniedUntil[ip] = Date().addingTimeInterval(600)
-            send(conn, "AYNA1 DENY", close: true)
-            return
-        }
-        let reuse = authenticated ? known?.token : nil
-        let token = reuse ?? randomHex(32)
-        let previous = Store.trusted
-        var list = previous.filter { $0.id != id }
-        list.append(TrustedDevice(id: id, name: name, ip: ip, token: token))
-        if Store.whitelist(list) != Store.whitelist(previous) {
-            let (ok, message) = RustDesk.setWhitelist(list, previous: previous)
-            guard ok else {
-                show(error: "Güvenilenler listesi RustDesk'e yazılamadı.", detail: message)
-                send(conn, "AYNA1 DENY", close: true)
-                return
+        // Satır "WAIT" gönderilsin diye soru bir sonraki turda açılır.
+        DispatchQueue.main.async { [self] in
+            defer { asking = false }
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            switch (known, authenticated) {
+            case (.some(let k), true):
+                alert.messageText = "“\(k.name)” yeni bir adresten bağlanıyor"
+                alert.informativeText = "Güvenilen bu bilgisayar artık \(ip) adresinde (önceden \(k.ip))."
+            case (.some(let k), false):
+                alert.alertStyle = .critical
+                alert.messageText = "“\(name)” kimliğini kanıtlayamadı"
+                alert.informativeText = """
+                    Bu cihaz kendini güvendiğiniz “\(k.name)” gibi gösteriyor ama onun anahtarına sahip değil. \
+                    Kendi bilgisayarınızın eşleşmesini sıfırlamadıysanız reddedin.
+                    """
+            default:
+                alert.messageText = "“\(name)” bu Mac'e bağlanmak istiyor"
+                alert.informativeText = """
+                    İzin verirseniz bu bilgisayar Mac'in ekranını görüp fare ve klavyeyle kontrol edebilir \
+                    ve güvenilenler listesine eklenir.
+                    """
             }
+            alert.informativeText += """
+
+
+                Windows'taki Mac penceresinde görünen kod bununla aynı olmalı:
+                \(sas)
+
+                Adres: \(ip)   Cihaz: …\(id.suffix(6).uppercased())
+                """
+            // Varsayılan (Enter) düğme "Reddet": o an yazı yazan kullanıcı yanlışlıkla izin vermesin.
+            alert.addButton(withTitle: "Reddet")
+            alert.addButton(withTitle: "İzin ver")
+            guard case .ready = session.conn.state else { completion(false); return }
+            let allowed = alert.runModal() == .alertSecondButtonReturn
+            // Yanıt geç verildiyse Windows çoktan vazgeçmiştir.
+            guard case .ready = session.conn.state else { completion(false); return }
+            if !allowed { deniedUntil[ip] = Date().addingTimeInterval(600) }
+            completion(allowed)
         }
-        Store.trusted = list
-        approve(token: token, issue: reuse == nil)
     }
 
     // MARK: Menü
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        guard RustDesk.installed else {
-            menu.addItem(item("RustDesk kurulu değil", nil))
-            menu.addItem(item("RustDesk'i indir…", #selector(downloadRustDesk)))
-            menu.addItem(.separator())
-            menu.addItem(item("Çıkış", #selector(quit)))
-            return
-        }
-        if let code {
-            let codeItem = item("Kod: \(formatted(code))", #selector(copyCode))
-            codeItem.toolTip = "Kopyalamak için tıklayın"
-            menu.addItem(codeItem)
-        } else {
-            menu.addItem(item("Kod okunuyor…", nil))
+        let codeItem = item("Kod: \(formatted(Store.code))", #selector(copyCode))
+        codeItem.toolTip = "Kopyalamak için tıklayın"
+        menu.addItem(codeItem)
+        if let s = active {
+            menu.addItem(item("Bağlı: \(s.name) (\(s.ip))", nil))
+            menu.addItem(item("Bağlantıyı kes", #selector(disconnect)))
         }
         let accepting = item("Bağlantılara izin ver", #selector(toggleAccepting))
         accepting.state = Store.accepting ? .on : .off
@@ -568,11 +969,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let trustedItem = item("Güvenilen bilgisayarlar", nil)
         let sub = NSMenu()
-        let list = Store.trusted
-        if list.isEmpty {
-            sub.addItem(item("Henüz yok", nil))
-        }
-        for device in list {
+        if Store.trusted.isEmpty { sub.addItem(item("Henüz yok", nil)) }
+        for device in Store.trusted {
             let entry = NSMenuItem(title: "\(device.name) (\(device.ip))", action: nil, keyEquivalent: "")
             let actions = NSMenu()
             let remove = item("Güveni kaldır", #selector(removeTrusted(_:)))
@@ -583,13 +981,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         trustedItem.submenu = sub
         menu.addItem(trustedItem)
-        menu.addItem(item("Bağlantı parolasını değiştir…", #selector(changePassword)))
-        menu.addItem(item("RustDesk'i Ayna için ayarla…", #selector(setupFromMenu)))
-        menu.addItem(item("Ekran Kaydı ve Erişilebilirlik izinleri…", #selector(openPrivacy)))
         menu.addItem(.separator())
+        menu.addItem(item(screenAllowed ? "Ekran Kaydı izni: verildi" : "Ekran Kaydı izni ver…", #selector(openScreenPrivacy)))
+        menu.addItem(item(inputAllowed ? "Erişilebilirlik izni: verildi" : "Erişilebilirlik izni ver…", #selector(openInputPrivacy)))
         let login = item("Oturum açınca başlat", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
+        menu.addItem(.separator())
         menu.addItem(item("Çıkış", #selector(quit)))
     }
 
@@ -601,107 +999,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func copyCode() {
-        guard let code = plainCode else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(code, forType: .string)
+        NSPasteboard.general.setString(Store.code, forType: .string)
     }
+
+    @objc private func disconnect() { active?.close() }
 
     @objc private func toggleAccepting() {
         Store.accepting.toggle()
+        if !Store.accepting { active?.close() }
     }
 
-    /// Önce RustDesk'ten kaldırılır (doğrulanarak), sonra listeden: yazım başarısızsa adres RustDesk'te
-    /// izinli kalırken listede görünmez olmasın.
     @objc private func removeTrusted(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        let previous = Store.trusted
-        let list = previous.filter { $0.id != id }
-        let (ok, message) = RustDesk.setWhitelist(list, previous: previous)
-        guard ok else { show(error: "RustDesk ayarı değiştirilemedi; bilgisayar hâlâ güvenilir.", detail: message); return }
-        Store.trusted = list
+        Store.trusted = Store.trusted.filter { $0.id != id }
     }
 
-    @objc private func setupFromMenu() { setup() }
-
-    /// İlk kurulum: parola + RustDesk'i doğrudan IP, kalıcı parola ve beyaz listeyle çalıştırma.
-    private func setup() {
-        NSApp.activate(ignoringOtherApps: true)
-        guard let password = askPassword(
-            title: "Ayna için RustDesk ayarı",
-            text: """
-                Windows'tan bu Mac'e bağlanırken sorulacak parolayı belirleyin (en az \(minPasswordLength) karakter).
-                RustDesk yalnız güvendiğiniz bilgisayarların yerel ağ adreslerinden ve bu parolayla \
-                bağlantı kabul edecek biçimde ayarlanacak. Ardından macOS yönetici parolanızı soracak.
-                """
-        ) else { return }
-        let (ok, message) = RustDesk.configure(whitelist: Store.trusted, password: password)
-        guard ok else {
-            show(error: "RustDesk ayarlanamadı.", detail: message)
-            return
-        }
-        Store.configured = true
-        let done = NSAlert()
-        done.messageText = "Hazır"
-        done.informativeText = """
-            Windows'ta Ayna Merkezi'ne bu Mac'in kodunu yazın: \(code.map(formatted) ?? "menü çubuğundaki kod").
-            RustDesk'in ekranı paylaşabilmesi için Sistem Ayarları > Gizlilik ve Güvenlik'te \
-            Ekran Kaydı ve Erişilebilirlik izinlerinin RustDesk için açık olması gerekir.
-            """
-        done.runModal()
+    @objc private func openScreenPrivacy() {
+        if !screenAllowed { CGRequestScreenCaptureAccess() }
+        open("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     }
 
-    @objc private func changePassword() {
-        NSApp.activate(ignoringOtherApps: true)
-        guard let password = askPassword(
-            title: "Bağlantı parolası",
-            text: "Yeni parolayı yazın (en az \(minPasswordLength) karakter)."
-        ) else { return }
-        let (ok, message) = RustDesk.runAsAdmin([[rustDeskBinary, "--password", password]])
-        if !ok { show(error: "Parola değiştirilemedi.", detail: message) }
+    @objc private func openInputPrivacy() {
+        requestPermissions()
+        open("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
     }
 
-    private func askPassword(title: String, text: String) -> String? {
-        while true {
-            let alert = NSAlert()
-            alert.messageText = title
-            alert.informativeText = text
-            let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 260, height: 56))
-            stack.orientation = .vertical
-            stack.spacing = 8
-            let first = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-            first.placeholderString = "Parola"
-            let second = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-            second.placeholderString = "Parola (tekrar)"
-            stack.addArrangedSubview(first)
-            stack.addArrangedSubview(second)
-            alert.accessoryView = stack
-            alert.addButton(withTitle: "Tamam")
-            alert.addButton(withTitle: "Vazgeç")
-            alert.window.initialFirstResponder = first
-            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-            let p = first.stringValue
-            if p.count < minPasswordLength {
-                show(error: "Parola en az \(minPasswordLength) karakter olmalı.", detail: "")
-            } else if p != second.stringValue {
-                show(error: "Parolalar aynı değil.", detail: "")
-            } else if p.contains(where: { $0.isNewline }) {
-                show(error: "Parola satır sonu içeremez.", detail: "")
-            } else {
-                return p
-            }
-        }
-    }
-
-    @objc private func openPrivacy() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func downloadRustDesk() {
-        if let url = URL(string: "https://github.com/rustdesk/rustdesk/releases/latest") {
-            NSWorkspace.shared.open(url)
-        }
+    private func open(_ url: String) {
+        if let u = URL(string: url) { NSWorkspace.shared.open(u) }
     }
 
     @objc private func toggleLogin() {
@@ -717,10 +1042,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() {
+        active?.close()
         NSApp.terminate(nil)
     }
 
-    private func show(error: String, detail: String) {
+    func show(error: String, detail: String = "") {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning

@@ -15,7 +15,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
@@ -24,7 +24,5 @@
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Windows'taki Ayna Merkezi'nin bu Mac'i yerel ağda bulabilmesi için.</string>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>RustDesk ayarlarını yönetici onayıyla değiştirmek için.</string>
 </dict>
 </plist>

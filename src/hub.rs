@@ -1,8 +1,8 @@
 //! Ayna Merkezi: uygulamanın ana penceresi.
 //!
-//! iPhone'u açıp kapatma (kapalıyken görev çubuğu ikonu da kalkar), ekran boyutu, Mac'e kodla
-//! bağlanma ve genel ayarlar. Çerçevesiz, yuvarlak köşeli tek bir pencere; denetimler (anahtar,
-//! kaydırıcı, düğme) kendi çizilir, yalnız kod alanı yerel bir EDIT denetimidir.
+//! iPhone ve Mac'i açıp kapatma (kapalıyken görev çubuğu ikonları da kalkar), iPhone ekran boyutu,
+//! Mac bağlantı durumu ve genel ayarlar. Çerçevesiz, yuvarlak köşeli tek bir pencere; denetimler
+//! (anahtar, kaydırıcı, düğme) kendi çizilir. Buradaki çizim yardımcılarını Mac penceresi de kullanır.
 
 use std::cell::RefCell;
 
@@ -11,29 +11,25 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::mac::{self, Mac};
-use crate::mirror::{self, WM_APP_SHOW, WM_APP_TOGGLE};
-use crate::taskbar::{self, draw_mac, draw_phone, fill, hex, round_rect_sdf, Canvas, Device, WM_APP_DISCONNECT, WM_APP_HUB};
+use crate::macview;
+use crate::mirror;
+use crate::taskbar::{self, draw_mac, draw_phone, fill, hex, round_rect_sdf, Canvas, Device, WM_APP_HUB};
 use crate::util::{self, height, width};
 
 pub const CLASS: PCWSTR = w!("iPhoneAyna.Merkez");
 const TIMER_STATUS: usize = 1;
-const WM_MOUSELEAVE: u32 = 0x02A3;
-/// Kod alanında Enter: bağlan.
-const WM_APP_GO: u32 = WM_APP + 24;
-const EDIT_ID: usize = 100;
+pub(crate) const WM_MOUSELEAVE: u32 = 0x02A3;
 const ZOOM_SETTING: PCWSTR = w!("BuyutmeYenile");
-const CODE_SETTING: PCWSTR = w!("MacKodu");
 
 /// Pencere genişliği ve kart ölçüleri (96 DPI'da piksel).
 const W: f32 = 400.0;
 const PAD: f32 = 16.0;
 const TITLE_H: f32 = 56.0;
 const IPHONE_H: f32 = 142.0;
-const MAC_H: f32 = 156.0;
+const MAC_H: f32 = 150.0;
 const GENERAL_H: f32 = 108.0;
 const GAP: f32 = 12.0;
 
@@ -42,6 +38,7 @@ enum Ctl {
     Close,
     IPhoneSwitch,
     Slider,
+    MacSwitch,
     MacButton,
     AutostartSwitch,
     ZoomSwitch,
@@ -49,8 +46,6 @@ enum Ctl {
 
 struct Hub {
     hwnd: HWND,
-    edit: HWND,
-    mac: Mac,
     scale: f32,
     light: bool,
     hover: Option<Ctl>,
@@ -58,21 +53,21 @@ struct Hub {
     dragging: bool,
     tracking: bool,
     fonts: Fonts,
-    edit_brush: HBRUSH,
     /// Son çizimdeki durum metinleri; değişmedikçe zamanlayıcı yeniden çizmez.
-    painted: (String, String, bool),
+    painted: (String, String, bool, bool),
 }
 
-struct Fonts {
-    title: HFONT,
-    name: HFONT,
-    body: HFONT,
-    small: HFONT,
-    code: HFONT,
+pub(crate) struct Fonts {
+    pub title: HFONT,
+    pub name: HFONT,
+    pub body: HFONT,
+    pub small: HFONT,
+    pub code: HFONT,
+    pub big: HFONT,
 }
 
 impl Fonts {
-    fn new(scale: f32) -> Fonts {
+    pub(crate) fn new(scale: f32) -> Fonts {
         let make = |size: f32, weight: i32| {
             let mut lf = LOGFONTW {
                 lfHeight: -(size * scale).round() as i32,
@@ -85,31 +80,38 @@ impl Fonts {
             }
             unsafe { CreateFontIndirectW(&lf) }
         };
-        Fonts { title: make(18.0, 600), name: make(15.0, 600), body: make(14.0, 400), small: make(12.0, 400), code: make(17.0, 500) }
+        Fonts {
+            title: make(18.0, 600),
+            name: make(15.0, 600),
+            body: make(14.0, 400),
+            small: make(12.0, 400),
+            code: make(17.0, 500),
+            big: make(30.0, 600),
+        }
     }
 
-    fn delete(&self) {
+    pub(crate) fn delete(&self) {
         unsafe {
-            for f in [self.title, self.name, self.body, self.small, self.code] {
+            for f in [self.title, self.name, self.body, self.small, self.code, self.big] {
                 let _ = DeleteObject(f);
             }
         }
     }
 }
 
-struct Palette {
-    bg: [f32; 3],
-    card: [f32; 3],
-    field: [f32; 3],
-    text: [f32; 3],
-    secondary: [f32; 3],
-    separator: [f32; 3],
-    accent: [f32; 3],
-    switch_off: [f32; 3],
-    danger: [f32; 3],
+pub(crate) struct Palette {
+    pub bg: [f32; 3],
+    pub card: [f32; 3],
+    pub field: [f32; 3],
+    pub text: [f32; 3],
+    pub secondary: [f32; 3],
+    pub separator: [f32; 3],
+    pub accent: [f32; 3],
+    pub switch_off: [f32; 3],
+    pub danger: [f32; 3],
 }
 
-fn palette(light: bool) -> Palette {
+pub(crate) fn palette(light: bool) -> Palette {
     if light {
         Palette {
             bg: hex(0xF2F2F7),
@@ -137,7 +139,7 @@ fn palette(light: bool) -> Palette {
     }
 }
 
-fn colorref(c: [f32; 3]) -> COLORREF {
+pub(crate) fn colorref(c: [f32; 3]) -> COLORREF {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     util::rgb(b(c[0]), b(c[1]), b(c[2]))
 }
@@ -199,34 +201,9 @@ pub fn create() -> Option<HWND> {
         let corner = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
 
-        let edit = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("EDIT"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE((ES_CENTER | ES_NUMBER | ES_AUTOHSCROLL) as u32),
-            0,
-            0,
-            10,
-            10,
-            hwnd,
-            HMENU(EDIT_ID as _),
-            instance,
-            None,
-        )
-        .unwrap_or_default();
-        SendMessageW(edit, 0x00C5 /* EM_LIMITTEXT */, WPARAM(12), LPARAM(0));
-        let prev = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
-        EDIT_PREV.with(|p| p.set(prev));
-        if let Some(code) = util::read_text_setting(CODE_SETTING) {
-            let text = util::wide(&code);
-            let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
-        }
-
         let scale = util::scale(hwnd);
         let hub = Hub {
             hwnd,
-            edit,
-            mac: Mac::new(hwnd),
             scale,
             light: util::light_apps(),
             hover: None,
@@ -234,21 +211,14 @@ pub fn create() -> Option<HWND> {
             dragging: false,
             tracking: false,
             fonts: Fonts::new(scale),
-            edit_brush: HBRUSH::default(),
             painted: Default::default(),
         };
         STATE.with(|c| *c.borrow_mut() = Some(hub));
         with(|h| h.apply_theme());
         taskbar::set_hub(hwnd);
-        taskbar::set_target(Device::Mac, hwnd);
         SetTimer(hwnd, TIMER_STATUS, 500, None);
         Some(hwnd)
     }
-}
-
-/// Uygulama kapanırken: gizli Mac oturum penceresi erişilebilir bırakılır.
-pub fn shutdown() {
-    with(|h| h.mac.release());
 }
 
 /// Pencereyi imlecin bulunduğu monitörün ortasında açar.
@@ -287,7 +257,7 @@ struct Layout {
     iphone_switch: [f32; 4],
     slider: [f32; 4],
     mac: [f32; 4],
-    field: [f32; 4],
+    mac_switch: [f32; 4],
     mac_button: [f32; 4],
     general: [f32; 4],
     autostart_switch: [f32; 4],
@@ -307,44 +277,21 @@ fn layout(s: f32) -> Layout {
         iphone_switch: sw(iy + 18.0 * s),
         slider: [x0 + 16.0 * s, iy + 106.0 * s, x1 - 16.0 * s, iy + 126.0 * s],
         mac: [x0, my, x1, my + MAC_H * s],
-        field: [x0 + 16.0 * s, my + 80.0 * s, x1 - 132.0 * s, my + 118.0 * s],
-        mac_button: [x1 - 120.0 * s, my + 80.0 * s, x1 - 16.0 * s, my + 118.0 * s],
+        mac_switch: sw(my + 18.0 * s),
+        mac_button: [x0 + 16.0 * s, my + 78.0 * s, x1 - 16.0 * s, my + 112.0 * s],
         general: [x0, gy, x1, gy + GENERAL_H * s],
         autostart_switch: sw(gy + 13.0 * s),
         zoom_switch: sw(gy + 67.0 * s),
     }
 }
 
-fn hit(b: &[f32; 4], x: i32, y: i32) -> bool {
+pub(crate) fn hit(b: &[f32; 4], x: i32, y: i32) -> bool {
     let (x, y) = (x as f32, y as f32);
     x >= b[0] && x < b[2] && y >= b[1] && y < b[3]
 }
 
-fn to_rect(b: &[f32; 4]) -> RECT {
+pub(crate) fn to_rect(b: &[f32; 4]) -> RECT {
     RECT { left: b[0].round() as i32, top: b[1].round() as i32, right: b[2].round() as i32, bottom: b[3].round() as i32 }
-}
-
-thread_local! {
-    static EDIT_PREV: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-    /// Kod alanının zemin fırçası; durum ödünç alınmışken de (yeniden giriş) verilebilsin.
-    static EDIT_BRUSH: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
-}
-
-/// Kod alanı: Enter bağlanır, Esc pencereyi kapatır.
-unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if msg == WM_CHAR && (wp.0 == 0x0D || wp.0 == 0x1B) {
-        return LRESULT(0);
-    }
-    if msg == WM_KEYDOWN && wp.0 == 0x0D {
-        let _ = PostMessageW(GetParent(hwnd).unwrap_or_default(), WM_APP_GO, WPARAM(0), LPARAM(0));
-        return LRESULT(0);
-    }
-    if msg == WM_KEYDOWN && wp.0 == 0x1B {
-        let _ = ShowWindow(GetParent(hwnd).unwrap_or_default(), SW_HIDE);
-        return LRESULT(0);
-    }
-    let prev: WNDPROC = std::mem::transmute(EDIT_PREV.with(|p| p.get()));
-    CallWindowProcW(prev, hwnd, msg, wp, lp)
 }
 
 enum Action {
@@ -352,6 +299,7 @@ enum Action {
     Hide,
     ToggleIPhone,
     Size(u32),
+    ToggleMac,
     MacButton,
     Autostart,
     Zoom,
@@ -383,22 +331,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_TIMER => {
-            with(|h| {
-                h.mac.poll();
-                h.refresh_if_changed();
-            });
+            with(|h| h.refresh_if_changed());
             return LRESULT(0);
-        }
-        WM_CTLCOLOREDIT => {
-            let brush = with(|h| {
-                let p = palette(h.light);
-                let dc = HDC(wp.0 as _);
-                SetTextColor(dc, colorref(p.text));
-                SetBkColor(dc, colorref(p.field));
-                h.edit_brush
-            });
-            let fallback = EDIT_BRUSH.with(|b| b.get());
-            return LRESULT(brush.map_or(fallback, |b| b.0 as isize));
         }
         WM_MOUSEMOVE => with(|h| h.mouse_move(point(lp))).unwrap_or(Action::None),
         WM_MOUSELEAVE => with(|h| {
@@ -417,17 +351,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             Action::Paint
         }
         WM_KEYDOWN if wp.0 == 0x1B => Action::Hide,
-        WM_ACTIVATE => {
-            // Pencere öne gelince kod alanı odağı alır (yazmaya hazır).
-            if wp.0 & 0xFFFF != 0 {
-                if let Some(edit) = with(|h| h.edit) {
-                    if GetFocus() != edit {
-                        let _ = SetFocus(edit);
-                    }
-                }
-            }
-            Action::None
-        }
         WM_DPICHANGED => {
             let suggested = &*(lp.0 as *const RECT);
             with(|h| {
@@ -457,27 +380,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             show(hwnd);
             Action::None
         }
-        WM_APP_GO => Action::MacButton,
-        // Mac ikonu: tıklama, başka monitördeki ikona tıklama, menüden "bağlantıyı kes".
-        WM_APP_TOGGLE => {
-            with(|h| h.mac.toggle());
-            Action::None
-        }
-        WM_APP_SHOW => {
-            with(|h| h.mac.show());
-            Action::None
-        }
-        WM_APP_DISCONNECT => {
-            with(|h| h.mac.cancel());
-            Action::Paint
-        }
-        mac::WM_APP_MAC => {
-            with(|h| {
-                h.mac.poll();
-                h.refresh_if_changed();
-            });
-            Action::None
-        }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     };
     // Durum ödünç alınmadan: ayar değiştirmek başka pencerelere mesaj gönderebilir.
@@ -494,8 +396,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             mirror::set_size_percent(pct);
             invalidate(hwnd);
         }
+        Action::ToggleMac => {
+            macview::set_enabled(!macview::enabled());
+            invalidate(hwnd);
+        }
         Action::MacButton => {
-            with(|h| h.mac_button());
+            if macview::connected() {
+                macview::disconnect();
+            } else {
+                macview::open();
+            }
             invalidate(hwnd);
         }
         Action::Autostart => {
@@ -512,11 +422,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     LRESULT(0)
 }
 
-fn point(lp: LPARAM) -> (i32, i32) {
+pub(crate) fn point(lp: LPARAM) -> (i32, i32) {
     ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32)
 }
 
-fn invalidate(hwnd: HWND) {
+pub(crate) fn invalidate(hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(hwnd, None, false);
     }
@@ -528,33 +438,6 @@ impl Hub {
         let dark = BOOL::from(!self.light);
         unsafe {
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
-            if !self.edit_brush.is_invalid() && !self.edit_brush.0.is_null() {
-                let _ = DeleteObject(self.edit_brush);
-            }
-            self.edit_brush = CreateSolidBrush(colorref(palette(self.light).field));
-            EDIT_BRUSH.with(|b| b.set(self.edit_brush.0 as isize));
-            SendMessageW(self.edit, WM_SETFONT, WPARAM(self.fonts.code.0 as usize), LPARAM(1));
-        }
-        self.place_edit();
-    }
-
-    fn place_edit(&self) {
-        let l = layout(self.scale);
-        let f = to_rect(&l.field);
-        // Tek satırlık EDIT metni üste yaslar; alan yüksekliğinin ortasına denk gelecek kadar içeride.
-        let inset_x = (12.0 * self.scale) as i32;
-        let text_h = (24.0 * self.scale) as i32;
-        let top = f.top + (height(&f) - text_h) / 2;
-        unsafe {
-            let _ = SetWindowPos(
-                self.edit,
-                HWND::default(),
-                f.left + inset_x,
-                top,
-                width(&f) - 2 * inset_x,
-                text_h,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
         }
     }
 
@@ -564,6 +447,7 @@ impl Hub {
             (Ctl::Close, l.close),
             (Ctl::IPhoneSwitch, l.iphone_switch),
             (Ctl::Slider, [l.slider[0] - 8.0 * self.scale, l.slider[1] - 6.0 * self.scale, l.slider[2] + 8.0 * self.scale, l.slider[3] + 6.0 * self.scale]),
+            (Ctl::MacSwitch, l.mac_switch),
             (Ctl::MacButton, l.mac_button),
             (Ctl::AutostartSwitch, l.autostart_switch),
             (Ctl::ZoomSwitch, l.zoom_switch),
@@ -634,6 +518,7 @@ impl Hub {
         match pressed {
             Some(Ctl::Close) => Action::Hide,
             Some(Ctl::IPhoneSwitch) => Action::ToggleIPhone,
+            Some(Ctl::MacSwitch) => Action::ToggleMac,
             Some(Ctl::MacButton) => Action::MacButton,
             Some(Ctl::AutostartSwitch) => Action::Autostart,
             Some(Ctl::ZoomSwitch) => Action::Zoom,
@@ -641,29 +526,8 @@ impl Hub {
         }
     }
 
-    fn code(&self) -> String {
-        let mut buf = [0u16; 32];
-        let n = unsafe { GetWindowTextW(self.edit, &mut buf) } as usize;
-        String::from_utf16_lossy(&buf[..n]).chars().filter(|c| c.is_ascii_digit()).collect()
-    }
-
-    fn mac_button(&mut self) {
-        match self.mac.state() {
-            mac::State::Idle | mac::State::Failed(_) => {
-                let code = self.code();
-                if code.len() < 6 {
-                    self.mac.fail("Mac kodunu yazın (Mac'teki Ayna Ajan menüsünde görünür).");
-                    return;
-                }
-                let _ = util::write_text_setting(CODE_SETTING, &code);
-                self.mac.connect(&code);
-            }
-            _ => self.mac.cancel(),
-        }
-    }
-
     fn refresh_if_changed(&mut self) {
-        let now = (mirror::status(), self.mac.state().text(), mirror::enabled());
+        let now = (mirror::status(), macview::status(), mirror::enabled(), macview::enabled());
         if now != self.painted {
             invalidate(self.hwnd);
         }
@@ -681,9 +545,11 @@ impl Hub {
             let p = palette(self.light);
             let l = layout(s);
             let iphone_status = mirror::status();
-            let mac_state = self.mac.state();
+            let mac_status = macview::status();
             let iphone_on = mirror::enabled();
-            self.painted = (iphone_status.clone(), mac_state.text(), iphone_on);
+            let mac_on = macview::enabled();
+            let mac_connected = macview::connected();
+            self.painted = (iphone_status.clone(), mac_status.clone(), iphone_on, mac_on);
 
             // Şekiller: yazılım rasterleyicisi (kenar yumuşatmalı).
             let mut c = Canvas::new(w as usize, h as usize);
@@ -704,22 +570,19 @@ impl Hub {
             separator(&mut c, ib[0] + 16.0 * s, ib[2], ib[1] + 64.0 * s, p.separator, s);
             switch(&mut c, l.iphone_switch, iphone_on, p.accent, p.switch_off, s);
             let pct = mirror::size_percent();
-            slider(&mut c, l.slider, pct, iphone_on, &p, s, self.dragging || self.hover == Some(Ctl::Slider));
+            let t = (pct - mirror::SIZE_MIN) as f32 / (mirror::SIZE_MAX - mirror::SIZE_MIN) as f32;
+            slider(&mut c, l.slider, t, iphone_on, &p, s, self.dragging || self.hover == Some(Ctl::Slider));
 
             // Mac kartı.
             let mb = l.mac;
             badge(&mut c, mb[0] + 16.0 * s, mb[1] + 16.0 * s, s, hex(0x8E8E93), Device::Mac);
             separator(&mut c, mb[0] + 16.0 * s, mb[2], mb[1] + 64.0 * s, p.separator, s);
-            card_bg(&mut c, l.field, p.field, 10.0 * s);
-            let (label, color) = match mac_state {
-                mac::State::Idle | mac::State::Failed(_) => ("Bağlan", p.accent),
-                mac::State::Connected(_) => ("Bağlantıyı kes", p.danger),
-                _ => ("Vazgeç", hex(0x8E8E93)),
-            };
+            switch(&mut c, l.mac_switch, mac_on, p.accent, p.switch_off, s);
+            let (label, color) = if mac_connected { ("Bağlantıyı kes", p.danger) } else { ("Mac ekranını aç", p.accent) };
             let pressed = self.pressed == Some(Ctl::MacButton);
             let hover = self.hover == Some(Ctl::MacButton);
             let alpha = if pressed { 0.75 } else if hover { 0.9 } else { 1.0 };
-            card_bg_alpha(&mut c, l.mac_button, color, 10.0 * s, alpha);
+            card_bg_alpha(&mut c, l.mac_button, if mac_on { color } else { p.switch_off }, 10.0 * s, alpha);
 
             // Genel kart.
             let gb = l.general;
@@ -727,27 +590,7 @@ impl Hub {
             switch(&mut c, l.autostart_switch, util::autostart_enabled(), p.accent, p.switch_off, s);
             switch(&mut c, l.zoom_switch, util::read_setting(ZOOM_SETTING) != Some(0), p.accent, p.switch_off, s);
 
-            let pixels = c.to_premultiplied_bgra();
-            let screen = GetDC(self.hwnd);
-            let mem = CreateCompatibleDC(screen);
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-            if let Ok(bmp) = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
-                std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
-                let old = SelectObject(mem, bmp);
-                SetBkMode(mem, TRANSPARENT);
-
+            blit(self.hwnd, w, h, &c, |mem| {
                 // Metinler.
                 let f = &self.fonts;
                 text(mem, f.title, p.text, "Ayna Merkezi", [20.0 * s, 16.0 * s, 300.0 * s, 42.0 * s], DT_LEFT);
@@ -759,34 +602,58 @@ impl Hub {
                 text(mem, f.body, size_color, "Ekran boyutu", [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_LEFT);
                 text(mem, f.body, p.secondary, &format!("%{pct}"), [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_RIGHT);
 
-                text(mem, f.name, p.text, "Mac", [tx, mb[1] + 13.0 * s, mb[2] - 16.0 * s, mb[1] + 34.0 * s], DT_LEFT);
-                let mac_color = if matches!(mac_state, mac::State::Failed(_)) { p.danger } else { p.secondary };
-                text(mem, f.small, mac_color, &mac_state.text(), [tx, mb[1] + 34.0 * s, mb[2] - 16.0 * s, mb[1] + 54.0 * s], DT_LEFT | DT_END_ELLIPSIS);
+                text(mem, f.name, p.text, "Mac", [tx, mb[1] + 13.0 * s, mb[2] - 80.0 * s, mb[1] + 34.0 * s], DT_LEFT);
+                text(mem, f.small, p.secondary, &mac_status, [tx, mb[1] + 34.0 * s, mb[2] - 80.0 * s, mb[1] + 54.0 * s], DT_LEFT | DT_END_ELLIPSIS);
                 text(mem, f.body, [1.0, 1.0, 1.0], label, l.mac_button, DT_CENTER);
                 text(
                     mem,
                     f.small,
                     p.secondary,
-                    "Kodu, Mac'teki Ayna Ajan menüsünde görürsünüz.",
-                    [mb[0] + 16.0 * s, mb[1] + 126.0 * s, mb[2] - 16.0 * s, mb[1] + 146.0 * s],
+                    "Kod, Mac'teki Ayna Ajan menüsünde; Mac ekranında yazılır.",
+                    [mb[0] + 16.0 * s, mb[1] + 118.0 * s, mb[2] - 16.0 * s, mb[1] + 140.0 * s],
                     DT_LEFT,
                 );
 
                 text(mem, f.body, p.text, "Windows ile başlat", [gb[0] + 16.0 * s, gb[1] + 14.0 * s, gb[2] - 80.0 * s, gb[1] + 40.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, "Bağlanınca Büyütme'yi yenile", [gb[0] + 16.0 * s, gb[1] + 68.0 * s, gb[2] - 80.0 * s, gb[1] + 94.0 * s], DT_LEFT);
-
-                let _ = BitBlt(screen, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-                SelectObject(mem, old);
-                let _ = DeleteObject(bmp);
-            }
-            let _ = DeleteDC(mem);
-            ReleaseDC(self.hwnd, screen);
-            let _ = ValidateRect(self.hwnd, None);
+            });
         }
     }
 }
 
-unsafe fn text(dc: HDC, font: HFONT, color: [f32; 3], s: &str, b: [f32; 4], align: DRAW_TEXT_FORMAT) {
+/// Tuvali pencereye basar; `texts` GDI ile üstüne metin yazar (ClearType).
+pub(crate) unsafe fn blit(hwnd: HWND, w: i32, h: i32, c: &Canvas, texts: impl FnOnce(HDC)) {
+    let pixels = c.to_premultiplied_bgra();
+    let screen = GetDC(hwnd);
+    let mem = CreateCompatibleDC(screen);
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    if let Ok(bmp) = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
+        let old = SelectObject(mem, bmp);
+        SetBkMode(mem, TRANSPARENT);
+        texts(mem);
+        let _ = BitBlt(screen, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+    }
+    let _ = DeleteDC(mem);
+    ReleaseDC(hwnd, screen);
+    let _ = ValidateRect(hwnd, None);
+}
+
+pub(crate) unsafe fn text(dc: HDC, font: HFONT, color: [f32; 3], s: &str, b: [f32; 4], align: DRAW_TEXT_FORMAT) {
     let old = SelectObject(dc, font);
     SetTextColor(dc, colorref(color));
     let mut r = to_rect(&b);
@@ -795,22 +662,22 @@ unsafe fn text(dc: HDC, font: HFONT, color: [f32; 3], s: &str, b: [f32; 4], alig
     SelectObject(dc, old);
 }
 
-fn card_bg(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], r: f32) {
+pub(crate) fn card_bg(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], r: f32) {
     card_bg_alpha(c, b, rgb, r, 1.0);
 }
 
-fn card_bg_alpha(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], r: f32, alpha: f32) {
+pub(crate) fn card_bg_alpha(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], r: f32, alpha: f32) {
     let (cx, cy, hw, hh) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0, (b[2] - b[0]) / 2.0, (b[3] - b[1]) / 2.0);
     c.draw_in(b, rgb, alpha, |x, y| fill(round_rect_sdf(x, y, cx, cy, hw, hh, r)));
 }
 
-fn separator(c: &mut Canvas, x0: f32, x1: f32, y: f32, rgb: [f32; 3], s: f32) {
+pub(crate) fn separator(c: &mut Canvas, x0: f32, x1: f32, y: f32, rgb: [f32; 3], s: f32) {
     let t = s.max(1.0);
     c.draw_in([x0, y - t, x1, y + t], rgb, 1.0, |_, py| if (py - y).abs() <= t / 2.0 { 1.0 } else { 0.0 });
 }
 
 /// Renkli yuvarlak kare içinde beyaz cihaz simgesi (Ayarlar uygulamasındaki gibi).
-fn badge(c: &mut Canvas, x: f32, y: f32, s: f32, rgb: [f32; 3], device: Device) {
+pub(crate) fn badge(c: &mut Canvas, x: f32, y: f32, s: f32, rgb: [f32; 3], device: Device) {
     let size = 34.0 * s;
     let (cx, cy) = (x + size / 2.0, y + size / 2.0);
     c.draw_in([x, y, x + size, y + size], rgb, 1.0, |px, py| {
@@ -823,7 +690,7 @@ fn badge(c: &mut Canvas, x: f32, y: f32, s: f32, rgb: [f32; 3], device: Device) 
 }
 
 /// iOS tarzı anahtar.
-fn switch(c: &mut Canvas, b: [f32; 4], on: bool, accent: [f32; 3], off: [f32; 3], s: f32) {
+pub(crate) fn switch(c: &mut Canvas, b: [f32; 4], on: bool, accent: [f32; 3], off: [f32; 3], s: f32) {
     let (cx, cy, hw, hh) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0, (b[2] - b[0]) / 2.0, (b[3] - b[1]) / 2.0);
     let track = if on { accent } else { off };
     c.draw_in(b, track, 1.0, |x, y| fill(round_rect_sdf(x, y, cx, cy, hw, hh, hh)));
@@ -832,9 +699,9 @@ fn switch(c: &mut Canvas, b: [f32; 4], on: bool, accent: [f32; 3], off: [f32; 3]
     c.draw_in(b, [1.0, 1.0, 1.0], 1.0, |x, y| fill(((x - kx).powi(2) + (y - cy).powi(2)).sqrt() - r));
 }
 
-fn slider(c: &mut Canvas, b: [f32; 4], pct: u32, enabled: bool, p: &Palette, s: f32, active: bool) {
+/// Kaydırıcı; `t` 0..1 konum.
+pub(crate) fn slider(c: &mut Canvas, b: [f32; 4], t: f32, enabled: bool, p: &Palette, s: f32, active: bool) {
     let cy = (b[1] + b[3]) / 2.0;
-    let t = (pct as f32 - mirror::SIZE_MIN as f32) / (mirror::SIZE_MAX - mirror::SIZE_MIN) as f32;
     let kx = b[0] + t.clamp(0.0, 1.0) * (b[2] - b[0]);
     let th = 2.0 * s;
     let tb = [b[0] - th, cy - th, b[2] + th, cy + th];
@@ -849,7 +716,7 @@ fn slider(c: &mut Canvas, b: [f32; 4], pct: u32, enabled: bool, p: &Palette, s: 
     c.draw_in(kb, [1.0, 1.0, 1.0], 1.0, |x, y| fill(((x - kx).powi(2) + (y - cy).powi(2)).sqrt() - r + 0.5));
 }
 
-fn close_glyph(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], s: f32) {
+pub(crate) fn close_glyph(c: &mut Canvas, b: [f32; 4], rgb: [f32; 3], s: f32) {
     let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
     let (len, t) = (5.0 * s, 0.8 * s);
     c.draw_in(b, rgb, 1.0, |x, y| {

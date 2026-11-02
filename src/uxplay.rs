@@ -489,25 +489,6 @@ fn child_process(parent: u32, name: &str) -> Option<u32> {
     }
 }
 
-/// Adı verilen tüm süreçlerin kimlikleri.
-pub fn processes_named(name: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
-        let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        let mut ok = Process32FirstW(snap, &mut entry).is_ok();
-        while ok {
-            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
-            if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case(name) {
-                out.push(entry.th32ProcessID);
-            }
-            ok = Process32NextW(snap, &mut entry).is_ok();
-        }
-        let _ = CloseHandle(snap);
-    }
-    out
-}
-
 struct Search {
     pid: u32,
     hwnd: Option<HWND>,
@@ -540,7 +521,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     true.into()
 }
 
-fn short_path(path: &Path) -> PathBuf {
+pub(crate) fn short_path(path: &Path) -> PathBuf {
     let long = util::wide(&path.to_string_lossy());
     let mut buf = vec![0u16; 1024];
     let n = unsafe { GetShortPathNameW(PCWSTR(long.as_ptr()), Some(&mut buf)) } as usize;

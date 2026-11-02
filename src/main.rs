@@ -3,9 +3,12 @@
 mod ble;
 mod buttons;
 mod corners;
+mod crypto;
+mod gst;
 mod hid;
 mod hub;
 mod mac;
+mod macview;
 mod mirror;
 mod taskbar;
 mod toast;
@@ -49,6 +52,7 @@ fn main() {
         let engine = uxplay::Engine::new();
         let Some(hwnd) = mirror::create(ble, engine) else { return };
         let Some(hub) = hub::create() else { return };
+        macview::create();
         taskbar::ensure(hwnd);
 
         // Uygulamayı açmak ana pencereyi açar; iPhone ekranı görev çubuğundaki ikondan.
@@ -61,6 +65,5 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        hub::shutdown();
     }
 }

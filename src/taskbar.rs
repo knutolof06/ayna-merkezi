@@ -358,7 +358,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_RBUTTONUP => {
-            show_menu(hwnd);
+            // Mac ikonunda sağ tık boyut penceresini açar (menü onun "Ayna Merkezi" bağlantısında).
+            match with(hwnd, |i| (i.device, i.tray)) {
+                Some((Device::Mac, tray)) => {
+                    set_anchor(Device::Mac, tray);
+                    let _ = PostMessageW(target(Device::Mac), crate::macview::WM_APP_SIZER, WPARAM(0), LPARAM(0));
+                }
+                _ => show_menu(hwnd),
+            }
             LRESULT(0)
         }
         WM_DROPFILES => {
