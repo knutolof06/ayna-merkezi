@@ -14,6 +14,7 @@ mod taskbar;
 mod toast;
 mod transfer;
 mod util;
+mod update;
 mod uxplay;
 
 use windows::core::{w, PCWSTR};
@@ -29,6 +30,8 @@ pub const BACKGROUND_FLAG: &str = "--arka-plan";
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Güncellemeden sonra: eski sürüm kapanana dek beklenir (tek kopya kilidi ondan alınır).
+        update::on_startup();
 
         // Tek kopya: ikinci açılış mevcut pencereyi öne getirir.
         let _mutex = CreateMutexW(None, true, w!("Local\\iPhoneAyna.TekKopya"));
@@ -54,6 +57,10 @@ fn main() {
         let Some(hub) = hub::create() else { return };
         macview::create();
         taskbar::ensure(hwnd);
+        update::start(hub);
+        if update::just_updated() {
+            toast::show(hwnd, &format!("Ayna Merkezi güncellendi (sürüm {}).", update::build()));
+        }
 
         // Uygulamayı açmak ana pencereyi açar; iPhone ekranı görev çubuğundaki ikondan.
         if !std::env::args().any(|a| a == BACKGROUND_FLAG) {

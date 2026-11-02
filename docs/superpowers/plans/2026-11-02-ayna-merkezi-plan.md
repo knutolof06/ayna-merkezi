@@ -63,7 +63,7 @@ Windows (Ayna Merkezi)                               Mac mini (Ayna Ajan)
 - **Bağlantı:** RustDesk istemcisi Mac'e doğrudan IP ile bağlanır (Mac'te "Doğrudan IP erişimi" açık).
   Görüntü, kontrol ve şifreleme RustDesk'ten gelir.
 - **Güven ve parola (AnyDesk akışı):**
-  1. İlk bağlantı: Mac'te "BURHAN-PC bağlanmak istiyor — İzin ver / Her zaman güven" penceresi
+  1. İlk bağlantı: Mac'te "MASAUSTU-PC bağlanmak istiyor — İzin ver / Her zaman güven" penceresi
      çıkar; Windows'ta Mac'in anahtar parmak izi gösterilir.
   2. "Her zaman güven" sonrası Windows cihaz anahtarı Mac'in güvenilenler listesine yazılır.
   3. Sonraki bağlantılar: katılımsız erişim parolası (Mac ajanında belirlenir).

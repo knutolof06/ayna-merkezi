@@ -918,10 +918,10 @@ mod tests {
     #[test]
     fn parses_agent_reply() {
         let ip = Ipv4Addr::new(192, 168, 1, 20);
-        let here = parse_here("AYNA1 HERE 123456789 21130 - Burhan's Mac mini\n", "123456789", ip).unwrap();
+        let here = parse_here("AYNA1 HERE 123456789 21130 - Ev Mac mini\n", "123456789", ip).unwrap();
         assert_eq!(here.peer.port, 21130);
         assert_eq!(here.proof, "-");
-        assert_eq!(here.peer.name, "Burhan's Mac mini");
+        assert_eq!(here.peer.name, "Ev Mac mini");
         assert!(parse_here("AYNA1 HERE 999 21130 - x", "123456789", ip).is_none());
         assert_eq!(clean_name("a\u{202E}b\u{200B}c"), "abc");
     }

@@ -872,6 +872,107 @@ final class Session {
     }
 }
 
+// MARK: - Otomatik güncelleme
+
+/// GitHub'daki son sürümü denetler; yeni sürümü indirir, SHA-256 özetini ve imzasını (bu projenin
+/// sabit imza anahtarı) doğrular, uygulamayı değiştirip yeniden başlatır. Sürüm numarası GitHub
+/// Actions çalıştırma numarasıdır (CFBundleVersion); 0 olan yerel derlemelerde kapalıdır.
+enum Updater {
+    static let latest = URL(string: "https://api.github.com/repos/knutolof06/ayna-merkezi/releases/latest")!
+    static let downloadPrefix = "https://github.com/knutolof06/ayna-merkezi/releases/download/"
+    static let asset = "AynaAjan.zip"
+    /// Yalnız bu kimlik ve bu sertifikayla imzalanmış uygulama kabul edilir.
+    static let requirement =
+        "identifier \"tr.ayna.ajan\" and certificate leaf = H\"c7251ef44643fc0dcf58efe33fd4d5e02a215fa0\""
+
+    static var build: Int { Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 0 }
+
+    private struct Release: Decodable {
+        let tag_name: String
+        let body: String?
+        let assets: [Asset]
+    }
+
+    private struct Asset: Decodable {
+        let name: String
+        let browser_download_url: String
+    }
+
+    /// Yeni sürüm hazırlanırsa (indirilip doğrulandıysa) ana kuyrukta sürüm ve açılmış uygulama yolu.
+    static func check(completion: @escaping (Int, URL) -> Void, failed: @escaping (String) -> Void) {
+        guard build > 0 else { return }
+        var req = URLRequest(url: latest)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            guard let data, error == nil, let release = try? JSONDecoder().decode(Release.self, from: data),
+                  let version = Int(release.tag_name.dropFirst()), version > build else { return }
+            guard let a = release.assets.first(where: { $0.name == asset }),
+                  a.browser_download_url.hasPrefix(downloadPrefix), let url = URL(string: a.browser_download_url),
+                  let expected = sha256(in: release.body ?? "", for: asset) else {
+                failed("Sürüm \(version) eksik yayınlanmış.")
+                return
+            }
+            URLSession.shared.dataTask(with: url) { zip, _, error in
+                guard let zip, error == nil, hex(SHA256.hash(data: zip)) == expected else {
+                    failed("İndirilen güncellemenin özeti tutmuyor.")
+                    return
+                }
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("AynaAjan-\(version)")
+                try? FileManager.default.removeItem(at: dir)
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let zipURL = dir.appendingPathComponent(asset)
+                let app = dir.appendingPathComponent("Ayna Ajan.app")
+                guard (try? zip.write(to: zipURL)) != nil,
+                      run("/usr/bin/ditto", ["-x", "-k", zipURL.path, dir.path]),
+                      run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R=\(requirement)", app.path]) else {
+                    failed("Güncelleme doğrulanamadı (imza).")
+                    return
+                }
+                DispatchQueue.main.async { completion(version, app) }
+            }.resume()
+        }.resume()
+    }
+
+    /// Yeni uygulamayı eskisinin yerine koyar ve yeniden başlatır.
+    static func install(_ app: URL) -> Bool {
+        let current = Bundle.main.bundleURL
+        do {
+            _ = try FileManager.default.replaceItemAt(current, withItemAt: app)
+        } catch {
+            return false
+        }
+        let path = current.path.replacingOccurrences(of: "'", with: "'\\''")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 1; /usr/bin/open '\(path)'"]
+        try? p.run()
+        return true
+    }
+
+    private static func sha256(in body: String, for name: String) -> String? {
+        for line in body.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+            if parts.count >= 2, parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "*")) == name,
+               isHex(String(parts[0]), length: 64) {
+                return parts[0].lowercased()
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private static func run(_ tool: String, _ args: [String]) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+}
+
 // MARK: - Uygulama
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -886,6 +987,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var deniedUntil: [String: Date] = [:]
     private var recentPrompts: [Date] = []
     private var handshakes: [(Date, String)] = []
+    /// İndirilmiş, uygulanmayı bekleyen güncelleme (oturum yokken uygulanır).
+    private var pendingUpdate: (Int, URL)?
+    private var updateNote: String?
     /// Bilgisayar adı bir kez okunur (her bulma isteğinde ağ adı çözümlemesi yapılmasın).
     private lazy var macName = cleanName(Host.current().localizedName ?? "Mac")
 
@@ -897,6 +1001,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
         startNetwork()
         requestPermissions()
+        // Güncelleme: açılıştan 1 dk sonra, sonra 6 saatte bir; indirilen sürüm oturum yokken kurulur.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in self?.checkForUpdate() }
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in self?.checkForUpdate() }
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.installIfIdle() }
+    }
+
+    private func checkForUpdate() {
+        guard pendingUpdate == nil else { return }
+        Updater.check(completion: { [weak self] version, app in
+            self?.pendingUpdate = (version, app)
+            self?.updateNote = "Sürüm \(version) hazır; bağlantı yokken kurulacak."
+            self?.installIfIdle()
+        }, failed: { [weak self] message in
+            DispatchQueue.main.async { self?.updateNote = message }
+        })
+    }
+
+    private func installIfIdle() {
+        guard let update = pendingUpdate, active == nil, pending.isEmpty else { return }
+        let (version, app) = update
+        pendingUpdate = nil
+        if Updater.install(app) {
+            NSApp.terminate(nil)
+        } else {
+            updateNote = "Sürüm \(version) kurulamadı (Uygulamalar klasörüne yazılamadı)."
+        }
+    }
+
+    @objc private func checkNow() {
+        updateNote = "Güncelleme denetleniyor…"
+        checkForUpdate()
     }
 
     private func updateIcon() {
@@ -1090,6 +1225,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(item(screenAllowed ? "Ekran Kaydı izni: verildi" : "Ekran Kaydı izni ver…", #selector(openScreenPrivacy)))
         menu.addItem(item(inputAllowed ? "Erişilebilirlik izni: verildi" : "Erişilebilirlik izni ver…", #selector(openInputPrivacy)))
+        let version = Updater.build > 0 ? "Sürüm \(Updater.build)" : "Geliştirme sürümü"
+        menu.addItem(item(updateNote.map { "\(version) · \($0)" } ?? version, nil))
+        menu.addItem(item("Güncellemeleri denetle", #selector(checkNow)))
         let login = item("Oturum açınca başlat", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)

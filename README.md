@@ -28,7 +28,7 @@ iPhone için ek donanım ya da uygulama gerekmez; Mac'te yalnız bu projenin kü
 1. `iPhoneAyna.exe`'yi çalıştırın (yanında `bin\uxplay` klasörü olmalı).
 2. **Yansıtma:** iPhone ile PC aynı Wi-Fi'de olsun. iPhone'da Denetim Merkezi → Ekran Yansıtma → **Ayna**.
 3. **Kontrol (bir kez):**
-   - iPhone Ayarlar → Bluetooth → bilgisayarın adını (ör. `BURHAN`) eşleyin. Daha önce eşlediyseniz önce
+   - iPhone Ayarlar → Bluetooth → bilgisayarın adını (ör. `MASAUSTU-PC`) eşleyin. Daha önce eşlediyseniz önce
      **Bu Aygıtı Unut** deyip yeniden eşleyin (iPhone eski cihaz tanımını önbellekte tutar). Windows bir eşleşme
      onayı gösterirse kabul edin.
    - iPhone Ayarlar → Erişilebilirlik → **Büyütme: Açık**. iOS harici dokunmatik ekran girdisini yalnız Büyütme

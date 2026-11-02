@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::macview;
 use crate::mirror;
 use crate::taskbar::{self, draw_mac, draw_phone, fill, hex, round_rect_sdf, Canvas, Device, WM_APP_HUB};
+use crate::update;
 use crate::util::{self, height, width};
 
 pub const CLASS: PCWSTR = w!("iPhoneAyna.Merkez");
@@ -332,6 +333,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => return LRESULT(1),
         WM_TIMER => {
             with(|h| h.refresh_if_changed());
+            apply_update_when_idle();
+            return LRESULT(0);
+        }
+        update::WM_APP_UPDATE => {
+            UPDATE_PENDING.with(|p| p.set(true));
             return LRESULT(0);
         }
         WM_MOUSEMOVE => with(|h| h.mouse_move(point(lp))).unwrap_or(Action::None),
@@ -420,6 +426,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         Action::Paint => invalidate(hwnd),
     }
     LRESULT(0)
+}
+
+thread_local! {
+    /// Bir güncelleme indirildi; uygulama kullanılmıyorken uygulanacak.
+    static UPDATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// İndirilmiş güncelleme, hiçbir pencere açık değilken (iPhone, Mac, Ayna Merkezi) uygulanır;
+/// uygulama yeni sürümle yeniden başlar.
+fn apply_update_when_idle() {
+    if !UPDATE_PENDING.with(|p| p.get()) {
+        return;
+    }
+    unsafe {
+        let visible = |class: PCWSTR| {
+            FindWindowW(class, PCWSTR::null()).is_ok_and(|h| IsWindowVisible(h).as_bool())
+        };
+        if visible(mirror::CLASS) || visible(crate::macview::CLASS) || visible(CLASS) {
+            return;
+        }
+        UPDATE_PENDING.with(|p| p.set(false));
+        if update::apply() {
+            if let Ok(m) = FindWindowW(mirror::CLASS, PCWSTR::null()) {
+                let _ = DestroyWindow(m);
+            }
+        }
+    }
 }
 
 pub(crate) fn point(lp: LPARAM) -> (i32, i32) {
@@ -594,6 +627,11 @@ impl Hub {
                 // Metinler.
                 let f = &self.fonts;
                 text(mem, f.title, p.text, "Ayna Merkezi", [20.0 * s, 16.0 * s, 300.0 * s, 42.0 * s], DT_LEFT);
+                let version = match update::build() {
+                    0 => "geliştirme".to_string(),
+                    n => format!("sürüm {n}"),
+                };
+                text(mem, f.small, p.secondary, &version, [140.0 * s, 16.0 * s, (W - 52.0) * s, 42.0 * s], DT_RIGHT);
 
                 let tx = ib[0] + 62.0 * s;
                 text(mem, f.name, p.text, "iPhone", [tx, ib[1] + 13.0 * s, ib[2] - 80.0 * s, ib[1] + 34.0 * s], DT_LEFT);
