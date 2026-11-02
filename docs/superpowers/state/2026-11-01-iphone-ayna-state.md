@@ -45,8 +45,10 @@
 
 - 2026-11-02: Özel depo oluşturuldu: https://github.com/knutolof06/ayna-merkezi (boş). Push reddedildi: gh belirtecinde `workflow` kapsamı yok. Kullanıcı `gh auth refresh -h github.com -s workflow` çalıştırınca `git push -u origin main`, sonra Actions sonucu (Swift derlemesi ilk kez orada doğrulanacak).
 
+- 2026-11-03: workflow kapsamı verildi, main gönderildi. Actions: Windows derleme+test başarılı; macOS ilk denemede GitHub kapasite sorunuyla hiç başlamadı, yeniden çalıştırınca Swift uyarısız derlendi, AynaAjan.dmg (universal) artefakt olarak hazır.
+
 ## Sonraki Adım
-Push bekliyor (workflow kapsamı). Kullanıcı: (1) iPhone'da güç tuşunu birkaç kez dene (yöntem öğrenilir). (2) Mac mini'de RustDesk 1.5.1 + Actions'tan AynaAjan.dmg kur, kodla bağlan. Mac tarafı gerçek cihazda henüz test edilmedi.
+Kullanıcı: (1) iPhone'da güç tuşunu birkaç kez dene (yöntem öğrenilir). (2) Mac mini'de RustDesk 1.5.1 + Actions'tan AynaAjan.dmg kur, kodla bağlan. Mac tarafı gerçek cihazda henüz test edilmedi. Dmg: Actions > son çalıştırma > AynaAjan-mac.
 
 ## Açık Sorular / Bekleyen Onaylar
 - [x] Yerel doğrulama: derleme, birim testler, ikon konumu/aç-kapa, sağ tık menüsü, temiz çıkış, devre dışı çocuk pencere fare yönlendirmesi, BLE HID yayını başladı
