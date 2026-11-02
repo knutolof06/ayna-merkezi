@@ -1,0 +1,39 @@
+name: Derleme
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows (Ayna Merkezi)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust araç zinciri
+        run: rustup toolchain install stable --profile minimal
+      - name: Test
+        run: cargo test --release
+      - name: Derle
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AynaMerkezi-windows
+          path: target/release/iphone-ayna.exe
+
+  mac:
+    name: macOS (Ayna Ajan)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derle ve paketle
+        run: sh mac-agent/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AynaAjan-mac
+          path: mac-agent/build/AynaAjan.dmg

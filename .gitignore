@@ -1,0 +1,6 @@
+/target/
+/bin/
+*.exe
+*.log
+/_eski_aethercast/
+/mac-agent/build/

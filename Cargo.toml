@@ -1,0 +1,45 @@
+[package]
+name = "iphone-ayna"
+version = "0.1.0"
+edition = "2021"
+description = "iPhone ekranını Windows'a yansıtır, PC'nin Bluetooth'uyla fare/klavye olarak kontrol eder"
+
+[dependencies]
+windows = { version = "0.58", features = [
+  "Foundation",
+  "Foundation_Collections",
+  "Devices_Bluetooth",
+  "Devices_Bluetooth_GenericAttributeProfile",
+  "Storage_Streams",
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Dwm",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Accessibility",
+  "Win32_UI_Shell",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_System_Variant",
+  "Win32_Security",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_Storage_CloudFilters",
+  "Win32_System_DataExchange",
+  "Win32_System_Console",
+  "Win32_System_Pipes",
+  "Win32_System_IO",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Memory",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
