@@ -50,12 +50,44 @@ jobs:
           cp iPhoneAyna.exe AynaMerkezi/
           7z a -tzip -mx=7 AynaMerkezi-Windows.zip AynaMerkezi > /dev/null
           ls -la AynaMerkezi-Windows.zip
+      # Installer: per-user install (no admin) with a Programs and Features entry; see installer/AynaMerkezi.iss.
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE) { exit 1 } }
+          & $iscc /Qp "/DAppVer=$env:AYNA_BUILD" installer\AynaMerkezi.iss
+          if ($LASTEXITCODE) { exit 1 }
+          Get-Item AynaMerkezi-Setup.exe | Format-List Name, Length
+      # Install silently, check files and the uninstall entry, then uninstall and check that it is gone.
+      - name: Installer smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Ayna Merkezi'
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{15E0CF97-DA98-430C-BCFB-369CC239E8A0}_is1'
+          $p = Start-Process .\AynaMerkezi-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=setup.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content setup.log; throw "setup exit code $($p.ExitCode)" }
+          foreach ($f in 'iPhoneAyna.exe', 'bin\uxplay\uxplay-windows.exe', 'unins000.exe') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing $f" }
+          }
+          $u = Get-ItemProperty $key
+          "$($u.DisplayName) $($u.DisplayVersion) -> $($u.InstallLocation)"
+          if ($u.DisplayVersion -ne $env:AYNA_BUILD) { throw 'wrong DisplayVersion' }
+          if (-not (Test-Path (Join-Path ([Environment]::GetFolderPath('Programs')) 'Ayna Merkezi.lnk'))) { throw 'no Start menu shortcut' }
+          $p = Start-Process (Join-Path $dir 'unins000.exe') -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall exit code $($p.ExitCode)" }
+          for ($i = 0; $i -lt 60 -and ((Test-Path $dir) -or (Test-Path $key)); $i++) { Start-Sleep 1 }
+          if (Test-Path $dir) { Get-ChildItem -Recurse $dir; throw 'install folder left behind' }
+          if (Test-Path $key) { throw 'uninstall entry left behind' }
+          'install + uninstall OK'
       - uses: actions/upload-artifact@v4
         with:
           name: AynaMerkezi-windows
           path: |
             iPhoneAyna.exe
             AynaMerkezi-Windows.zip
+            AynaMerkezi-Setup.exe
 
   mac:
     name: macOS (Ayna Ajan)
@@ -99,7 +131,7 @@ jobs:
           openssl pkcs12 -in sign.p12 -nocerts -nodes -legacy -passin env:MAC_SIGN_PASSWORD -out key.pem
           openssl pkcs12 -in sign.p12 -nokeys -legacy -passin env:MAC_SIGN_PASSWORD | openssl x509 -pubkey -noout > pub.pem
           rm -f sign.p12
-          { echo "AYNA-SURUM ${AYNA_BUILD}"; sha256sum iPhoneAyna.exe AynaMerkezi-Windows.zip AynaAjan.zip AynaAjan.dmg; } > manifest.txt
+          { echo "AYNA-SURUM ${AYNA_BUILD}"; sha256sum iPhoneAyna.exe AynaMerkezi-Setup.exe AynaMerkezi-Windows.zip AynaAjan.zip AynaAjan.dmg; } > manifest.txt
           openssl dgst -sha256 -sign key.pem -out manifest.bin manifest.txt
           rm -f key.pem
           openssl dgst -sha256 -verify pub.pem -signature manifest.bin manifest.txt
@@ -114,13 +146,13 @@ jobs:
           {
             echo "Ayna Merkezi (Windows) and Ayna Ajan (Mac), version ${AYNA_BUILD}."
             echo
-            echo "- Windows: download **AynaMerkezi-Windows.zip**, extract it and run iPhoneAyna.exe from the extracted folder (it contains bin/uxplay). iPhoneAyna.exe alone is the update file."
+            echo "- Windows: download and run **AynaMerkezi-Setup.exe** (no admin rights needed; uninstall from Control Panel > Programs and Features). Portable alternative: extract AynaMerkezi-Windows.zip and run iPhoneAyna.exe from it. iPhoneAyna.exe alone is the update file."
             echo "- Mac: AynaAjan.dmg"
             echo
             echo "Installed apps update themselves. Signed manifest (SHA-256):"
             echo
             sed 's/^/    /' manifest.txt
           } > notes.md
-          gh release create "v${AYNA_BUILD}" AynaMerkezi-Windows.zip iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
+          gh release create "v${AYNA_BUILD}" AynaMerkezi-Setup.exe AynaMerkezi-Windows.zip iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Version ${AYNA_BUILD}" --notes-file notes.md

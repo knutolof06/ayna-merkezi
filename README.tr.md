@@ -29,9 +29,13 @@ iPhone için ek donanım ya da uygulama gerekmez; Mac'te yalnız bu projenin kü
 
 ## Kullanım
 
-1. [Son sürümden](../../releases/latest) **`AynaMerkezi-Windows.zip`**'i indirip açın ve `iPhoneAyna.exe`'yi açılan
-   klasörden çalıştırın. Yanında `bin\uxplay` klasörü olmalı (AirPlay alıcısı ve Mac ekranının görüntü çözücüsü);
-   sürümdeki tek başına `iPhoneAyna.exe` güncelleme dosyasıdır.
+1. [Son sürümden](../../releases/latest) **`AynaMerkezi-Setup.exe`**'yi indirip çalıştırın. Geçerli kullanıcı için
+   (yönetici izni gerekmez) `%LOCALAPPDATA%\Programs\Ayna Merkezi` klasörüne kurar, Başlat menüsüne ekler
+   (isteğe bağlı masaüstü simgesi ve *Windows ile başlat*) ve uygulamayı açar. Kaldırmak için: **Denetim Masası ›
+   Programlar ve Özellikler › Ayna Merkezi › Kaldır** (ya da Ayarlar › Uygulamalar); isterseniz ayarları da siler.
+   Kurulum programı kod imzalı olmadığı için Windows SmartScreen uyarısı verebilir (*Ek bilgi › Yine de çalıştır*).
+   Taşınabilir seçenek: `AynaMerkezi-Windows.zip`'i açıp içindeki `iPhoneAyna.exe`'yi çalıştırın (yanında
+   `bin\uxplay` klasörü olmalı); sürümdeki tek başına `iPhoneAyna.exe` güncelleme dosyasıdır.
 2. **Yansıtma:** iPhone ile PC aynı Wi-Fi'de olsun. iPhone'da Denetim Merkezi → Ekran Yansıtma → **Ayna**.
 3. **Kontrol (bir kez):**
    - iPhone Ayarlar → Bluetooth → bilgisayarın adını (ör. `MASAUSTU-PC`) eşleyin. Daha önce eşlediyseniz önce

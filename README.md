@@ -31,9 +31,13 @@ app; the Mac only runs this project's small menu-bar helper (**Ayna Ajan**) — 
 
 ### Setup (once)
 
-1. Download **`AynaMerkezi-Windows.zip`** from the [latest release](../../releases/latest), extract it and run
-   `iPhoneAyna.exe` from the extracted folder. It needs the `bin\uxplay` folder next to it (the AirPlay receiver
-   and the video decoder used for the Mac screen); `iPhoneAyna.exe` alone in the release is the update file.
+1. Download **`AynaMerkezi-Setup.exe`** from the [latest release](../../releases/latest) and run it. It installs
+   for the current user (no admin rights) into `%LOCALAPPDATA%\Programs\Ayna Merkezi`, adds a Start menu entry
+   (optionally a desktop icon and *Start with Windows*) and starts the app. To remove it: **Control Panel ›
+   Programs and Features › Ayna Merkezi › Uninstall** (or Settings › Apps); it can also remove the settings.
+   Windows may show a SmartScreen warning because the installer isn't code-signed (*More info › Run anyway*).
+   Portable alternative: extract `AynaMerkezi-Windows.zip` and run `iPhoneAyna.exe` from it (it needs the
+   `bin\uxplay` folder next to it); `iPhoneAyna.exe` alone in the release is the update file.
 2. **Mirroring:** same Wi-Fi; on the iPhone, Control Center → Screen Mirroring → **Ayna**.
 3. **Control:** iPhone Settings → Bluetooth → pair the PC. Settings → Accessibility → **Zoom: On** (iOS only
    accepts external touch input while Zoom is on; triple-finger double tap to zoom out again). Choose the same
@@ -110,7 +114,9 @@ copy target\release\iphone-ayna.exe iPhoneAyna.exe
 
 Rust + `windows` crate (Windows app), Swift (`mac-agent/`, `build.sh` makes a universal .app and .dmg).
 `tools/make_icon.py` regenerates the logo (`assets/`). `bin\` (UxPlay binaries) is not in the repository.
-GitHub Actions builds both and publishes the release (`.github/workflows/build.yml`).
+`installer/AynaMerkezi.iss` (Inno Setup 6) builds `AynaMerkezi-Setup.exe`.
+GitHub Actions builds both, tests the installer (silent install + uninstall) and publishes the release
+(`.github/workflows/build.yml`).
 
 Built on: [abhishek-raj/windows-ble-hid](https://github.com/abhishek-raj/windows-ble-hid),
 [sakx7/iOSBleDigitizer](https://github.com/sakx7/iOSBleDigitizer),

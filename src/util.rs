@@ -57,8 +57,8 @@ pub fn find_uxplay_dir() -> Option<PathBuf> {
     None
 }
 
-const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("iPhoneAyna");
+pub const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+pub const RUN_VALUE: PCWSTR = w!("iPhoneAyna");
 
 pub fn read_dword(key: PCWSTR, value: PCWSTR) -> Option<u32> {
     let mut data = 0u32;
@@ -90,12 +90,12 @@ pub fn write_setting(name: PCWSTR, value: u32) {
     }
 }
 
-/// Uygulama ayarlarındaki metin değeri.
-pub fn read_text_setting(name: PCWSTR) -> Option<String> {
+/// Kullanıcı kayıt defterindeki (HKCU) bir metin değeri.
+pub fn read_text(key: PCWSTR, name: PCWSTR) -> Option<String> {
     let mut buf = [0u16; 512];
     let mut size = (buf.len() * 2) as u32;
     let r = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, APP_KEY, name, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut size))
+        RegGetValueW(HKEY_CURRENT_USER, key, name, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut size))
     };
     if r != ERROR_SUCCESS {
         return None;
@@ -104,12 +104,21 @@ pub fn read_text_setting(name: PCWSTR) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..n]))
 }
 
-pub fn write_text_setting(name: PCWSTR, value: &str) -> bool {
+pub fn write_text(key: PCWSTR, name: PCWSTR, value: &str) -> bool {
     let v = wide(value);
     unsafe {
-        RegSetKeyValueW(HKEY_CURRENT_USER, APP_KEY, name, REG_SZ.0, Some(v.as_ptr() as _), (v.len() * 2) as u32)
+        RegSetKeyValueW(HKEY_CURRENT_USER, key, name, REG_SZ.0, Some(v.as_ptr() as _), (v.len() * 2) as u32)
             == ERROR_SUCCESS
     }
+}
+
+/// Uygulama ayarlarındaki metin değeri.
+pub fn read_text_setting(name: PCWSTR) -> Option<String> {
+    read_text(APP_KEY, name)
+}
+
+pub fn write_text_setting(name: PCWSTR, value: &str) -> bool {
+    write_text(APP_KEY, name, value)
 }
 
 pub fn delete_setting(name: PCWSTR) {

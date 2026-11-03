@@ -1,7 +1,8 @@
 # Uygulama cilası — Plan
 
 **Tarih:** 2026-11-03
-**Durum:** uygulanıyor
+**Durum:** yayınlandı — v16 (305d580), CI üç iş başarılı, exe'de simge kaynağı doğrulandı; depo açıklaması İngilizce.
+Gerçek kullanımda doğrulanmadı: Ctrl 10 sn sayacı (oyunda), Mac ajanının İngilizce metinleri.
 
 ## İstekler (kullanıcı)
 1. Ctrl 10 sn basılı → fare kilidinden çıkış; ekranda geri sayım. Oyunda hiçbir şey değişmemeli (Esc oyunun
@@ -22,9 +23,7 @@
 - Dil: `i18n.rs` `tr(tr, en)`; ayar "Dil" (tr|en), yoksa Windows arayüz diline göre.
 
 ## Sonraki Adım
-Yapıldı (commit yok): 1 Ctrl 10 sn + sayaç (countdown.rs), 6 sağ tık (Mac sizer'a Ayarlar/Çık; iPhone menüsüne
-Bağlantıyı kes = mirror::disconnect, Ayarları aç, Güncellemeleri denetle, Çık), 5 hub'da Dil + Güncelleme satırı
-(update::check_now/Status), 2 logo (tools/make_icon.py → assets/icon.ico/.res/logo.png; .res yalnız MSVC'de
-gömülür) + tray.rs (kendi simgesi, uxplay simgesini NIM_DELETE), 4 Mac i18n (L()), Info.plist en + tr.lproj,
-3 README İngilizce (+README.tr.md), iş akışı İngilizce + "Version N". Windows metinlerinin çevirisi ajanda.
-Kalan: ajan sonucu → build/test → review → commit → push onayı (+ gh repo açıklaması İngilizce).
+v16 (cila) ve v17 (zip paketi) yayınlandı. 2026-11-04: kurulum programı — installer/AynaMerkezi.iss (Inno Setup,
+kullanıcı başına %LOCALAPPDATA%\Programs\Ayna Merkezi, AppId 15E0CF97-…, Programlar ve Özellikler kaydı HKCU),
+src/install.rs (DisplayVersion + autostart yolu), CI'da ISCC + sessiz kur/kaldır testi, README'ler.
+Kalan: review → commit → push onayı → CI'da Setup testi geçti mi.

@@ -8,6 +8,7 @@ mod countdown;
 mod dragout;
 mod ghost;
 mod i18n;
+mod install;
 mod gst;
 mod hid;
 mod hub;
@@ -53,6 +54,9 @@ fn main() {
             }
             return;
         }
+
+        // Yalnız çalışan tek kopya: Programlar ve Özellikler sürümü, Windows ile başlat yolu.
+        install::on_startup();
 
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         // Sürükle-bırak (OLE) için.
