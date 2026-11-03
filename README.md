@@ -128,7 +128,12 @@ noktadaki Finder penceresinin klasörüne (yoksa Mac Masaüstü'ne) kopyalanır.
 Finder'ı denetlemek istiyor" diye sorar (Otomasyon izni; verilmezse dosyalar Masaüstü'ne gider). Mac'te bir
 dosyayı tutup Mac penceresinin dışına sürükleyin: dosya Windows'a alınır ve fare nereye bırakılırsa (Masaüstü,
 Gezgin klasörü) oraya kopyalanır; fare dosya gelmeden bırakılırsa Windows Masaüstü'ne kaydedilir. Aktarım
-şifreli oturumun içinden gider; büyük dosyalar sırasında görüntü ve fare akmaya devam eder.
+şifreli oturumun içinden gider; büyük dosyalar sırasında görüntü ve fare akmaya devam eder. Windows'tan
+sürüklerken dosyanın simgesi ve adı Mac'te (Mac ölçeğinde) imlecin altında görünür; Mac'ten çıkarırken
+dosyalar inene dek simgesi ve adı Windows'ta imleci izler, sonra Windows'un sürükleme görüntüsü devralır.
+
+**Tek imleç:** Mac imleci görüntüye çizilmez; Windows imleci gecikmesiz kalır ama Mac'teki şeklini alır
+(yazı imleci, el, boyutlandırma okları).
 
 **Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı), "iPhone'u Mac üzerinden göster" ve "Bağlantıyı kes".
 

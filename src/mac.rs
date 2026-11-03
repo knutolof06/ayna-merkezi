@@ -61,6 +61,10 @@ const MSG_PONG: u8 = 0x03;
 const MSG_BYE: u8 = 0x04;
 /// Mac → Windows: kip durumu [kip][başarılı][metin].
 const MSG_STATE: u8 = 0x05;
+/// Mac → Windows: imleç şekli [sıcak x][sıcak y][gen][yük][BGRA önceden çarpılmış]; gen 0 = ok.
+const MSG_CURSOR: u8 = 0x06;
+/// Windows → Mac: imleci Windows çizer; Mac imlecini görüntüden çıkarıp şeklini göndersin.
+const MSG_LOCAL_CURSOR: u8 = 0x1A;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -77,6 +81,9 @@ const MSG_PUT_DATA: u8 = 0x21;
 const MSG_PUT_END: u8 = 0x22;
 const MSG_DRAG_QUERY: u8 = 0x23;
 const MSG_GET: u8 = 0x24;
+/// Windows → Mac: sürüklenen dosya Mac penceresinin üstünde [x][y][sayı][klasör][ad uz.][ad].
+const MSG_HOVER: u8 = 0x25;
+const MSG_HOVER_END: u8 = 0x26;
 // Mac → Windows (dosyalar)
 const MSG_DRAG_LIST: u8 = 0x30;
 const MSG_GET_BEGIN: u8 = 0x31;
@@ -87,6 +94,8 @@ const MSG_PUT_DONE: u8 = 0x35;
 
 /// Dosya olayı (iş parçacığı → Mac penceresi); WPARAM `FILES_*`.
 pub const WM_APP_FILES: u32 = WM_APP + 28;
+/// Mac imlecinin şekli değişti.
+pub const WM_APP_CURSOR: u32 = WM_APP + 29;
 /// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
 pub const FILES_LISTED: usize = 1;
 /// Mac'ten sürüklenen dosyaların hepsi geldi.
@@ -163,6 +172,8 @@ struct Shared {
     incoming: Mutex<Option<DragIn>>,
     /// Mac'e "dosya sürükleniyor mu?" soruldu; Mac'in listesi yalnız o zaman kabul edilir.
     drag_asked: AtomicBool,
+    /// Mac imlecinin şekli (görüntü pikseli ölçeğinde); yoksa olağan ok.
+    cursor: Mutex<Option<CursorImage>>,
     /// iPhone kipi istendi (Mac'teki iPhone Mirroring gösterilir); ağ kopup yeniden bağlanınca da sürer.
     phone: AtomicBool,
     /// Kip istendi, Mac henüz yanıt vermedi (eski Ayna Ajan isteği tanımaz, hiç yanıt gelmez).
@@ -183,6 +194,16 @@ struct DragIn {
     /// Sıra başına: bitti mi (bitiş iletisi yinelenirse bir kez sayılır).
     finished: Vec<bool>,
     done: usize,
+}
+
+/// Mac imlecinin resmi.
+#[derive(Clone)]
+pub struct CursorImage {
+    pub hot: (u16, u16),
+    pub width: usize,
+    pub height: usize,
+    /// Önceden çarpılmış BGRA, üst satır önce.
+    pub bgra: Vec<u8>,
 }
 
 /// Dosya numaraları tüm toplu işlerde tektir (Mac dosyaları numarayla ayırır; üst üste iki
@@ -230,6 +251,7 @@ impl Mac {
                 batches: Mutex::new(HashMap::new()),
                 incoming: Mutex::new(None),
                 drag_asked: AtomicBool::new(false),
+                cursor: Mutex::new(None),
                 phone: AtomicBool::new(false),
                 phone_asked: Mutex::new(None),
                 phone_quiet: AtomicBool::new(false),
@@ -278,6 +300,47 @@ impl Mac {
     pub fn query_drag(&self) {
         self.shared.drag_asked.store(true, Ordering::SeqCst);
         self.send(vec![MSG_DRAG_QUERY]);
+    }
+
+    /// Windows'tan sürüklenen dosya Mac penceresinin üstünde: Mac'te simgesi ve adı gösterilir.
+    pub fn drag_hover(&self, x: u16, y: u16, count: usize, folder: bool, name: &str) {
+        let name = &name.as_bytes()[..name.len().min(1024)];
+        let mut m = vec![MSG_HOVER];
+        m.extend_from_slice(&x.to_be_bytes());
+        m.extend_from_slice(&y.to_be_bytes());
+        m.extend_from_slice(&(count.min(u16::MAX as usize) as u16).to_be_bytes());
+        m.push(u8::from(folder));
+        m.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        m.extend_from_slice(name);
+        self.send(m);
+    }
+
+    pub fn drag_hover_end(&self) {
+        self.send(vec![MSG_HOVER_END]);
+    }
+
+    pub fn cursor(&self) -> Option<CursorImage> {
+        self.shared.cursor.lock().unwrap().clone()
+    }
+
+    /// Mac'ten alınmakta olan öğeler için önizleme: ilk en üst öğenin adı, klasör mü, öğe sayısı.
+    pub fn dragged_preview(&self) -> Option<(String, bool, usize)> {
+        let guard = self.shared.incoming.lock().unwrap();
+        let d = guard.as_ref()?;
+        let mut tops: Vec<&std::ffi::OsStr> = Vec::new();
+        let mut first_is_dir = false;
+        for n in &d.names {
+            let mut parts = n.iter();
+            let Some(top) = parts.next() else { continue };
+            if tops.is_empty() {
+                first_is_dir = parts.next().is_some();
+            }
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        let first = tops.first()?.to_string_lossy().to_string();
+        Some((first, first_is_dir, tops.len()))
     }
 
     /// Bildirilen sürüklenen dosyaları ister.
@@ -763,12 +826,14 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         return Err(String::new());
     }
     util::log(&format!("Mac oturumu açıldı: {}", peer.name));
+    *shared.cursor.lock().unwrap() = None;
     let saved = format!("{}:{} {}", peer.ip, peer.port, peer.name);
     let _ = util::write_text_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()), &saved);
     post(notify);
     if shared.player.lock().unwrap().is_some() {
         let _ = tx.send(vec![MSG_KEYFRAME]);
     }
+    let _ = tx.send(vec![MSG_LOCAL_CURSOR]);
     if shared.phone.load(Ordering::SeqCst) {
         shared.phone_quiet.store(true, Ordering::SeqCst);
         *shared.phone_asked.lock().unwrap() = Some(Instant::now());
@@ -822,6 +887,16 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
             }
             MSG_BYE => return Ok(true),
+            MSG_CURSOR if plain.len() >= 9 => {
+                let be = |i: usize| u16::from_be_bytes([plain[i], plain[i + 1]]);
+                let (width, height) = (be(5) as usize, be(7) as usize);
+                let image = (width > 0 && height > 0 && width <= 256 && height <= 256 && plain.len() == 9 + width * height * 4)
+                    .then(|| CursorImage { hot: (be(1), be(3)), width, height, bgra: plain[9..].to_vec() });
+                *shared.cursor.lock().unwrap() = image;
+                unsafe {
+                    let _ = PostMessageW(HWND(notify as _), WM_APP_CURSOR, WPARAM(0), LPARAM(0));
+                }
+            }
             MSG_STATE if plain.len() >= 3 => {
                 let (mode, ok) = (plain[1], plain[2] == 1);
                 *shared.phone_asked.lock().unwrap() = None;

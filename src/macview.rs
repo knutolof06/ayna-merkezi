@@ -17,13 +17,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryPoint, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dragout;
+use crate::ghost;
 use crate::gst::{self, Player};
 use crate::toast;
-use crate::transfer;
 use crate::hub::{self, card_bg, card_bg_alpha, colorref, hit, palette, point, slider, text, to_rect, Fonts};
 use crate::mac::{self, Mac, State};
 use crate::mirror::{WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
@@ -88,6 +87,10 @@ struct View {
     drag_queried: bool,
     /// Mac'ten sürüklenen dosyalar alınıyor; fare bırakılana dek Mac'e fare iletilmez.
     dragging_out: bool,
+    /// Mac imlecinin şekli, penceredeki görüntü ölçeğinde (görüntüde imleç çizilmez).
+    mac_cursor: HCURSOR,
+    /// Mac'e en son bildirilen sürükleme önizleme yeri (aynısı yinelenmez).
+    last_hover: Option<(u16, u16)>,
 }
 
 thread_local! {
@@ -289,13 +292,16 @@ pub fn create() -> Option<HWND> {
             seen: None,
             drag_queried: false,
             dragging_out: false,
+            mac_cursor: HCURSOR::default(),
+            last_hover: None,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
         SendMessageW(edit, WM_SETFONT, WPARAM(with(|v| v.fonts.code.0 as usize).unwrap_or(0)), LPARAM(1));
 
-        // Windows'tan sürüklenen dosyalar bu pencereye bırakılınca Mac'e gider.
-        DragAcceptFiles(hwnd, true);
+        // Windows'tan sürüklenen dosyalar bu pencereye bırakılınca Mac'e gider (OLE hedefi: sürüklerken
+        // Mac'te dosyanın simgesi görünür).
+        dragout::register_target(hwnd);
         taskbar::set_target(Device::Mac, hwnd);
         taskbar::set_view(Device::Mac, hwnd);
         taskbar::set_enabled(Device::Mac, enabled());
@@ -523,37 +529,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             After::Mode
         }
         WM_APP_GO => After::Go,
-        WM_DROPFILES => {
-            let drop = HDROP(wp.0 as _);
-            let mut pt = POINT::default();
-            let _ = DragQueryPoint(drop, &mut pt);
-            if dragout::active() {
-                // Mac'ten gelen dosya yine Mac penceresine bırakıldı: geri gönderilmez.
-                DragFinish(drop);
-                return LRESULT(0);
-            }
-            if !connected() {
-                DragFinish(drop);
-                toast::show(hwnd, "Dosya göndermek için önce Mac'e bağlanın.");
-                return LRESULT(0);
-            }
-            let paths = transfer::dropped_paths(drop);
-            let sent = with(|v| {
-                let (x, y) = v.normalized((pt.x, pt.y));
-                v.mac.send_files(paths, x, y)
-            })
-            .unwrap_or(false);
-            if sent {
-                toast::show(hwnd, "Mac'e gönderiliyor…");
-            }
-            return LRESULT(0);
-        }
         mac::WM_APP_FILES => {
             files_event(hwnd, wp.0);
             return LRESULT(0);
         }
+        mac::WM_APP_CURSOR => {
+            with(|v| v.rebuild_cursor());
+            return LRESULT(0);
+        }
+        WM_SETCURSOR => {
+            // Görüntünün üstünde Windows imleci Mac imlecinin şeklini alır (çift imleç olmasın).
+            let hit = (lp.0 & 0xFFFF) as u16;
+            if hit == HTCLIENT as u16 || hit == HTERROR as u16 {
+                if let Some(c) = with(|v| v.mac.connected().then_some(v.mac_cursor)).flatten().filter(|c| !c.is_invalid()) {
+                    SetCursor(c);
+                    return LRESULT(1);
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         WM_SIZE => {
             layout(hwnd);
+            with(|v| v.rebuild_cursor());
             After::Paint
         }
         WM_DPICHANGED => {
@@ -796,7 +793,9 @@ impl View {
     fn release_input(&mut self) {
         self.fake_ctrl = false;
         self.drag_queried = false;
-        self.dragging_out = false;
+        if std::mem::take(&mut self.dragging_out) {
+            ghost::hide();
+        }
         if !self.mac.connected() {
             self.keys.clear();
             self.buttons = 0;
@@ -812,6 +811,33 @@ impl View {
             }
         }
         self.buttons = 0;
+    }
+
+    /// Mac imlecinin resmini penceredeki görüntü ölçeğine getirip Windows imleci yapar.
+    fn rebuild_cursor(&mut self) {
+        let image = self.mac.cursor();
+        let mut c = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut c);
+        }
+        let new = match (image, self.mac.screen()) {
+            (Some(img), Some((vw, _))) if vw > 0 => make_cursor(&img, width(&c) as f32 / vw as f32),
+            _ => HCURSOR::default(),
+        };
+        let old = std::mem::replace(&mut self.mac_cursor, new);
+        unsafe {
+            // İmleç penceredeyse hemen değişir.
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let over = WindowFromPoint(pt) == self.hwnd || IsChild(self.hwnd, WindowFromPoint(pt)).as_bool();
+            let lp = LPARAM(((pt.y as u16 as isize) << 16) | (pt.x as u16 as isize));
+            if over && SendMessageW(self.hwnd, WM_NCHITTEST, WPARAM(0), lp).0 == HTCLIENT as isize {
+                SetCursor(if new.is_invalid() { LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default() } else { new });
+            }
+            if !old.is_invalid() {
+                let _ = DestroyCursor(old);
+            }
+        }
     }
 
     fn normalized(&self, (x, y): (i32, i32)) -> (u16, u16) {
@@ -839,6 +865,7 @@ impl View {
         }
         if self.mac.connected() {
             if self.dragging_out {
+                ghost::follow();
                 return After::None;
             }
             // Basılı fareyle pencerenin dışına çıkıldı: Mac'te dosya sürükleniyorsa Windows'a alınır.
@@ -871,6 +898,7 @@ impl View {
             if button == 0 && !down {
                 self.drag_queried = false;
                 if std::mem::take(&mut self.dragging_out) {
+                    ghost::hide();
                     unsafe {
                         let _ = ReleaseCapture();
                     }
@@ -1069,6 +1097,127 @@ impl View {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Windows'tan Mac penceresine sürükleme (OLE hedefinden çağrılır; ekran koordinatı)
+
+/// Sürüklenen dosya pencerenin üstünde: Mac'te simgesi ve adı gösterilir. Kabul edilirse true.
+/// `enter`: yeni sürükleme (önceki konum unutulur).
+pub fn drop_hover(x: i32, y: i32, count: usize, folder: bool, name: &str, enter: bool) -> bool {
+    let accepted = with(|v| {
+        if !v.mac.connected() || v.mac.phone() {
+            return false;
+        }
+        if enter {
+            v.last_hover = None;
+        }
+        let mut pt = POINT { x, y };
+        unsafe {
+            let _ = ScreenToClient(v.hwnd, &mut pt);
+        }
+        let pos = v.normalized((pt.x, pt.y));
+        if v.last_hover != Some(pos) {
+            v.last_hover = Some(pos);
+            v.mac.drag_hover(pos.0, pos.1, count, folder, name);
+        }
+        true
+    })
+    .unwrap_or(false);
+    if enter && !accepted && !connected() {
+        toast::show(main_hwnd(), "Dosya göndermek için önce Mac'e bağlanın.");
+    }
+    accepted
+}
+
+pub fn drop_leave() {
+    with(|v| {
+        v.last_hover = None;
+        v.mac.drag_hover_end();
+    });
+}
+
+/// Bırakıldı: dosyalar Mac'te bırakılan noktadaki klasöre gider.
+pub fn drop_files(x: i32, y: i32, paths: Vec<std::path::PathBuf>) -> bool {
+    let sent = with(|v| {
+        let mut pt = POINT { x, y };
+        unsafe {
+            let _ = ScreenToClient(v.hwnd, &mut pt);
+        }
+        let (nx, ny) = v.normalized((pt.x, pt.y));
+        v.mac.send_files(paths, nx, ny)
+    })
+    .unwrap_or(false);
+    if sent {
+        toast::show(main_hwnd(), "Mac'e gönderiliyor…");
+    }
+    sent
+}
+
+/// Mac imleci resmini (önceden çarpılmış BGRA) `k` oranında ölçekleyip Windows imleci yapar.
+fn make_cursor(img: &mac::CursorImage, k: f32) -> HCURSOR {
+    let (sw, sh) = (img.width, img.height);
+    let w = ((sw as f32 * k).round() as usize).clamp(1, 256);
+    let h = ((sh as f32 * k).round() as usize).clamp(1, 256);
+    // Çift doğrusal örnekleme (önceden çarpılmış değerlerde doğru), sonra düz alfaya çevrilir.
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) * sh as f32 / h as f32 - 0.5).clamp(0.0, (sh - 1) as f32);
+        let (y0, ty) = (fy.floor() as usize, fy.fract());
+        let y1 = (y0 + 1).min(sh - 1);
+        for x in 0..w {
+            let fx = ((x as f32 + 0.5) * sw as f32 / w as f32 - 0.5).clamp(0.0, (sw - 1) as f32);
+            let (x0, tx) = (fx.floor() as usize, fx.fract());
+            let x1 = (x0 + 1).min(sw - 1);
+            let px = |xx: usize, yy: usize, c: usize| img.bgra[(yy * sw + xx) * 4 + c] as f32;
+            let mut v = [0f32; 4];
+            for (c, slot) in v.iter_mut().enumerate() {
+                let top = px(x0, y0, c) * (1.0 - tx) + px(x1, y0, c) * tx;
+                let bottom = px(x0, y1, c) * (1.0 - tx) + px(x1, y1, c) * tx;
+                *slot = top * (1.0 - ty) + bottom * ty;
+            }
+            let a = v[3];
+            let o = (y * w + x) * 4;
+            for c in 0..3 {
+                out[o + c] = if a > 0.0 { (v[c] * 255.0 / a).round().clamp(0.0, 255.0) as u8 } else { 0 };
+            }
+            out[o + 3] = a.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    unsafe {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let screen = GetDC(HWND::default());
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0);
+        ReleaseDC(HWND::default(), screen);
+        let Ok(color) = color else { return HCURSOR::default() };
+        std::ptr::copy_nonoverlapping(out.as_ptr(), bits as *mut u8, out.len());
+        // Tek renkli maske boş: şeffaflığı alfa belirler.
+        let mask_bytes = vec![0u8; w.div_ceil(16) * 2 * h];
+        let mask = CreateBitmap(w as i32, h as i32, 1, 1, Some(mask_bytes.as_ptr() as _));
+        let icon = ICONINFO {
+            fIcon: FALSE,
+            xHotspot: ((img.hot.0 as usize * w / sw) as u32).min(w as u32 - 1),
+            yHotspot: ((img.hot.1 as usize * h / sh) as u32).min(h as u32 - 1),
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let cursor = CreateIconIndirect(&icon).map(|h| HCURSOR(h.0)).unwrap_or_default();
+        let _ = DeleteObject(color);
+        let _ = DeleteObject(mask);
+        cursor
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Mac'ten Windows'a sürüklenen dosyalar
 
 unsafe fn files_event(hwnd: HWND, what: usize) {
@@ -1090,7 +1239,10 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
                 v.mac.dragged_count()
             })
             .unwrap_or(0);
-            if count > 0 {
+            // Mac'teki sürükleme iptal edildi: dosyalar inene dek simgesi ve adı imleci izler.
+            if let Some((name, folder, items)) = with(|v| if v.dragging_out { v.mac.dragged_preview() } else { None }).flatten() {
+                ghost::show(&name, folder, items);
+            } else if count > 0 {
                 toast::show(hwnd, &format!("Mac'ten alınıyor: {count} dosya…"));
             }
         }
@@ -1104,13 +1256,14 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
                 return;
             };
             let _ = ReleaseCapture();
+            ghost::hide();
             if items.is_empty() {
                 toast::show(hwnd, "Mac'ten dosyalar alınamadı.");
                 return;
             }
             let held = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01 /* VK_LBUTTON */) < 0;
             if held {
-                dragout::drag(&items);
+                dragout::drag(hwnd, &items);
             } else {
                 // Fare dosyalar gelmeden bırakıldı: Masaüstü'ne kaydedilir.
                 let desktop = util::desktop_dir();

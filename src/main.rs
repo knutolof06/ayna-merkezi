@@ -5,6 +5,7 @@ mod buttons;
 mod corners;
 mod crypto;
 mod dragout;
+mod ghost;
 mod gst;
 mod hid;
 mod hub;

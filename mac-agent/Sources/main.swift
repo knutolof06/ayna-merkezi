@@ -22,6 +22,12 @@
 //   Mac yanıtı: "AYNA2 WAIT" … "AYNA2 OK NEW|SAME <HMAC(anahtar, "ok|T")>" | DENY | OFF | BUSY.
 // - Şifreli çerçeveler: u32 uzunluk || şifreli metin || etiket.
 //   nonce = 4 sıfır bayt || u64 sayaç (yön başına).
+// - İmleç: Windows → Mac 0x1A LOCAL_CURSOR (Windows imleci kendisi çizer); bundan sonra Mac imleci
+//   görüntüye çizilmez ve Mac → Windows 0x06 CURSOR [sıcak x][sıcak y][gen][yük][BGRA önceden
+//   çarpılmış, görüntü pikseli ölçeğinde] gider; gen 0 = Windows kendi okunu göstersin. Bunu
+//   bildirmeyen eski Windows için imleç görüntüde kalır.
+// - Sürükleme önizlemesi: Windows → Mac 0x25 HOVER [x][y][sayı][klasör mü][ad uz.][ad], 0x26 HOVER_END:
+//   Windows'tan sürüklenen dosyanın simgesi ve adı Mac'te imlecin altında görünür.
 // - iPhone kipi: Windows → Mac 0x18 MODE [0 Mac ekranı | 1 iPhone]; Mac → Windows 0x05 STATE
 //   [kip][başarılı][metin]. iPhone kipinde görüntü ve fare, görünmez bir sanal ekranda açılan
 //   iPhone Mirroring penceresine aittir.
@@ -281,10 +287,16 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         return dead
     }
 
-    init(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)? = nil, paused: Bool = false,
+    /// Ana ekran yakalamasında imleç çizilsin mi (Windows imleci kendisi çiziyorsa hayır).
+    private let cursor: Bool
+    /// Yalnız `queue` üzerinde: çalışan akışın yapılandırması (imleç sonradan değiştirilebilir).
+    private var config: SCStreamConfiguration?
+
+    init(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)? = nil, paused: Bool = false, cursor: Bool = true,
          onFrame: @escaping (Data, Bool) -> Void, onSize: @escaping (Int, Int) -> Void, onError: @escaping (String) -> Void) {
         self.region = region
         self.paused = paused
+        self.cursor = cursor
         self.onFrame = onFrame
         self.onSize = onSize
         self.onError = onError
@@ -311,7 +323,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 pw = mode.pixelWidth
                 ph = mode.pixelHeight
             }
-            self.begin(filter: SCContentFilter(display: display, excludingWindows: []), pixels: (pw, ph), cursor: true)
+            self.begin(filter: SCContentFilter(display: display, excludingWindows: []), pixels: (pw, ph), cursor: self.cursor)
         }
     }
 
@@ -339,6 +351,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             guard !self.stopped else { return false }
             self.makeEncoder(width: w, height: h)
             self.scStream = stream
+            self.config = config
             return true
         }
         guard proceed else { return }
@@ -439,6 +452,15 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async {
             self.forceKey = true
             if let pb = self.lastBuffer { self.encode(pb) }
+        }
+    }
+
+    /// İmleci görüntüye çizmeyi açar/kapatır (akış yeniden başlamaz).
+    func setCursorShown(_ shown: Bool) {
+        queue.async {
+            guard let stream = self.scStream, let config = self.config, config.showsCursor != shown else { return }
+            config.showsCursor = shown
+            stream.updateConfiguration(config) { _ in }
         }
     }
 
@@ -1168,6 +1190,77 @@ final class PhoneMirror {
     }
 }
 
+// MARK: - Sürükleme önizlemesi
+
+/// Windows'tan Mac penceresine sürüklenen dosyanın simgesi ve adı: Mac'te imlecin altında, Finder'ın
+/// sürükleme görüntüsü gibi. Fareyi yakalamaz, görüntüyle birlikte Windows'a gider.
+final class DragPreview {
+    private let panel: NSPanel
+    private let icon = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+    private let badge = NSTextField(labelWithString: "")
+    private static let size = NSSize(width: 200, height: 100)
+
+    init() {
+        panel = NSPanel(contentRect: NSRect(origin: .zero, size: DragPreview.size), styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        let content = NSView(frame: NSRect(origin: .zero, size: DragPreview.size))
+        icon.frame = NSRect(x: (DragPreview.size.width - 64) / 2, y: 32, width: 64, height: 64)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.alphaValue = 0.85
+        label.frame = NSRect(x: 4, y: 6, width: DragPreview.size.width - 8, height: 22)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingMiddle
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.wantsLayer = true
+        label.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.85).cgColor
+        label.layer?.cornerRadius = 5
+        badge.frame = NSRect(x: DragPreview.size.width / 2 + 18, y: 74, width: 26, height: 20)
+        badge.alignment = .center
+        badge.font = .systemFont(ofSize: 12, weight: .bold)
+        badge.textColor = .white
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.systemRed.cgColor
+        badge.layer?.cornerRadius = 10
+        content.addSubview(icon)
+        content.addSubview(label)
+        content.addSubview(badge)
+        panel.contentView = content
+    }
+
+    /// `point`: genel koordinat (sol üst köşe başlangıç, Mac'in fare koordinatları gibi).
+    func show(at point: CGPoint, name: String, count: Int, folder: Bool) {
+        if label.stringValue != name {
+            label.stringValue = name
+            let ext = (name as NSString).pathExtension
+            icon.image = folder ? NSImage(named: NSImage.folderName)
+                : NSWorkspace.shared.icon(forFileType: ext.isEmpty ? "public.data" : ext)
+            // Etiket, ada göre daralır (Finder'daki gibi).
+            let width = min(DragPreview.size.width - 8, (name as NSString).size(withAttributes: [.font: label.font!]).width + 16)
+            label.frame = NSRect(x: (DragPreview.size.width - width) / 2, y: 6, width: width, height: 22)
+        }
+        badge.isHidden = count < 2
+        badge.stringValue = "\(count)"
+        // Cocoa ekran koordinatı: başlangıç ana ekranın sol alt köşesi. İmleç simgenin ortasında.
+        let primary = NSScreen.screens.first?.frame.height ?? CGDisplayBounds(CGMainDisplayID()).height
+        let origin = NSPoint(x: point.x - DragPreview.size.width / 2, y: primary - point.y - 64)
+        panel.setFrameOrigin(origin)
+        if !panel.isVisible { panel.orderFrontRegardless() }
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+        label.stringValue = ""
+    }
+}
+
 // MARK: - Oturum
 
 final class Session {
@@ -1195,6 +1288,14 @@ final class Session {
     /// iPhone kipindeyken görünmez ekrandaki iPhone Mirroring.
     private var phone: PhoneMirror?
     private var phoneAnnounced = false
+    /// Windows imleci kendisi çiziyor: Mac imleci görüntüye çizilmez, şekli 0x06 ile gider.
+    private var localCursor = false
+    /// Mac imlecinin şeklini Windows'a taşır (görüntüde imleç yok).
+    private var cursorTimer: Timer?
+    private var lastCursor = Data()
+    /// Görüntü pikseli / ekran noktası (görüntü en uzun kenar sınırına küçültülür).
+    private var videoScale: CGFloat = 1
+    private var dragPreview: DragPreview?
     /// Windows penceresi gizli: görüntü durur (yeni yakalayıcıya da geçer).
     private var videoPaused = false
     private let injector = Injector()
@@ -1476,15 +1577,68 @@ final class Session {
         process()
     }
 
+    /// Mac imlecinin şekli değiştiyse resmini (görüntü ölçeğinde) Windows'a gönderir.
+    private func sendCursor() {
+        guard stage == .streaming else { return }
+        var message = Data([0x06, 0, 0, 0, 0, 0, 0, 0, 0])
+        if phone == nil, let cursor = NSCursor.currentSystem {
+            let size = cursor.image.size
+            let w = Int((size.width * videoScale).rounded()), h = Int((size.height * videoScale).rounded())
+            if (1...256).contains(w), (1...256).contains(h) {
+                var pixels = [UInt8](repeating: 0, count: w * h * 4)
+                let drawn: Bool = pixels.withUnsafeMutableBytes { raw in
+                    guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                              space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+                    else { return false }
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+                    // En yüksek çözünürlüklü temsil (Retina imleci küçültülerek keskin kalır).
+                    let rect = NSRect(x: 0, y: 0, width: w, height: h)
+                    if let best = cursor.image.representations.max(by: { $0.pixelsWide < $1.pixelsWide }) {
+                        best.draw(in: rect)
+                    } else {
+                        cursor.image.draw(in: rect)
+                    }
+                    NSGraphicsContext.restoreGraphicsState()
+                    return true
+                }
+                if drawn {
+                    let hot = cursor.hotSpot
+                    let hx = UInt16(clamping: Int(hot.x * videoScale))
+                    let hy = UInt16(clamping: Int(hot.y * videoScale))
+                    var head: [UInt8] = [0x06]
+                    head += be16(hx)
+                    head += be16(hy)
+                    head += be16(UInt16(w))
+                    head += be16(UInt16(h))
+                    message = Data(head)
+                    message.append(contentsOf: pixels)
+                }
+            }
+        }
+        guard message != lastCursor else { return }
+        lastCursor = message
+        send(message)
+    }
+
     /// Ana ekranı (ya da iPhone kipinde görünmez ekrandaki iPhone Mirroring penceresini) yakalamaya başlar.
     private func startCapture(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)?) {
         capturer?.stop()
         let cap = Capturer(
             region: region,
             paused: videoPaused,
+            cursor: !localCursor,
             onFrame: { [weak self] data, key in self?.sendVideo(data, key: key) },
             onSize: { [weak self] w, h in
                 self?.send(Data([0x02] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
+                if region == nil {
+                    let points = CGDisplayBounds(CGMainDisplayID()).width
+                    DispatchQueue.main.async {
+                        self?.videoScale = points > 0 ? CGFloat(w) / points : 1
+                        self?.lastCursor = Data()
+                    }
+                }
             },
             onError: { [weak self] message in
                 DispatchQueue.main.async {
@@ -1597,6 +1751,26 @@ final class Session {
             dragQuery()
         case 0x24 where b.count >= 5:
             get(readBE32(b, 1))
+        case 0x25 where b.count >= 10:
+            let (x, y) = (readBE16(m, 1), readBE16(m, 3))
+            let count = Int(readBE16(m, 5)), folder = b[7] == 1
+            let len = Int(UInt16(b[8]) << 8 | UInt16(b[9]))
+            guard phone == nil, b.count >= 10 + len else { break }
+            let name = String(decoding: b[10..<(10 + len)], as: UTF8.self)
+            injector.move(x, y)
+            let screen = CGDisplayBounds(CGMainDisplayID())
+            let point = CGPoint(x: screen.minX + CGFloat(x) / 65535 * screen.width, y: screen.minY + CGFloat(y) / 65535 * screen.height)
+            let preview = dragPreview ?? DragPreview()
+            dragPreview = preview
+            preview.show(at: point, name: name, count: count, folder: folder)
+        case 0x26:
+            dragPreview?.hide()
+        case 0x1A:
+            // Windows imleci kendisi çiziyor: Mac imleci görüntüden çıkar, şekli ayrıca gönderilir.
+            guard !localCursor else { break }
+            localCursor = true
+            if phone == nil { capturer?.setCursorShown(false) }
+            cursorTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.sendCursor() }
         default:
             break
         }
@@ -1749,6 +1923,9 @@ final class Session {
         let wasStreaming = stage == .streaming
         stage = .closed
         watchdog?.invalidate()
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        dragPreview?.hide()
         capturer?.stop()
         capturer = nil
         phone?.stop()
