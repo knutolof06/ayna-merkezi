@@ -130,7 +130,15 @@ dosyayı tutup Mac penceresinin dışına sürükleyin: dosya Windows'a alınır
 Gezgin klasörü) oraya kopyalanır; fare dosya gelmeden bırakılırsa Windows Masaüstü'ne kaydedilir. Aktarım
 şifreli oturumun içinden gider; büyük dosyalar sırasında görüntü ve fare akmaya devam eder.
 
-**Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı) ve "Bağlantıyı kes".
+**Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı), "iPhone'u Mac üzerinden göster" ve "Bağlantıyı kes".
+
+**iPhone'u Mac üzerinden (deneme):** Mac'teki iPhone Mirroring'i Windows'tan kullanır; Mac penceresinde Mac
+ekranı yerine telefon görünür, fare ve klavye telefona gider (Cmd+1 ana ekran, Cmd+2 uygulama değiştirici,
+Cmd+3 arama; Windows'ta Ctrl+1/2/3). Mac'in ekranında iPhone görüntüsü durmaz: Ayna Ajan görünmez bir sanal
+ekran açar, iPhone Mirroring'i oraya koyar; kip kapanınca uygulamayı kapatıp sanal ekranı kaldırır.
+Gerekenler: macOS 15 ve Apple çipli Mac, iOS 18, iki cihazda aynı Apple hesabı, iPhone Mac'in yakınında ve
+kilitli. iPhone Mirroring ayarlarında kimlik doğrulama "otomatik" olmalı (yoksa açılışta görünmeyen ekranda
+parola sorar). Sanal ekran macOS'un belgelenmemiş bir özelliğidir; açılamazsa Mac ekranına dönülür.
 
 **Teknik:** Görüntü Mac'te ScreenCaptureKit ile yakalanıp VideoToolbox ile donanımda H.264'e kodlanır (en uzun
 kenar 1920 piksel, 60 kare/sn'ye kadar, ~12 Mbit/sn), Windows'ta GStreamer ile donanımda çözülür (UxPlay'in

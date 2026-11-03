@@ -59,6 +59,8 @@ const MSG_VIDEO: u8 = 0x01;
 const MSG_SCREEN: u8 = 0x02;
 const MSG_PONG: u8 = 0x03;
 const MSG_BYE: u8 = 0x04;
+/// Mac → Windows: kip durumu [kip][başarılı][metin].
+const MSG_STATE: u8 = 0x05;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -68,6 +70,8 @@ const MSG_KEYFRAME: u8 = 0x14;
 const MSG_PING: u8 = 0x15;
 const MSG_PAUSE: u8 = 0x16;
 const MSG_LEAVE: u8 = 0x17;
+/// Windows → Mac: [0 Mac ekranı | 1 iPhone (Mac'teki iPhone Mirroring)].
+const MSG_MODE: u8 = 0x18;
 const MSG_PUT_BEGIN: u8 = 0x20;
 const MSG_PUT_DATA: u8 = 0x21;
 const MSG_PUT_END: u8 = 0x22;
@@ -159,6 +163,12 @@ struct Shared {
     incoming: Mutex<Option<DragIn>>,
     /// Mac'e "dosya sürükleniyor mu?" soruldu; Mac'in listesi yalnız o zaman kabul edilir.
     drag_asked: AtomicBool,
+    /// iPhone kipi istendi (Mac'teki iPhone Mirroring gösterilir); ağ kopup yeniden bağlanınca da sürer.
+    phone: AtomicBool,
+    /// Kip istendi, Mac henüz yanıt vermedi (eski Ayna Ajan isteği tanımaz, hiç yanıt gelmez).
+    phone_asked: Mutex<Option<Instant>>,
+    /// Yeniden bağlanınca kendiliğinden yinelenen istek: yalnız hata bildirilir (bildirim yağmuru olmasın).
+    phone_quiet: AtomicBool,
     note: Mutex<Option<String>>,
 }
 
@@ -220,6 +230,9 @@ impl Mac {
                 batches: Mutex::new(HashMap::new()),
                 incoming: Mutex::new(None),
                 drag_asked: AtomicBool::new(false),
+                phone: AtomicBool::new(false),
+                phone_asked: Mutex::new(None),
+                phone_quiet: AtomicBool::new(false),
                 note: Mutex::new(None),
             }),
         }
@@ -294,6 +307,36 @@ impl Mac {
             }
         }
         top
+    }
+
+    /// iPhone kipi: Mac penceresinde Mac ekranı yerine Mac'teki iPhone Mirroring görünür.
+    pub fn set_phone(&self, on: bool) {
+        self.shared.phone.store(on, Ordering::SeqCst);
+        self.shared.phone_quiet.store(false, Ordering::SeqCst);
+        *self.shared.phone_asked.lock().unwrap() = on.then(Instant::now);
+        self.send(vec![MSG_MODE, u8::from(on)]);
+    }
+
+    /// Kullanıcı bağlantıyı kesti: bir sonraki bağlanış Mac ekranıyla başlar.
+    pub fn clear_phone(&self) {
+        self.shared.phone.store(false, Ordering::SeqCst);
+        *self.shared.phone_asked.lock().unwrap() = None;
+    }
+
+    /// Zamanlayıcıdan: istek birkaç saniyede yanıtlanmadıysa Mac'teki ajan bu kipi bilmiyordur.
+    pub fn check_phone_answer(&self) {
+        let mut asked = self.shared.phone_asked.lock().unwrap();
+        if asked.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) && self.connected() {
+            *asked = None;
+            self.shared.phone.store(false, Ordering::SeqCst);
+            *self.shared.note.lock().unwrap() =
+                Some("Mac'teki Ayna Ajan bu özelliği bilmiyor: Mac'te menüden \"Güncellemeleri denetle\".".into());
+            post_files(self.notify.0 as isize, FILES_NOTE);
+        }
+    }
+
+    pub fn phone(&self) -> bool {
+        self.shared.phone.load(Ordering::SeqCst)
     }
 
     pub fn take_note(&self) -> Option<String> {
@@ -711,6 +754,11 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     if shared.player.lock().unwrap().is_some() {
         let _ = tx.send(vec![MSG_KEYFRAME]);
     }
+    if shared.phone.load(Ordering::SeqCst) {
+        shared.phone_quiet.store(true, Ordering::SeqCst);
+        *shared.phone_asked.lock().unwrap() = Some(Instant::now());
+        let _ = tx.send(vec![MSG_MODE, 1]);
+    }
     drop(tx);
     // Ortak zaman başlangıcı: yoklama (ping) zaman damgası yanıtla (pong) geri gelir, gidiş-dönüş
     // süresi ölçülür (Mac'te biriken gönderim kuyruğu da bunda görünür).
@@ -759,6 +807,21 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
             }
             MSG_BYE => return Ok(true),
+            MSG_STATE if plain.len() >= 3 => {
+                let (mode, ok) = (plain[1], plain[2] == 1);
+                *shared.phone_asked.lock().unwrap() = None;
+                // Mac iPhone kipini açamadıysa ya da kipten çıktıysa istek düşer.
+                if !ok || mode == 0 {
+                    shared.phone.store(false, Ordering::SeqCst);
+                }
+                let text: String = String::from_utf8_lossy(&plain[3..]).chars().take(200).collect();
+                let quiet = ok && shared.phone_quiet.load(Ordering::SeqCst);
+                if !text.is_empty() && !quiet {
+                    util::log(&format!("Mac iPhone kipi: {text}"));
+                    *shared.note.lock().unwrap() = Some(text);
+                    post_files(notify, FILES_NOTE);
+                }
+            }
             MSG_DRAG_LIST..=MSG_PUT_DONE => receive_file_message(shared, &plain, notify),
             _ => {}
         }

@@ -22,6 +22,9 @@
 //   Mac yanıtı: "AYNA2 WAIT" … "AYNA2 OK NEW|SAME <HMAC(anahtar, "ok|T")>" | DENY | OFF | BUSY.
 // - Şifreli çerçeveler: u32 uzunluk || şifreli metin || etiket.
 //   nonce = 4 sıfır bayt || u64 sayaç (yön başına).
+// - iPhone kipi: Windows → Mac 0x18 MODE [0 Mac ekranı | 1 iPhone]; Mac → Windows 0x05 STATE
+//   [kip][başarılı][metin]. iPhone kipinde görüntü ve fare, görünmez bir sanal ekranda açılan
+//   iPhone Mirroring penceresine aittir.
 // - Dosyalar (Windows → Mac): 0x20 PUT_BEGIN [toplu][no][boy u64][x][y][ad uz.][göreli ad],
 //   0x21 PUT_DATA [no][veri], 0x22 PUT_END [no]; Mac her dosyadan sonra 0x35 PUT_DONE
 //   [toplu][biten sayısı][hedef klasör]. Hedef, bırakılan noktadaki Finder penceresi ya da Masaüstü.
@@ -265,14 +268,35 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
     let onFrame: (Data, Bool) -> Void
     let onSize: (Int, Int) -> Void
     let onError: (String) -> Void
+    /// Verilirse ana ekran yerine bu ekranın bu bölümü (nokta, ekrana göre) yakalanır: iPhone kipinde
+    /// görünmez ekrandaki iPhone Mirroring penceresi.
+    let region: (display: SCDisplay, rect: CGRect, scale: CGFloat)?
+    /// Durdurulduktan sonra (kodlayıcıda kalan kareler dahil) hiçbir şey dışarı verilmez: yeni
+    /// yakalayıcının boyut iletisinden sonra eski boyutta kare gitmesin.
+    private let deadLock = NSLock()
+    private var dead = false
+    private var isDead: Bool {
+        deadLock.lock()
+        defer { deadLock.unlock() }
+        return dead
+    }
 
-    init(onFrame: @escaping (Data, Bool) -> Void, onSize: @escaping (Int, Int) -> Void, onError: @escaping (String) -> Void) {
+    init(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)? = nil, paused: Bool = false,
+         onFrame: @escaping (Data, Bool) -> Void, onSize: @escaping (Int, Int) -> Void, onError: @escaping (String) -> Void) {
+        self.region = region
+        self.paused = paused
         self.onFrame = onFrame
         self.onSize = onSize
         self.onError = onError
     }
 
     func start() {
+        if let region {
+            let pixels = (Int(region.rect.width * region.scale), Int(region.rect.height * region.scale))
+            begin(filter: SCContentFilter(display: region.display, excludingWindows: []), pixels: pixels, cursor: false,
+                  source: region.rect)
+            return
+        }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, _ in
             guard let self else { return }
             guard let content,
@@ -287,47 +311,55 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 pw = mode.pixelWidth
                 ph = mode.pixelHeight
             }
-            let scale = min(1.0, Double(maxVideoSide) / Double(max(pw, ph)))
-            let w = Int(Double(pw) * scale) & ~1, h = Int(Double(ph) * scale) & ~1
-            let config = SCStreamConfiguration()
-            config.width = w
-            config.height = h
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
-            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            config.showsCursor = true
-            config.queueDepth = 5
-            let filter = SCContentFilter(display: display, excludingWindows: [])
-            let stream = SCStream(filter: filter, configuration: config, delegate: self)
-            do {
-                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
-            } catch {
-                self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
-                return
-            }
-            // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
-            let proceed: Bool = self.queue.sync {
-                guard !self.stopped else { return false }
-                self.makeEncoder(width: w, height: h)
-                self.scStream = stream
-                return true
-            }
-            guard proceed else { return }
-            stream.startCapture { [weak self] error in
-                guard let self else { return }
-                if let error {
-                    self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
-                    return
-                }
-                // Başlarken durdurulduysa hemen kapat.
-                self.queue.async {
-                    if self.stopped { stream.stopCapture(completionHandler: nil) }
-                }
-            }
-            self.onSize(w, h)
+            self.begin(filter: SCContentFilter(display: display, excludingWindows: []), pixels: (pw, ph), cursor: true)
         }
     }
 
+    private func begin(filter: SCContentFilter, pixels: (Int, Int), cursor: Bool, source: CGRect? = nil) {
+        let (pw, ph) = (max(pixels.0, 2), max(pixels.1, 2))
+        let scale = min(1.0, Double(maxVideoSide) / Double(max(pw, ph)))
+        let w = Int(Double(pw) * scale) & ~1, h = Int(Double(ph) * scale) & ~1
+        let config = SCStreamConfiguration()
+        config.width = w
+        config.height = h
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.showsCursor = cursor
+        config.queueDepth = 5
+        if let source { config.sourceRect = source }
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        do {
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+        } catch {
+            self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+            return
+        }
+        // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
+        let proceed: Bool = self.queue.sync {
+            guard !self.stopped else { return false }
+            self.makeEncoder(width: w, height: h)
+            self.scStream = stream
+            return true
+        }
+        guard proceed else { return }
+        stream.startCapture { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+                return
+            }
+            // Başlarken durdurulduysa hemen kapat.
+            self.queue.async {
+                if self.stopped { stream.stopCapture(completionHandler: nil) }
+            }
+        }
+        if !isDead { self.onSize(w, h) }
+    }
+
     func stop() {
+        deadLock.lock()
+        dead = true
+        deadLock.unlock()
         queue.async {
             self.stopped = true
             self.scStream?.stopCapture(completionHandler: nil)
@@ -382,6 +414,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        guard !isDead else { return }
         onError("Ekran yakalama durdu: \(error.localizedDescription)")
     }
 
@@ -396,8 +429,8 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         VTCompressionSessionEncodeFrame(e, imageBuffer: pb, presentationTimeStamp: CMTime(value: frameIndex, timescale: 60),
                                         duration: .invalid, frameProperties: props, infoFlagsOut: nil) { [weak self] status, _, sbuf in
-            guard status == noErr, let sbuf, let frame = Capturer.annexB(sbuf) else { return }
-            self?.onFrame(frame.0, frame.1)
+            guard let self, !self.isDead, status == noErr, let sbuf, let frame = Capturer.annexB(sbuf) else { return }
+            self.onFrame(frame.0, frame.1)
         }
     }
 
@@ -480,6 +513,8 @@ final class Injector {
     private var finderCut: Int?
 
     var leftDown: Bool { buttons.contains(0) }
+    /// iPhone kipi: koordinatlar bu alana (iPhone Mirroring penceresi, genel koordinat) eşlenir.
+    var area: (() -> CGRect?)?
 
     /// Basılı değiştirici tuşlardan (sol/sağ ayrı) bayraklar.
     private var flags: CGEventFlags {
@@ -488,9 +523,17 @@ final class Injector {
         return f
     }
 
-    private func point(_ x: UInt16, _ y: UInt16) -> CGPoint {
-        let b = CGDisplayBounds(CGMainDisplayID())
-        return CGPoint(x: b.minX + CGFloat(x) / 65535 * b.width, y: b.minY + CGFloat(y) / 65535 * b.height)
+    /// iPhone kipinde pencerenin yeri bilinmiyorsa (açılıyor, taşınıyor) nil: fare Mac masaüstüne gitmez.
+    private func point(_ x: UInt16, _ y: UInt16) -> CGPoint? {
+        let b: CGRect
+        if let area {
+            guard let r = area() else { return nil }
+            b = r
+        } else {
+            b = CGDisplayBounds(CGMainDisplayID())
+        }
+        return CGPoint(x: min(b.minX + CGFloat(x) / 65535 * b.width, b.maxX - 1),
+                       y: min(b.minY + CGFloat(y) / 65535 * b.height, b.maxY - 1))
     }
 
     func move(_ x: UInt16, _ y: UInt16) {
@@ -499,13 +542,15 @@ final class Injector {
         else if buttons.contains(1) { (type, button) = (.rightMouseDragged, .right) }
         else if buttons.contains(2) { (type, button) = (.otherMouseDragged, .center) }
         else { (type, button) = (.mouseMoved, .left) }
-        let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point(x, y), mouseButton: button)
+        guard let p = point(x, y) else { return }
+        let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button)
         e?.flags = flags
         e?.post(tap: .cghidEventTap)
     }
 
     func button(_ b: UInt8, down: Bool, _ x: UInt16, _ y: UInt16) {
-        let p = point(x, y)
+        // Bırakış hiç düşürülmez (düğme basılı kalmasın): yer bilinmiyorsa imlecin olduğu yerde.
+        guard let p = point(x, y) ?? (down ? nil : CGEvent(source: nil)?.location) else { return }
         let (downType, upType, mb): (CGEventType, CGEventType, CGMouseButton) = switch b {
         case 0: (.leftMouseDown, .leftMouseUp, .left)
         case 1: (.rightMouseDown, .rightMouseUp, .right)
@@ -891,6 +936,238 @@ enum Files {
     }
 }
 
+// MARK: - iPhone Mirroring (görünmez ekranda)
+
+/// iPhone Mirroring'i Mac'in hiçbir monitöründe görünmeyen bir sanal ekranda açar; yalnız o ekranın
+/// pencereye düşen bölümü Windows'a gönderilir. Bitince uygulama kapatılır; sanal ekran ancak uygulama
+/// gerçekten kapandıktan sonra kaldırılır (önce kalksa pencere ana ekrana düşerdi).
+final class PhoneMirror {
+    static let bundleID = "com.apple.ScreenContinuity"
+    /// Uygulamanın kapanmasını bekleyen sanal ekranlar.
+    private static var parked: [CGVirtualDisplay] = []
+    private var display: CGVirtualDisplay?
+    private var timer: Timer?
+    private let started = Date()
+    /// Açılış isteği sonuçlandı (o zamana dek uygulama listede görünmeyebilir).
+    private var openFinished = false
+    private var seenRunning = false
+    private var moveStarted: Date?
+    private var windowID: CGWindowID?
+    /// En son bildirilen bölge (ekrana göre) ve iki ölçümdür aynı kalan aday (boyut animasyonu biter).
+    private var reported = CGRect.null
+    private var candidate = CGRect.null
+    private var lookingUp = false
+    private var finished = false
+    /// Pencerenin şu anki yeri (genel koordinat); fare buna eşlenir. Bilinmiyorsa nil.
+    private(set) var frame: CGRect?
+    /// Sanal ekranın piksel/nokta oranı.
+    private var scale: CGFloat = 2
+    let onReady: (SCDisplay, CGRect, CGFloat) -> Void
+    let onError: (String) -> Void
+
+    init(onReady: @escaping (SCDisplay, CGRect, CGFloat) -> Void, onError: @escaping (String) -> Void) {
+        self.onReady = onReady
+        self.onError = onError
+    }
+
+    func start() {
+        guard AXIsProcessTrusted() else {
+            fail("Erişilebilirlik izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik > Ayna Ajan).")
+            return
+        }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
+            fail("Bu Mac'te iPhone Mirroring yok (macOS 15 Sequoia ve Apple çipli Mac gerekir).")
+            return
+        }
+        guard let d = Self.makeDisplay() else {
+            fail("Görünmez ekran açılamadı.")
+            return
+        }
+        display = d
+        if let mode = CGDisplayCopyDisplayMode(d.displayID), mode.width > 0 {
+            scale = CGFloat(mode.pixelWidth) / CGFloat(mode.width)
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] _, error in
+            DispatchQueue.main.async {
+                self?.openFinished = true
+                if let error { self?.fail("iPhone Mirroring açılamadı: \(error.localizedDescription)") }
+            }
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+    }
+
+    /// Uygulamayı kapatır; sanal ekran uygulama kapanınca kaldırılır.
+    func stop() {
+        guard !finished else { return }
+        finished = true
+        frame = nil
+        timer?.invalidate()
+        timer = nil
+        guard let d = display else { return }
+        display = nil
+        Self.parked.append(d)
+        let begun = Date()
+        let openFinished = { [weak self] in self?.openFinished ?? true }
+        func check() {
+            let waited = Date().timeIntervalSince(begun)
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: PhoneMirror.bundleID).filter { !$0.isTerminated }
+            for app in apps { _ = waited > 3 ? app.forceTerminate() : app.terminate() }
+            // Açılış isteği sonuçlanmadıysa uygulama birazdan belirebilir: o da kapatılana dek beklenir.
+            if (apps.isEmpty && (openFinished() || waited > 8)) || waited > 20 {
+                PhoneMirror.parked.removeAll { $0 === d }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { check() }
+        }
+        check()
+    }
+
+    /// Ayna Ajan kapanırken (sanal ekran süreçle birlikte gider): önce iPhone Mirroring kapatılır.
+    static func shutdown() {
+        guard !parked.isEmpty else { return }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).filter { !$0.isTerminated }
+            if apps.isEmpty { return }
+            apps.forEach { $0.terminate() }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).forEach { $0.forceTerminate() }
+    }
+
+    /// Klavye iPhone Mirroring'e gitsin. Öndeyse true; değilse Erişilebilirlikle öne alınır (false).
+    func focus() -> Bool {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first else { return false }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return true }
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), kAXFrontmostAttribute as CFString,
+                                     kCFBooleanTrue)
+        return false
+    }
+
+    private func fail(_ message: String) {
+        guard !finished else { return }
+        onError(message)
+    }
+
+    private func tick() {
+        guard let display, !finished else { return }
+        let id = display.displayID
+        let elapsed = Date().timeIntervalSince(started)
+        let bounds = CGDisplayBounds(id)
+        // Sanal ekran hazır olmadan taşınırsa pencere ana ekranda bir yere gider.
+        guard CGDisplayIsActive(id) != 0, bounds.width >= 300, bounds.height >= 300 else {
+            if elapsed > 10 { fail("Görünmez ekran hazır olmadı.") }
+            return
+        }
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first(where: { !$0.isTerminated })
+        else {
+            if seenRunning { fail("iPhone Mirroring kapandı.") } else if elapsed > 20 { fail("iPhone Mirroring açılmadı.") }
+            return
+        }
+        seenRunning = true
+        guard let found = Self.mainWindow(pid: app.processIdentifier) else {
+            if windowID == nil && elapsed > 30 { fail("iPhone Mirroring penceresi bulunamadı.") }
+            return
+        }
+        let (wid, rect) = found
+        // Pencere görünmez ekranda değilse oraya taşınır (açılışta ve sistem/kullanıcı taşırsa).
+        if !bounds.contains(CGPoint(x: rect.midX, y: rect.midY)) {
+            frame = nil
+            let since = moveStarted ?? Date()
+            moveStarted = since
+            if Date().timeIntervalSince(since) > 10 {
+                fail("iPhone Mirroring penceresi görünmez ekrana taşınamadı.")
+            } else {
+                Self.move(pid: app.processIdentifier, to: CGPoint(x: bounds.minX + 40, y: bounds.minY + 40))
+            }
+            return
+        }
+        moveStarted = nil
+        frame = rect
+        let local = rect.offsetBy(dx: -bounds.minX, dy: -bounds.minY)
+        guard wid != windowID || local != reported else {
+            candidate = .null
+            return
+        }
+        // Yeni yer/boyut iki ölçümde aynı kalınca bildirilir (boyut animasyonunda yakalama yeniden başlamasın).
+        guard candidate == local else {
+            candidate = local
+            return
+        }
+        guard !lookingUp else { return }
+        lookingUp = true
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            let found = content?.displays.first(where: { $0.displayID == id })
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.lookingUp = false
+                // Bulunamadıysa bir sonraki ölçümde yeniden denenir.
+                guard !self.finished, let found else { return }
+                self.windowID = wid
+                self.reported = local
+                self.candidate = .null
+                self.onReady(found, local, self.scale)
+            }
+        }
+    }
+
+    /// Uygulamanın en büyük olağan penceresi (katman 0).
+    private static func mainWindow(pid: pid_t) -> (CGWindowID, CGRect)? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return nil }
+        var best: (CGWindowID, CGRect)?
+        for w in list {
+            guard (w[kCGWindowOwnerPID as String] as? Int).map({ pid_t($0) }) == pid,
+                  (w[kCGWindowLayer as String] as? Int) == 0,
+                  let id = (w[kCGWindowNumber as String] as? Int).map({ CGWindowID($0) }),
+                  let b = w[kCGWindowBounds as String], let r = CGRect(dictionaryRepresentation: b as! CFDictionary),
+                  r.width > 100, r.height > 100 else { continue }
+            if best == nil || r.width * r.height > best!.1.width * best!.1.height { best = (id, r) }
+        }
+        return best
+    }
+
+    private static func move(pid: pid_t, to point: CGPoint) {
+        let app = AXUIElementCreateApplication(pid)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return }
+        var p = point
+        guard let position = AXValueCreate(.cgPoint, &p) else { return }
+        for w in windows {
+            AXUIElementSetAttributeValue(w, kAXPositionAttribute as CFString, position)
+        }
+    }
+
+    /// 900×1000 noktalık Retina sanal ekran (iPhone penceresine yeter).
+    private static func makeDisplay() -> CGVirtualDisplay? {
+        guard NSClassFromString("CGVirtualDisplay") != nil else { return nil }
+        let descriptor = CGVirtualDisplayDescriptor()
+        if descriptor.responds(to: NSSelectorFromString("setDispatchQueue:")) {
+            descriptor.setDispatchQueue(DispatchQueue.main)
+        } else if descriptor.responds(to: NSSelectorFromString("setQueue:")) {
+            descriptor.queue = DispatchQueue.main
+        } else {
+            return nil
+        }
+        descriptor.name = "Ayna iPhone"
+        descriptor.maxPixelsWide = 1800
+        descriptor.maxPixelsHigh = 2000
+        descriptor.sizeInMillimeters = CGSize(width: 300, height: 333)
+        descriptor.vendorID = 0x4159
+        descriptor.productID = 0x0001
+        descriptor.serialNum = 0x0001
+        guard let display = CGVirtualDisplay(descriptor: descriptor) else { return nil }
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = 1
+        settings.modes = [CGVirtualDisplayMode(width: 1800, height: 2000, refreshRate: 60)]
+        guard display.apply(settings), display.displayID != 0 else { return nil }
+        return display
+    }
+}
+
 // MARK: - Oturum
 
 final class Session {
@@ -915,6 +1192,11 @@ final class Session {
     private var inFlight = 0
     private var needKey = false
     private var capturer: Capturer?
+    /// iPhone kipindeyken görünmez ekrandaki iPhone Mirroring.
+    private var phone: PhoneMirror?
+    private var phoneAnnounced = false
+    /// Windows penceresi gizli: görüntü durur (yeni yakalayıcıya da geçer).
+    private var videoPaused = false
     private let injector = Injector()
     private var lastData = Date()
     private var watchdog: Timer?
@@ -1190,17 +1472,79 @@ final class Session {
         stage = .streaming
         lastData = Date()
         app?.sessionStarted(self)
+        startCapture(region: nil)
+        process()
+    }
+
+    /// Ana ekranı (ya da iPhone kipinde görünmez ekrandaki iPhone Mirroring penceresini) yakalamaya başlar.
+    private func startCapture(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)?) {
+        capturer?.stop()
         let cap = Capturer(
+            region: region,
+            paused: videoPaused,
             onFrame: { [weak self] data, key in self?.sendVideo(data, key: key) },
             onSize: { [weak self] w, h in
                 self?.send(Data([0x02] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
             },
             onError: { [weak self] message in
-                DispatchQueue.main.async { self?.app?.show(error: message) }
+                DispatchQueue.main.async {
+                    // iPhone kipinde pencere kapanması zaten iPhone Mirroring izlenerek bildirilir; Mac
+                    // ekranında uyarı açılmaz.
+                    guard let self, self.phone == nil else { return }
+                    self.app?.show(error: message)
+                }
             })
         capturer = cap
         cap.start()
-        process()
+    }
+
+    // --- iPhone kipi
+
+    private func setPhoneMode(_ on: Bool) {
+        guard on != (phone != nil) else {
+            // Yinelenen istek de yanıtlanır (Windows yanıt bekler).
+            sendState(mode: on ? 1 : 0, ok: true, "")
+            return
+        }
+        if on {
+            let p = PhoneMirror(
+                onReady: { [weak self] display, rect, scale in self?.phoneReady(display, rect, scale) },
+                onError: { [weak self] message in self?.phoneFailed(message) })
+            phone = p
+            phoneAnnounced = false
+            injector.area = { [weak p] in p?.frame }
+            sendState(mode: 1, ok: true, "iPhone Mirroring açılıyor…")
+            p.start()
+        } else {
+            phone?.stop()
+            phone = nil
+            injector.area = nil
+            startCapture(region: nil)
+            sendState(mode: 0, ok: true, "")
+        }
+    }
+
+    private func phoneReady(_ display: SCDisplay, _ rect: CGRect, _ scale: CGFloat) {
+        guard let phone, stage == .streaming else { return }
+        startCapture(region: (display, rect, scale))
+        _ = phone.focus()
+        if !phoneAnnounced {
+            phoneAnnounced = true
+            sendState(mode: 1, ok: true, "iPhone hazır")
+        }
+    }
+
+    private func phoneFailed(_ message: String) {
+        guard phone != nil else { return }
+        phone?.stop()
+        phone = nil
+        injector.area = nil
+        if stage == .streaming { startCapture(region: nil) }
+        sendState(mode: 0, ok: false, message)
+    }
+
+    private func sendState(mode: UInt8, ok: Bool, _ text: String) {
+        send(Data([0x05, mode, ok ? 1 : 0]) + Data(text.utf8))
     }
 
     // --- Oturum mesajları
@@ -1221,15 +1565,21 @@ final class Session {
         case 0x12 where b.count >= 5:
             injector.scroll(dx: Int16(bitPattern: readBE16(m, 1)), dy: Int16(bitPattern: readBE16(m, 3)))
         case 0x13 where b.count >= 4:
+            // iPhone kipinde tuş basışı yalnız iPhone Mirroring öndeyken gider (yoksa öne alınır, basış
+            // düşer); bırakış her zaman gider (tuş basılı kalmasın).
+            if b[3] == 1, let phone, !phone.focus() { return }
             injector.key(readBE16(m, 1), down: b[3] == 1)
         case 0x14:
             capturer?.requestKeyframe()
         case 0x15 where b.count >= 9:
             send(Data([0x03]) + m.dropFirst().prefix(8))
         case 0x16 where b.count >= 2:
-            capturer?.setPaused(b[1] == 1)
+            videoPaused = b[1] == 1
+            capturer?.setPaused(videoPaused)
         case 0x17:
             close()
+        case 0x18 where b.count >= 2:
+            setPhoneMode(b[1] == 1)
         case 0x20 where b.count >= 23:
             putBegin(b)
         case 0x21 where b.count >= 5:
@@ -1401,6 +1751,9 @@ final class Session {
         watchdog?.invalidate()
         capturer?.stop()
         capturer = nil
+        phone?.stop()
+        phone = nil
+        injector.area = nil
         injector.releaseAll()
         sendQueue.async { [self] in filesCancelled = true }
         fileQueue.async { [self] in
@@ -1900,6 +2253,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quit() {
         active?.close()
         NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        PhoneMirror.shutdown()
     }
 
     /// Uyarı, GCD ana kuyruğunun dışında açılır (açıkken oturumun ağ olayları durmasın).

@@ -17,6 +17,7 @@ for arch in arm64 x86_64; do
     swiftc -O -target "$arch-apple-macos13.0" \
         -framework AppKit -framework Network -framework ServiceManagement \
         -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CryptoKit -framework Security \
+        -framework CoreGraphics -import-objc-header Sources/VirtualDisplay.h \
         -o "$OUT/AynaAjan-$arch" Sources/main.swift
 done
 lipo -create -output "$APP/Contents/MacOS/AynaAjan" "$OUT/AynaAjan-arm64" "$OUT/AynaAjan-x86_64"

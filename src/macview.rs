@@ -139,6 +139,7 @@ pub fn disconnect() {
     with(|v| {
         v.user_closed = true;
         v.reconnect_at = None;
+        v.mac.clear_phone();
         v.mac.disconnect();
     });
     refresh(main_hwnd());
@@ -725,6 +726,7 @@ fn form_layout(c: &RECT, s: f32) -> Form {
 
 impl View {
     fn tick(&mut self) -> After {
+        self.mac.check_phone_answer();
         // Kendiliğinden yeniden bağlanma: koptuysa (kullanıcı kesmediyse) artan aralıkla.
         let state = self.mac.state();
         let connected = matches!(state, State::Connected(_));
@@ -1147,15 +1149,36 @@ struct Sizer {
     fonts: Fonts,
     dragging: bool,
     hover_button: bool,
+    hover_phone: bool,
 }
 
 const SIZER_W: f32 = 300.0;
-const SIZER_H: f32 = 150.0;
+const SIZER_H: f32 = 194.0;
 
-fn sizer_layout(s: f32) -> ([f32; 4], [f32; 4]) {
+/// Kaydırıcı, iPhone düğmesi, bağlantı düğmesi.
+fn sizer_layout(s: f32) -> ([f32; 4], [f32; 4], [f32; 4]) {
     let slider = [20.0 * s, 64.0 * s, (SIZER_W - 20.0) * s, 84.0 * s];
-    let button = [16.0 * s, 102.0 * s, (SIZER_W - 16.0) * s, 136.0 * s];
-    (slider, button)
+    let phone = [16.0 * s, 102.0 * s, (SIZER_W - 16.0) * s, 136.0 * s];
+    let button = [16.0 * s, 146.0 * s, (SIZER_W - 16.0) * s, 180.0 * s];
+    (slider, phone, button)
+}
+
+/// iPhone kipini açar/kapatır; bağlı değilse önce bağlanılır (kip bağlanınca uygulanır).
+fn toggle_phone() {
+    // Eşleşilmiş bir Mac yoksa önce kod girilmeli: kip istenmez, yalnız pencere açılır.
+    if !connected() && saved_code().filter(|c| Mac::paired(c)).is_none() {
+        open();
+        return;
+    }
+    let on = with(|v| {
+        let on = !v.mac.phone();
+        v.mac.set_phone(on);
+        on
+    })
+    .unwrap_or(false);
+    if on {
+        open();
+    }
 }
 
 fn hide_sizer() {
@@ -1205,7 +1228,8 @@ unsafe fn show_sizer() {
             let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
             let scale = util::scale(h);
             SIZER.with(|c| {
-                *c.borrow_mut() = Some(Sizer { hwnd: h, scale, fonts: Fonts::new(scale), dragging: false, hover_button: false })
+                *c.borrow_mut() =
+                    Some(Sizer { hwnd: h, scale, fonts: Fonts::new(scale), dragging: false, hover_button: false, hover_phone: false })
             });
             h
         }
@@ -1220,6 +1244,9 @@ unsafe fn show_sizer() {
     let s = util::scale(hwnd);
     SIZER.with(|c| {
         if let Some(z) = c.borrow_mut().as_mut() {
+            z.dragging = false;
+            z.hover_button = false;
+            z.hover_phone = false;
             if (z.scale - s).abs() > 0.01 {
                 z.fonts.delete();
                 z.fonts = Fonts::new(s);
@@ -1237,7 +1264,7 @@ unsafe fn show_sizer() {
 }
 
 fn sizer_value(s: f32, x: i32) -> u32 {
-    let (sl, _) = sizer_layout(s);
+    let (sl, _, _) = sizer_layout(s);
     let t = ((x as f32 - sl[0]) / (sl[2] - sl[0])).clamp(0.0, 1.0);
     let v = SIZE_MIN as f32 + t * (SIZE_MAX - SIZE_MIN) as f32;
     ((v / 5.0).round() as u32 * 5).clamp(SIZE_MIN, SIZE_MAX)
@@ -1276,13 +1303,16 @@ unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point(lp);
-            let (sl, bt) = sizer_layout(s);
+            let (sl, ph, bt) = sizer_layout(s);
             let grab = [sl[0] - 12.0 * s, sl[1] - 10.0 * s, sl[2] + 12.0 * s, sl[3] + 10.0 * s];
             if hit(&grab, x, y) {
                 SIZER.with(|c| c.borrow_mut().as_mut().map(|z| z.dragging = true));
                 SetCapture(hwnd);
                 set_size(sizer_value(s, x));
                 hub::invalidate(hwnd);
+            } else if hit(&ph, x, y) {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                toggle_phone();
             } else if hit(&bt, x, y) {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 if connected() {
@@ -1300,12 +1330,13 @@ unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 set_size(sizer_value(s, x));
                 hub::invalidate(hwnd);
             } else {
-                let (_, bt) = sizer_layout(s);
-                let over = hit(&bt, x, y);
+                let (_, ph, bt) = sizer_layout(s);
+                let (over, over_phone) = (hit(&bt, x, y), hit(&ph, x, y));
                 let changed = SIZER.with(|c| {
                     c.borrow_mut().as_mut().is_some_and(|z| {
-                        let ch = z.hover_button != over;
+                        let ch = z.hover_button != over || z.hover_phone != over_phone;
                         z.hover_button = over;
+                        z.hover_phone = over_phone;
                         ch
                     })
                 });
@@ -1336,8 +1367,10 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
     }
     let p = palette(false);
     let pct = size_percent();
-    let (sl, bt) = sizer_layout(s);
-    let (dragging, hover) = SIZER.with(|c| c.borrow().as_ref().map_or((false, false), |z| (z.dragging, z.hover_button)));
+    let (sl, ph, bt) = sizer_layout(s);
+    let (dragging, hover, hover_phone) =
+        SIZER.with(|c| c.borrow().as_ref().map_or((false, false, false), |z| (z.dragging, z.hover_button, z.hover_phone)));
+    let phone_on = with(|v| v.mac.phone()).unwrap_or(false);
     let mut c = Canvas::new(w as usize, h as usize);
     c.fill_background(p.card, 1.0);
     let t = (pct - SIZE_MIN) as f32 / (SIZE_MAX - SIZE_MIN) as f32;
@@ -1345,13 +1378,16 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
     let is_connected = connected();
     let color = if is_connected { p.danger } else { p.accent };
     card_bg_alpha(&mut c, bt, color, 10.0 * s, if hover { 0.9 } else { 1.0 });
+    card_bg_alpha(&mut c, ph, p.field, 10.0 * s, if hover_phone { 0.8 } else { 1.0 });
     let label = if is_connected { "Bağlantıyı kes" } else { "Mac ekranını aç" };
+    let phone_label = if phone_on { "Mac ekranına dön" } else { "iPhone'u Mac üzerinden göster" };
     SIZER.with(|cell| {
         if let Some(z) = cell.borrow().as_ref() {
             hub::blit(hwnd, w, h, &c, |mem| {
                 text(mem, z.fonts.name, p.text, "Mac ekran boyutu", [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_LEFT);
                 text(mem, z.fonts.body, p.secondary, &format!("%{pct}"), [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_RIGHT);
                 text(mem, z.fonts.body, [1.0, 1.0, 1.0], label, bt, DT_CENTER);
+                text(mem, z.fonts.body, p.text, phone_label, ph, DT_CENTER);
             });
         }
     });
