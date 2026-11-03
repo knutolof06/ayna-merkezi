@@ -29,7 +29,9 @@ iPhone için ek donanım ya da uygulama gerekmez; Mac'te yalnız bu projenin kü
 
 ## Kullanım
 
-1. `iPhoneAyna.exe`'yi çalıştırın (yanında `bin\uxplay` klasörü olmalı).
+1. [Son sürümden](../../releases/latest) **`AynaMerkezi-Windows.zip`**'i indirip açın ve `iPhoneAyna.exe`'yi açılan
+   klasörden çalıştırın. Yanında `bin\uxplay` klasörü olmalı (AirPlay alıcısı ve Mac ekranının görüntü çözücüsü);
+   sürümdeki tek başına `iPhoneAyna.exe` güncelleme dosyasıdır.
 2. **Yansıtma:** iPhone ile PC aynı Wi-Fi'de olsun. iPhone'da Denetim Merkezi → Ekran Yansıtma → **Ayna**.
 3. **Kontrol (bir kez):**
    - iPhone Ayarlar → Bluetooth → bilgisayarın adını (ör. `MASAUSTU-PC`) eşleyin. Daha önce eşlediyseniz önce

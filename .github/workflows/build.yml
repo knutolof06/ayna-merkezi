@@ -34,10 +34,28 @@ jobs:
         run: |
           cargo build --release --locked
           cp target/release/iphone-ayna.exe iPhoneAyna.exe
+      # Ready-to-run package: the app plus the AirPlay receiver and video decoder it needs (bin/uxplay),
+      # taken from a pinned uxplay-windows release and checked against its SHA-256.
+      - name: Package (app + UxPlay)
+        shell: bash
+        env:
+          UXPLAY_URL: https://github.com/leapbtw/uxplay-windows/releases/download/2.0.0.1736/uxplay-windows.zip
+          UXPLAY_SHA256: 9d3a51c15fc9db857351195e7eb7bbb21700d9ae25d936a54bcf8536b62cca18
+        run: |
+          curl -fsSL -o uxplay.zip "$UXPLAY_URL"
+          echo "$UXPLAY_SHA256  uxplay.zip" | sha256sum -c -
+          mkdir -p AynaMerkezi/bin/uxplay
+          7z x -y uxplay.zip -oAynaMerkezi/bin/uxplay > /dev/null
+          test -f AynaMerkezi/bin/uxplay/uxplay-windows.exe
+          cp iPhoneAyna.exe AynaMerkezi/
+          7z a -tzip -mx=7 AynaMerkezi-Windows.zip AynaMerkezi > /dev/null
+          ls -la AynaMerkezi-Windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: AynaMerkezi-windows
-          path: iPhoneAyna.exe
+          path: |
+            iPhoneAyna.exe
+            AynaMerkezi-Windows.zip
 
   mac:
     name: macOS (Ayna Ajan)
@@ -81,7 +99,7 @@ jobs:
           openssl pkcs12 -in sign.p12 -nocerts -nodes -legacy -passin env:MAC_SIGN_PASSWORD -out key.pem
           openssl pkcs12 -in sign.p12 -nokeys -legacy -passin env:MAC_SIGN_PASSWORD | openssl x509 -pubkey -noout > pub.pem
           rm -f sign.p12
-          { echo "AYNA-SURUM ${AYNA_BUILD}"; sha256sum iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg; } > manifest.txt
+          { echo "AYNA-SURUM ${AYNA_BUILD}"; sha256sum iPhoneAyna.exe AynaMerkezi-Windows.zip AynaAjan.zip AynaAjan.dmg; } > manifest.txt
           openssl dgst -sha256 -sign key.pem -out manifest.bin manifest.txt
           rm -f key.pem
           openssl dgst -sha256 -verify pub.pem -signature manifest.bin manifest.txt
@@ -96,13 +114,13 @@ jobs:
           {
             echo "Ayna Merkezi (Windows) and Ayna Ajan (Mac), version ${AYNA_BUILD}."
             echo
-            echo "- Windows: iPhoneAyna.exe (keep it next to the bin/uxplay folder)"
+            echo "- Windows: download **AynaMerkezi-Windows.zip**, extract it and run iPhoneAyna.exe from the extracted folder (it contains bin/uxplay). iPhoneAyna.exe alone is the update file."
             echo "- Mac: AynaAjan.dmg"
             echo
             echo "Installed apps update themselves. Signed manifest (SHA-256):"
             echo
             sed 's/^/    /' manifest.txt
           } > notes.md
-          gh release create "v${AYNA_BUILD}" iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
+          gh release create "v${AYNA_BUILD}" AynaMerkezi-Windows.zip iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "Version ${AYNA_BUILD}" --notes-file notes.md

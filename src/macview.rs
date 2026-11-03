@@ -1219,6 +1219,20 @@ impl View {
                 let _ = GetClientRect(self.hwnd, &mut c);
                 let dc = GetDC(self.hwnd);
                 FillRect(dc, &c, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+                // Çözücü yoksa görüntü hiç gelmez: siyah ekran yerine nedeni yazılır.
+                if !gst::available() {
+                    let note = t(
+                        "Mac'e bağlı, ama görüntü çözücü bulunamadı (bin\\uxplay klasörü yok).\n\nGitHub'daki AynaMerkezi-Windows.zip'i indirip açın ve iPhoneAyna.exe'yi o klasörden çalıştırın.",
+                        "Connected to the Mac, but the video decoder was not found (no bin\\uxplay folder).\n\nDownload AynaMerkezi-Windows.zip from GitHub, extract it and run iPhoneAyna.exe from that folder.",
+                    );
+                    let mut r = RECT { left: c.left + 40, top: c.top + 40, right: c.right - 40, bottom: c.bottom - 40 };
+                    let mut text: Vec<u16> = note.encode_utf16().collect();
+                    let old = SelectObject(dc, self.fonts.body);
+                    SetBkMode(dc, TRANSPARENT);
+                    SetTextColor(dc, COLORREF(0x00FF_FFFF));
+                    DrawTextW(dc, &mut text, &mut r, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+                    SelectObject(dc, old);
+                }
                 ReleaseDC(self.hwnd, dc);
                 let _ = ValidateRect(self.hwnd, None);
             }
@@ -1283,7 +1297,7 @@ impl View {
                     t("Mac'e bağlan", "Connect to Mac").to_string(),
                     t("Mac'teki Ayna Ajan menüsündeki kodu yazın.", "Enter the code shown in the Ayna Ajan menu on the Mac.").to_string(),
                     t("Bağlan", "Connect"),
-                    if gst::available() { String::new() } else { t("Görüntü motoru bulunamadı (bin\\uxplay).", "Video engine not found (bin\\uxplay).").into() },
+                    if gst::available() { String::new() } else { t("Görüntü çözücü yok (bin\\uxplay): GitHub'daki AynaMerkezi-Windows.zip'i kullanın.", "Video decoder missing (bin\\uxplay): use AynaMerkezi-Windows.zip from GitHub.").into() },
                     p.danger,
                 ),
             };

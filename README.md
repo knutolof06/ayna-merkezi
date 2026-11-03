@@ -31,7 +31,9 @@ app; the Mac only runs this project's small menu-bar helper (**Ayna Ajan**) — 
 
 ### Setup (once)
 
-1. Run `iPhoneAyna.exe` (the `bin\uxplay` folder must be next to it).
+1. Download **`AynaMerkezi-Windows.zip`** from the [latest release](../../releases/latest), extract it and run
+   `iPhoneAyna.exe` from the extracted folder. It needs the `bin\uxplay` folder next to it (the AirPlay receiver
+   and the video decoder used for the Mac screen); `iPhoneAyna.exe` alone in the release is the update file.
 2. **Mirroring:** same Wi-Fi; on the iPhone, Control Center → Screen Mirroring → **Ayna**.
 3. **Control:** iPhone Settings → Bluetooth → pair the PC. Settings → Accessibility → **Zoom: On** (iOS only
    accepts external touch input while Zoom is on; triple-finger double tap to zoom out again). Choose the same
@@ -112,4 +114,5 @@ GitHub Actions builds both and publishes the release (`.github/workflows/build.y
 
 Built on: [abhishek-raj/windows-ble-hid](https://github.com/abhishek-raj/windows-ble-hid),
 [sakx7/iOSBleDigitizer](https://github.com/sakx7/iOSBleDigitizer),
-[leapbtw/uxplay-windows](https://github.com/leapbtw/uxplay-windows).
+[leapbtw/uxplay-windows](https://github.com/leapbtw/uxplay-windows) (bundled in the release zip as `bin\uxplay`,
+version 2.0.0.1736; UxPlay is GPL-3.0, see `bin\uxplay\LICENSE.rtf`).

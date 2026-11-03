@@ -144,7 +144,7 @@ impl Engine {
     /// Yansıtma başlatılamıyorsa kullanıcıya gösterilecek neden.
     pub fn problem(&self) -> Option<String> {
         match &self.dir {
-            None => Some(crate::i18n::t("bin\\uxplay\\uxplay-windows.exe bu uygulamanın yanında olmalı.", "bin\\uxplay\\uxplay-windows.exe must be next to this app.").into()),
+            None => Some(crate::i18n::t("UxPlay bulunamadı (bin\\uxplay). GitHub'daki AynaMerkezi-Windows.zip'i indirip açın, iPhoneAyna.exe'yi o klasörden çalıştırın.", "UxPlay not found (bin\\uxplay). Download AynaMerkezi-Windows.zip from GitHub, extract it and run iPhoneAyna.exe from that folder.").into()),
             Some(d) if !d.to_string_lossy().is_ascii() => Some(crate::i18n::tf(
                 "UxPlay Türkçe karakter içeren klasörlerde çalışmıyor ve bu diskte kısa (8.3) adlar kapalı. \
                  Uygulama klasörünü yalnız İngilizce harfli bir yola taşıyın (ör. C:\\iPhoneAyna).\n\n{}",
