@@ -105,8 +105,9 @@ fn check() -> Result<Option<u32>, String> {
     if bytes.len() < 100_000 || !bytes.starts_with(b"MZ") {
         return Err("indirilen dosya geçerli bir program değil".into());
     }
+    // Uzantısız: çift tıklanıp ya da görev çubuğuna sabitlenip uygulama bu dosyadan açılmasın.
     let exe = util::exe_path();
-    let new = exe.with_extension("yeni.exe");
+    let new = exe.with_extension("guncelleme");
     std::fs::write(&new, &bytes).map_err(|e| format!("yazılamadı: {e}"))?;
     *READY.lock().unwrap() = Some((version, new, expected));
     Ok(Some(version))
@@ -161,6 +162,19 @@ pub fn apply() -> bool {
 
 /// Açılışta: güncelleme yaptıran eski süreç kapanana dek bekler, eski exe'yi siler.
 pub fn on_startup() {
+    // Eski sürümler güncellemeyi ".yeni.exe" adıyla indiriyordu; çift tıklanır ya da görev çubuğuna
+    // sabitlenirse uygulama ondan açılıyordu. Öyle açıldıysa asıl program başlatılır; asıl program da
+    // açılışta artık gereksiz bu dosyayı siler.
+    let exe = util::exe_path();
+    if let Some(stem) = exe.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(".yeni.exe")) {
+        let main = exe.with_file_name(format!("{stem}.exe"));
+        if main.exists() && std::process::Command::new(&main).args(std::env::args().skip(1)).spawn().is_ok() {
+            util::log("Uygulama güncelleme dosyasından açılmıştı; asıl program başlatıldı.");
+            std::process::exit(0);
+        }
+    } else {
+        let _ = std::fs::remove_file(exe.with_extension("yeni.exe"));
+    }
     let args: Vec<String> = std::env::args().collect();
     if let Some(pid) = args.iter().position(|a| a == WAIT_FLAG).and_then(|i| args.get(i + 1)).and_then(|p| p.parse::<u32>().ok()) {
         unsafe {
@@ -337,7 +351,7 @@ mod live {
     fn latest_release_verifies() {
         let got = super::check().unwrap();
         assert!(got.is_some_and(|v| v >= 6), "{got:?}");
-        let new = crate::util::exe_path().with_extension("yeni.exe");
+        let new = crate::util::exe_path().with_extension("guncelleme");
         assert!(new.exists());
         let _ = std::fs::remove_file(new);
     }

@@ -473,6 +473,7 @@ impl Mac {
     /// Eşleşmeyi bu bilgisayardan siler (Mac'te de güven kaldırılmalı).
     pub fn forget(code: &str) {
         util::delete_setting(PCWSTR(util::wide(&key_setting(code)).as_ptr()));
+        util::delete_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()));
     }
 }
 
@@ -482,6 +483,9 @@ fn transient(why: &str) -> bool {
         || why.starts_with("Mac'teki Ayna Ajan'a bağlanılamadı")
         || why.starts_with("Mac bağlantıyı kapattı")
         || why.starts_with("Mac'e şu an başka")
+        // Son bilinen adreste artık başka bir cihaz olabilir (Mac'in adresi değişti): yeniden denenir.
+        || why.starts_with("Mac'ten beklenmeyen yanıt")
+        || why.starts_with("Mac'ten geçersiz el sıkışma")
 }
 
 fn post(notify: isize) {
@@ -635,7 +639,16 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
             util::log(&format!("Mac kodu {code} için eşleşme kullanıcı onayıyla sıfırlandı."));
             peer
         }
-        Found::Nothing => return Err("Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?".into()),
+        // Bulma yanıtı gelmedi: eşleşilmiş Mac'in son bilinen adresi doğrudan denenir. macOS'un
+        // "Yerel Ağ" izni güncelleme sonrası sıfırlanınca Mac UDP ile yanıt veremez ama gelen TCP
+        // bağlantısını kabul eder. Kimlik yine el sıkışmada kayıtlı anahtarla doğrulanır (OK SAME).
+        Found::Nothing => match last_address(code).filter(|_| mac_key(code).is_some()) {
+            Some(peer) => {
+                util::log(&format!("Bulma yanıtı yok; son bilinen adres deneniyor: {}:{}", peer.ip, peer.port));
+                peer
+            }
+            None => return Err("Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?".into()),
+        },
     };
     util::log(&format!("Mac bulundu: {} ({}:{})", peer.name, peer.ip, peer.port));
     if !shared.publish(attempt, |i| i.state = State::Connecting(peer.name.clone())) {
@@ -750,6 +763,8 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         return Err(String::new());
     }
     util::log(&format!("Mac oturumu açıldı: {}", peer.name));
+    let saved = format!("{}:{} {}", peer.ip, peer.port, peer.name);
+    let _ = util::write_text_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()), &saved);
     post(notify);
     if shared.player.lock().unwrap().is_some() {
         let _ = tx.send(vec![MSG_KEYFRAME]);
@@ -1237,6 +1252,24 @@ fn read_line_limited(
 
 fn key_setting(code: &str) -> String {
     format!("MacAnahtari{code}")
+}
+
+fn address_setting(code: &str) -> String {
+    format!("MacAdresi{code}")
+}
+
+/// Bu Mac'le son kurulan oturumun adresi ve adı ("ip:port ad").
+fn last_address(code: &str) -> Option<Peer> {
+    let text = util::read_text_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()))?;
+    let (addr, name) = text.split_once(' ').unwrap_or((text.as_str(), "Mac"));
+    let (ip, port) = addr.split_once(':')?;
+    let ip: Ipv4Addr = ip.parse().ok()?;
+    // Yalnız bu bilgisayar o ağdayken (aynı /24): başka bir ağda aynı adres başka bir cihazdır.
+    let same_net = local_ipv4().iter().any(|l| l.octets()[..3] == ip.octets()[..3]);
+    if !(ip.is_private() || ip.is_link_local()) || !same_net {
+        return None;
+    }
+    Some(Peer { ip, port: port.parse().ok()?, name: clean_name(name) })
 }
 
 /// Bu Mac'le eşleşmenin anahtarı (yoksa daha önce eşleşilmemiştir).
