@@ -148,14 +148,14 @@ pub fn copy_all(paths: &[PathBuf], dest: &Path) -> Report {
     let dest_real = std::fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf());
     for src in paths {
         let Some(name) = src.file_name() else {
-            report.failed.push((src.clone(), "sürücünün tamamı gönderilemez".into()));
+            report.failed.push((src.clone(), crate::i18n::t("sürücünün tamamı gönderilemez", "a whole drive cannot be sent").into()));
             continue;
         };
         // iCloud Drive'ın kendisini ya da onu içeren bir klasörü göndermek, hedefi kaynağın
         // içine kopyalar ve sonsuza kadar iç içe klasör üretirdi.
         if let Ok(src_real) = std::fs::canonicalize(src) {
             if dest_real.starts_with(&src_real) {
-                report.failed.push((src.clone(), "iCloud Drive klasörünü içerdiği için gönderilemez".into()));
+                report.failed.push((src.clone(), crate::i18n::t("iCloud Drive klasörünü içerdiği için gönderilemez", "cannot be sent because it contains the iCloud Drive folder").into()));
                 continue;
             }
         }
@@ -177,7 +177,7 @@ fn copy_entry(src: &Path, dest: &Path, depth: usize, report: &mut Report) {
         return copy_file(src, dest, report);
     }
     if depth >= MAX_DEPTH {
-        return report.failed.push((src.to_path_buf(), "klasör çok derin".into()));
+        return report.failed.push((src.to_path_buf(), crate::i18n::t("klasör çok derin", "folder is too deep").into()));
     }
     if let Err(e) = std::fs::create_dir_all(dest) {
         return report.failed.push((src.to_path_buf(), e.to_string()));
@@ -227,7 +227,7 @@ fn copy_file(src: &Path, dest: &Path, report: &mut Report) {
             Err(e) => return report.failed.push((src.to_path_buf(), e.to_string())),
         }
     }
-    report.failed.push((src.to_path_buf(), "boş bir dosya adı bulunamadı".into()));
+    report.failed.push((src.to_path_buf(), crate::i18n::t("boş bir dosya adı bulunamadı", "no free file name found").into()));
 }
 
 fn unique_path(dir: &Path, name: &Path) -> PathBuf {

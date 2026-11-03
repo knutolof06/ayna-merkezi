@@ -144,11 +144,13 @@ impl Engine {
     /// Yansıtma başlatılamıyorsa kullanıcıya gösterilecek neden.
     pub fn problem(&self) -> Option<String> {
         match &self.dir {
-            None => Some("bin\\uxplay\\uxplay-windows.exe bu uygulamanın yanında olmalı.".into()),
-            Some(d) if !d.to_string_lossy().is_ascii() => Some(format!(
+            None => Some(crate::i18n::t("bin\\uxplay\\uxplay-windows.exe bu uygulamanın yanında olmalı.", "bin\\uxplay\\uxplay-windows.exe must be next to this app.").into()),
+            Some(d) if !d.to_string_lossy().is_ascii() => Some(crate::i18n::tf(
                 "UxPlay Türkçe karakter içeren klasörlerde çalışmıyor ve bu diskte kısa (8.3) adlar kapalı. \
                  Uygulama klasörünü yalnız İngilizce harfli bir yola taşıyın (ör. C:\\iPhoneAyna).\n\n{}",
-                d.display()
+                "UxPlay does not work in folders with non-English characters, and short (8.3) names are turned off on this drive. \
+                 Move the app folder to a path with only English letters (e.g. C:\\iPhoneAyna).\n\n{}",
+                &[&d.display()],
             )),
             Some(_) => None,
         }

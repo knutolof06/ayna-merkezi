@@ -14,6 +14,7 @@ use windows::Win32::UI::Shell::{SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHG
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::hub::card_bg_alpha;
+use crate::i18n::tf;
 use crate::taskbar::{present, Canvas};
 use crate::util;
 
@@ -37,7 +38,7 @@ pub fn show(name: &str, folder: bool, count: usize) {
         if hwnd.is_invalid() {
             return;
         }
-        let label = if count > 1 { format!("{count} öğe") } else { name.to_string() };
+        let label = if count > 1 { tf("{} öğe", "{} items", &[&count]) } else { name.to_string() };
         // Önce imlecin olduğu monitöre taşınır: ölçek o monitörün DPI'ından alınsın.
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);

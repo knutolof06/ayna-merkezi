@@ -3,7 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
-    <string>tr</string>
+    <string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>tr</string>
+    </array>
     <key>CFBundleExecutable</key>
     <string>AynaAjan</string>
     <key>CFBundleIdentifier</key>
@@ -23,8 +28,8 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Windows'tan sürüklenen dosyaları bırakıldıkları Finder penceresinin klasörüne kaydetmek için.</string>
+    <string>To save files dragged from Windows into the folder of the Finder window they are dropped on.</string>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Windows'taki Ayna Merkezi'nin bu Mac'i yerel ağda bulabilmesi için.</string>
+    <string>So that Ayna Merkezi on Windows can find this Mac on the local network.</string>
 </dict>
 </plist>

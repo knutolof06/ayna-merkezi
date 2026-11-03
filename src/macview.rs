@@ -23,7 +23,9 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::countdown;
 use crate::dragout;
+use crate::i18n::{t, tf};
 use crate::ghost;
 use crate::gst::{self, Player};
 use crate::toast;
@@ -41,6 +43,11 @@ pub const WM_APP_SIZER: u32 = WM_APP + 25;
 /// Kod alanında Enter.
 const WM_APP_GO: u32 = WM_APP + 26;
 const TIMER_TICK: usize = 1;
+/// Ctrl basılı tutulurken sayaç (fare kilidinden çıkış).
+const TIMER_HOLD: usize = 2;
+/// "Fare serbest" iletisinin kalkması.
+const TIMER_HOLD_DONE: usize = 3;
+const HOLD: Duration = Duration::from_secs(10);
 /// WM_APP_LOCK wParam: kilit ipucunu göster.
 const LOCK_HINT: usize = 1;
 const EDIT_ID: usize = 100;
@@ -104,10 +111,12 @@ struct View {
     released_inside: bool,
     /// Fare kilidi devrede: imleç pencereye hapsedilip gizlendi, ham hareket göreli gider.
     lock_on: bool,
-    /// Kullanıcı kilidi Ctrl+Alt ile bıraktı: pencereye tıklayana dek yeniden kilitlenmez.
+    /// Kullanıcı kilidi Ctrl'yi 10 sn basılı tutarak bıraktı: pencereye tıklayana dek yeniden kilitlenmez.
     lock_override: bool,
     /// Kilit ipucu bu oturumda gösterildi.
     lock_hint_shown: bool,
+    /// Fare kilitliyken Ctrl'ye basıldığı an (10 sn basılı kalırsa fare serbest kalır).
+    hold_since: Option<Instant>,
 }
 
 thread_local! {
@@ -151,7 +160,7 @@ pub fn connected() -> bool {
 /// Ana uygulamada gösterilen kısa durum.
 pub fn status() -> String {
     if !enabled() {
-        return "Kapalı".into();
+        return t("Kapalı", "Off").into();
     }
     with(|v| v.mac.state().text()).unwrap_or_default()
 }
@@ -317,6 +326,7 @@ pub fn create() -> Option<HWND> {
             lock_on: false,
             lock_override: false,
             lock_hint_shown: false,
+            hold_since: None,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
@@ -541,6 +551,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetBkColor(dc, colorref(p.field));
             return LRESULT(EDIT_BRUSH.with(|b| b.get()));
         }
+        WM_TIMER if wp.0 == TIMER_HOLD => {
+            hold_tick(hwnd);
+            return LRESULT(0);
+        }
+        WM_TIMER if wp.0 == TIMER_HOLD_DONE => {
+            let _ = KillTimer(hwnd, TIMER_HOLD_DONE);
+            countdown::hide();
+            return LRESULT(0);
+        }
         WM_TIMER => with(|v| v.tick()).unwrap_or(After::None),
         mac::WM_APP_MAC => After::Mode,
         WM_APP_TOGGLE => After::Toggle,
@@ -562,7 +581,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         mac::WM_APP_LOCK => {
             if wp.0 == LOCK_HINT {
-                toast::show(hwnd, "Oyun fareyi kilitledi. Bırakmak için sol Ctrl + sol Alt.");
+                toast::show(hwnd, t("Oyun fareyi kilitledi. Bırakmak için Ctrl'yi 10 sn basılı tutun.", "The game captured the mouse. Hold Ctrl for 10 s to release it."));
                 return LRESULT(0);
             }
             with(|v| {
@@ -709,26 +728,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-            // Sol Ctrl + sol Alt: fare kilidinden çık (sanal makinelerdeki gibi). Yalnız bu iki tuşun
-            // kendisine basılınca; AltGr (sağ Alt) yazarken bırakmasın.
-            use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
-            if down
-                && (wp.0 == 0x11 || wp.0 == 0x12)
-                && GetKeyState(0xA2) < 0
-                && GetKeyState(0xA4) < 0
-                && GetKeyState(0xA5) >= 0
-            {
-                let released = with(|v| {
-                    if !v.lock_on {
-                        return false;
+            // Fare kilitliyken Ctrl basılı tutulursa sayaç başlar; 10 sn'de fare serbest kalır. Ctrl oyuna
+            // da gider (oyuna Esc ya da Alt gönderilmez: oyunun menüsü açılmaz).
+            if wp.0 == 0x11 {
+                if down {
+                    let start = with(|v| {
+                        let start = v.lock_on && !v.fake_ctrl && v.hold_since.is_none();
+                        if start {
+                            v.hold_since = Some(Instant::now());
+                        }
+                        start
+                    })
+                    .unwrap_or(false);
+                    if start {
+                        let _ = KillTimer(hwnd, TIMER_HOLD_DONE);
+                        SetTimer(hwnd, TIMER_HOLD, 100, None);
                     }
-                    v.lock_override = true;
-                    v.unlock_pointer();
-                    true
-                })
-                .unwrap_or(false);
-                if released {
-                    toast::show(hwnd, "Fare serbest. Yeniden kilitlemek için pencereye tıklayın.");
+                } else if with(|v| v.hold_since.take().is_some()).unwrap_or(false) {
+                    // Yalnız süren sayaç durur; "Fare serbest" kartı kendi süresince kalır.
+                    stop_hold(hwnd);
                 }
             }
             let scan = ((lp.0 >> 16) & 0xFF) as u16 | if (lp.0 >> 24) & 1 == 1 { 0xE000 } else { 0 };
@@ -877,7 +895,7 @@ impl View {
                 self.decided = false;
                 let code = self.code();
                 if code.len() < 6 {
-                    self.mac.fail("Mac'teki Ayna Ajan menüsündeki kodu yazın.");
+                    self.mac.fail(t("Mac'teki Ayna Ajan menüsündeki kodu yazın.", "Enter the code shown in the Ayna Ajan menu on the Mac."));
                     return;
                 }
                 self.user_closed = false;
@@ -986,6 +1004,9 @@ impl View {
     }
 
     fn unlock_pointer(&mut self) {
+        if self.hold_since.take().is_some() {
+            stop_hold(self.hwnd);
+        }
         if !std::mem::take(&mut self.lock_on) {
             return;
         }
@@ -1109,7 +1130,7 @@ impl View {
                     }
                     if util::contains(&c, pt.0, pt.1) {
                         self.drag_cancelled = true;
-                        toast::show(self.hwnd, "Sürükleme iptal edildi.");
+                        toast::show(self.hwnd, t("Sürükleme iptal edildi.", "Drag cancelled."));
                     }
                     return After::None;
                 }
@@ -1219,42 +1240,50 @@ impl View {
 
             let (title, subtitle, button, note, note_color) = match &state {
                 State::Waiting { name, .. } => (
-                    "Doğrulama kodu".to_string(),
-                    format!("{name} ekranındaki kod bu mu?"),
-                    "Vazgeç",
+                    t("Doğrulama kodu", "Verification code").to_string(),
+                    tf("{} ekranındaki kod bu mu?", "Is this the code on {}'s screen?", &[name]),
+                    t("Vazgeç", "Cancel"),
                     if self.decided {
-                        "Şimdi Mac'te \"İzin ver\"e basın.".to_string()
+                        t("Şimdi Mac'te \"İzin ver\"e basın.", "Now click \"Allow\" on the Mac.").to_string()
                     } else {
-                        "Aynıysa burada \"Kodlar aynı\"ya, Mac'te \"İzin ver\"e basın.".to_string()
+                        t(
+                            "Aynıysa burada \"Kodlar aynı\"ya, Mac'te \"İzin ver\"e basın.",
+                            "If it matches, click \"Codes match\" here and \"Allow\" on the Mac.",
+                        )
+                        .to_string()
                     },
                     p.secondary,
                 ),
                 State::Confirm { name, .. } => (
-                    "Doğrulama kodu".to_string(),
-                    format!("{name} onayladı. Mac'in ekranındaki kod bu mu?"),
-                    "Vazgeç",
-                    "Kod farklıysa Vazgeç'e basın: ağdaki başka bir cihaz kendini Mac gibi gösteriyor olabilir.".to_string(),
+                    t("Doğrulama kodu", "Verification code").to_string(),
+                    tf("{} onayladı. Mac'in ekranındaki kod bu mu?", "{} approved. Is this the code on the Mac's screen?", &[name]),
+                    t("Vazgeç", "Cancel"),
+                    t(
+                        "Kod farklıysa Vazgeç'e basın: ağdaki başka bir cihaz kendini Mac gibi gösteriyor olabilir.",
+                        "If the code differs, click Cancel: another device on the network may be posing as the Mac.",
+                    )
+                    .to_string(),
                     p.secondary,
                 ),
                 State::Searching | State::Connecting(_) => (
-                    "Bağlanılıyor…".to_string(),
+                    t("Bağlanılıyor…", "Connecting…").to_string(),
                     state.text(),
-                    "Vazgeç",
+                    t("Vazgeç", "Cancel"),
                     String::new(),
                     p.secondary,
                 ),
                 State::Failed(why) => (
-                    "Mac'e bağlan".to_string(),
-                    "Mac'teki Ayna Ajan menüsündeki kodu yazın.".to_string(),
-                    "Bağlan",
+                    t("Mac'e bağlan", "Connect to Mac").to_string(),
+                    t("Mac'teki Ayna Ajan menüsündeki kodu yazın.", "Enter the code shown in the Ayna Ajan menu on the Mac.").to_string(),
+                    t("Bağlan", "Connect"),
                     why.clone(),
                     p.danger,
                 ),
                 _ => (
-                    "Mac'e bağlan".to_string(),
-                    "Mac'teki Ayna Ajan menüsündeki kodu yazın.".to_string(),
-                    "Bağlan",
-                    if gst::available() { String::new() } else { "Görüntü motoru bulunamadı (bin\\uxplay).".into() },
+                    t("Mac'e bağlan", "Connect to Mac").to_string(),
+                    t("Mac'teki Ayna Ajan menüsündeki kodu yazın.", "Enter the code shown in the Ayna Ajan menu on the Mac.").to_string(),
+                    t("Bağlan", "Connect"),
+                    if gst::available() { String::new() } else { t("Görüntü motoru bulunamadı (bin\\uxplay).", "Video engine not found (bin\\uxplay).").into() },
                     p.danger,
                 ),
             };
@@ -1276,7 +1305,7 @@ impl View {
                 card_bg_alpha(&mut c, f.yes, p.accent, 12.0 * s, shade(Ctl::Yes));
                 card_bg_alpha(&mut c, f.no, p.switch_off, 12.0 * s, shade(Ctl::Button));
             } else {
-                let color = if button == "Bağlan" { p.accent } else { p.switch_off };
+                let color = if button == t("Bağlan", "Connect") { p.accent } else { p.switch_off };
                 card_bg_alpha(&mut c, f.button, color, 12.0 * s, shade(Ctl::Button));
             }
             let fonts = &self.fonts;
@@ -1287,8 +1316,8 @@ impl View {
                     text(mem, fonts.big, p.text, sas, f.sas, DT_CENTER);
                 }
                 if two {
-                    text(mem, fonts.body, [1.0, 1.0, 1.0], "Kodlar aynı", f.yes, DT_CENTER);
-                    text(mem, fonts.body, [1.0, 1.0, 1.0], "Vazgeç", f.no, DT_CENTER);
+                    text(mem, fonts.body, [1.0, 1.0, 1.0], t("Kodlar aynı", "Codes match"), f.yes, DT_CENTER);
+                    text(mem, fonts.body, [1.0, 1.0, 1.0], t("Vazgeç", "Cancel"), f.no, DT_CENTER);
                 } else {
                     text(mem, fonts.body, [1.0, 1.0, 1.0], button, f.button, DT_CENTER);
                 }
@@ -1302,6 +1331,39 @@ impl View {
                 }
             });
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fare kilidinden çıkış: Ctrl basılı tutma sayacı
+
+fn stop_hold(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_HOLD);
+    }
+    countdown::hide();
+}
+
+unsafe fn hold_tick(hwnd: HWND) {
+    let elapsed = with(|v| if v.lock_on { v.hold_since.map(|t| t.elapsed()) } else { None }).flatten();
+    // Ctrl artık basılı değilse (bırakış iletisi kaçtıysa) sayaç iptal.
+    let held = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) < 0;
+    let Some(elapsed) = elapsed.filter(|_| held) else {
+        with(|v| v.hold_since = None);
+        stop_hold(hwnd);
+        return;
+    };
+    if elapsed >= HOLD {
+        let _ = KillTimer(hwnd, TIMER_HOLD);
+        with(|v| {
+            v.lock_override = true;
+            v.unlock_pointer();
+        });
+        countdown::show(hwnd, "✓", t("Fare serbest. Yeniden kilitlemek için pencereye tıklayın.", "Mouse released. Click the window to lock it again."));
+        SetTimer(hwnd, TIMER_HOLD_DONE, 2000, None);
+    } else if elapsed >= Duration::from_secs(1) {
+        let left = (HOLD.saturating_sub(elapsed).as_millis() as u64).div_ceil(1000);
+        countdown::show(hwnd, &left.to_string(), t("Fareyi bırakmak için Ctrl'yi basılı tutun", "Keep holding Ctrl to release the mouse"));
     }
 }
 
@@ -1331,7 +1393,7 @@ pub fn drop_hover(x: i32, y: i32, count: usize, folder: bool, name: &str, enter:
     })
     .unwrap_or(false);
     if enter && !accepted && !connected() {
-        toast::show(main_hwnd(), "Dosya göndermek için önce Mac'e bağlanın.");
+        toast::show(main_hwnd(), t("Dosya göndermek için önce Mac'e bağlanın.", "Connect to the Mac first to send files."));
     }
     accepted
 }
@@ -1355,7 +1417,7 @@ pub fn drop_files(x: i32, y: i32, paths: Vec<std::path::PathBuf>) -> bool {
     })
     .unwrap_or(false);
     if sent {
-        toast::show(main_hwnd(), "Mac'e gönderiliyor…");
+        toast::show(main_hwnd(), t("Mac'e gönderiliyor…", "Sending to Mac…"));
     }
     sent
 }
@@ -1471,7 +1533,7 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
             if let Some((name, folder, items)) = with(|v| if v.dragging_out { v.mac.dragged_preview() } else { None }).flatten() {
                 ghost::show(&name, folder, items);
             } else if count > 0 {
-                toast::show(hwnd, &format!("Mac'ten alınıyor: {count} dosya…"));
+                toast::show(hwnd, &tf("Mac'ten alınıyor: {} dosya…", "Receiving from Mac: {} files…", &[&count]));
             }
         }
         mac::FILES_READY => {
@@ -1493,7 +1555,7 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
                 return;
             }
             if items.is_empty() {
-                toast::show(hwnd, "Mac'ten dosyalar alınamadı.");
+                toast::show(hwnd, t("Mac'ten dosyalar alınamadı.", "Could not receive files from the Mac."));
                 return;
             }
             let held = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01 /* VK_LBUTTON */) < 0;
@@ -1512,9 +1574,9 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
                     }
                 }
                 let note = if saved == items.len() {
-                    format!("Masaüstüne kaydedildi: {saved} öğe")
+                    tf("Masaüstüne kaydedildi: {} öğe", "Saved to Desktop: {} items", &[&saved])
                 } else {
-                    format!("Masaüstüne kaydedildi: {saved}/{} öğe", items.len())
+                    tf("Masaüstüne kaydedildi: {}/{} öğe", "Saved to Desktop: {}/{} items", &[&saved, &items.len()])
                 };
                 toast::show(hwnd, &note);
             }
@@ -1536,19 +1598,36 @@ struct Sizer {
     scale: f32,
     fonts: Fonts,
     dragging: bool,
-    hover_button: bool,
-    hover_phone: bool,
+    /// Üstünde durulan düğme (`SizerButton`).
+    hover: Option<SizerButton>,
 }
 
 const SIZER_W: f32 = 300.0;
-const SIZER_H: f32 = 194.0;
+const SIZER_H: f32 = 238.0;
 
-/// Kaydırıcı, iPhone düğmesi, bağlantı düğmesi.
-fn sizer_layout(s: f32) -> ([f32; 4], [f32; 4], [f32; 4]) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SizerButton {
+    Phone,
+    Connection,
+    Settings,
+    Exit,
+}
+
+/// Kaydırıcı ve düğmeler: iPhone kipi, bağlantı, ayarlar | çık.
+fn sizer_layout(s: f32) -> ([f32; 4], [(SizerButton, [f32; 4]); 4]) {
     let slider = [20.0 * s, 64.0 * s, (SIZER_W - 20.0) * s, 84.0 * s];
-    let phone = [16.0 * s, 102.0 * s, (SIZER_W - 16.0) * s, 136.0 * s];
-    let button = [16.0 * s, 146.0 * s, (SIZER_W - 16.0) * s, 180.0 * s];
-    (slider, phone, button)
+    let mid = SIZER_W / 2.0;
+    let buttons = [
+        (SizerButton::Phone, [16.0 * s, 102.0 * s, (SIZER_W - 16.0) * s, 136.0 * s]),
+        (SizerButton::Connection, [16.0 * s, 146.0 * s, (SIZER_W - 16.0) * s, 180.0 * s]),
+        (SizerButton::Settings, [16.0 * s, 190.0 * s, (mid - 5.0) * s, 224.0 * s]),
+        (SizerButton::Exit, [(mid + 5.0) * s, 190.0 * s, (SIZER_W - 16.0) * s, 224.0 * s]),
+    ];
+    (slider, buttons)
+}
+
+fn sizer_button_at(s: f32, x: i32, y: i32) -> Option<SizerButton> {
+    sizer_layout(s).1.into_iter().find(|(_, b)| hit(b, x, y)).map(|(k, _)| k)
 }
 
 /// iPhone kipini açar/kapatır; bağlı değilse önce bağlanılır (kip bağlanınca uygulanır).
@@ -1598,7 +1677,7 @@ unsafe fn show_sizer() {
             let Ok(h) = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 SIZER_CLASS,
-                w!("Mac ekran boyutu"),
+                w!("Mac"),
                 WS_POPUP,
                 0,
                 0,
@@ -1616,10 +1695,7 @@ unsafe fn show_sizer() {
             let dark = BOOL::from(true);
             let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
             let scale = util::scale(h);
-            SIZER.with(|c| {
-                *c.borrow_mut() =
-                    Some(Sizer { hwnd: h, scale, fonts: Fonts::new(scale), dragging: false, hover_button: false, hover_phone: false })
-            });
+            SIZER.with(|c| *c.borrow_mut() = Some(Sizer { hwnd: h, scale, fonts: Fonts::new(scale), dragging: false, hover: None }));
             h
         }
     };
@@ -1634,8 +1710,7 @@ unsafe fn show_sizer() {
     SIZER.with(|c| {
         if let Some(z) = c.borrow_mut().as_mut() {
             z.dragging = false;
-            z.hover_button = false;
-            z.hover_phone = false;
+            z.hover = None;
             if (z.scale - s).abs() > 0.01 {
                 z.fonts.delete();
                 z.fonts = Fonts::new(s);
@@ -1653,7 +1728,7 @@ unsafe fn show_sizer() {
 }
 
 fn sizer_value(s: f32, x: i32) -> u32 {
-    let (sl, _, _) = sizer_layout(s);
+    let (sl, _) = sizer_layout(s);
     let t = ((x as f32 - sl[0]) / (sl[2] - sl[0])).clamp(0.0, 1.0);
     let v = SIZE_MIN as f32 + t * (SIZE_MAX - SIZE_MIN) as f32;
     ((v / 5.0).round() as u32 * 5).clamp(SIZE_MIN, SIZE_MAX)
@@ -1692,23 +1767,28 @@ unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point(lp);
-            let (sl, ph, bt) = sizer_layout(s);
+            let (sl, _) = sizer_layout(s);
             let grab = [sl[0] - 12.0 * s, sl[1] - 10.0 * s, sl[2] + 12.0 * s, sl[3] + 10.0 * s];
             if hit(&grab, x, y) {
                 SIZER.with(|c| c.borrow_mut().as_mut().map(|z| z.dragging = true));
                 SetCapture(hwnd);
                 set_size(sizer_value(s, x));
                 hub::invalidate(hwnd);
-            } else if hit(&ph, x, y) {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                toggle_phone();
-            } else if hit(&bt, x, y) {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                if connected() {
-                    disconnect();
-                } else {
-                    open();
+                return LRESULT(0);
+            }
+            let Some(button) = sizer_button_at(s, x, y) else { return LRESULT(0) };
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            match button {
+                SizerButton::Phone => toggle_phone(),
+                SizerButton::Connection => {
+                    if connected() {
+                        disconnect();
+                    } else {
+                        open();
+                    }
                 }
+                SizerButton::Settings => taskbar::open_hub(),
+                SizerButton::Exit => taskbar::quit(),
             }
             LRESULT(0)
         }
@@ -1719,13 +1799,11 @@ unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 set_size(sizer_value(s, x));
                 hub::invalidate(hwnd);
             } else {
-                let (_, ph, bt) = sizer_layout(s);
-                let (over, over_phone) = (hit(&bt, x, y), hit(&ph, x, y));
+                let over = sizer_button_at(s, x, y);
                 let changed = SIZER.with(|c| {
                     c.borrow_mut().as_mut().is_some_and(|z| {
-                        let ch = z.hover_button != over || z.hover_phone != over_phone;
-                        z.hover_button = over;
-                        z.hover_phone = over_phone;
+                        let ch = z.hover != over;
+                        z.hover = over;
                         ch
                     })
                 });
@@ -1756,27 +1834,42 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
     }
     let p = palette(false);
     let pct = size_percent();
-    let (sl, ph, bt) = sizer_layout(s);
-    let (dragging, hover, hover_phone) =
-        SIZER.with(|c| c.borrow().as_ref().map_or((false, false, false), |z| (z.dragging, z.hover_button, z.hover_phone)));
+    let (sl, buttons) = sizer_layout(s);
+    let (dragging, hover) = SIZER.with(|c| c.borrow().as_ref().map_or((false, None), |z| (z.dragging, z.hover)));
     let phone_on = with(|v| v.mac.phone()).unwrap_or(false);
+    let is_connected = connected();
     let mut c = Canvas::new(w as usize, h as usize);
     c.fill_background(p.card, 1.0);
-    let t = (pct - SIZE_MIN) as f32 / (SIZE_MAX - SIZE_MIN) as f32;
-    slider(&mut c, sl, t, true, &p, s, dragging);
-    let is_connected = connected();
-    let color = if is_connected { p.danger } else { p.accent };
-    card_bg_alpha(&mut c, bt, color, 10.0 * s, if hover { 0.9 } else { 1.0 });
-    card_bg_alpha(&mut c, ph, p.field, 10.0 * s, if hover_phone { 0.8 } else { 1.0 });
-    let label = if is_connected { "Bağlantıyı kes" } else { "Mac ekranını aç" };
-    let phone_label = if phone_on { "Mac ekranına dön" } else { "iPhone'u Mac üzerinden göster" };
+    let frac = (pct - SIZE_MIN) as f32 / (SIZE_MAX - SIZE_MIN) as f32;
+    slider(&mut c, sl, frac, true, &p, s, dragging);
+    let mut labels: Vec<(&str, [f32; 4], [f32; 3])> = Vec::new();
+    for (kind, b) in buttons {
+        let (fill_color, label, text_color) = match kind {
+            SizerButton::Phone => (
+                p.field,
+                if phone_on { t("Mac ekranına dön", "Back to Mac screen") } else { t("iPhone'u Mac üzerinden göster", "Show iPhone via Mac") },
+                p.text,
+            ),
+            SizerButton::Connection => (
+                if is_connected { p.danger } else { p.accent },
+                if is_connected { t("Bağlantıyı kes", "Disconnect") } else { t("Mac ekranını aç", "Open Mac screen") },
+                [1.0, 1.0, 1.0],
+            ),
+            SizerButton::Settings => (p.field, t("Ayarları aç", "Settings"), p.text),
+            SizerButton::Exit => (p.field, t("Çık", "Quit"), p.text),
+        };
+        let alpha = if hover == Some(kind) { 0.8 } else { 1.0 };
+        card_bg_alpha(&mut c, b, fill_color, 10.0 * s, alpha);
+        labels.push((label, b, text_color));
+    }
     SIZER.with(|cell| {
         if let Some(z) = cell.borrow().as_ref() {
             hub::blit(hwnd, w, h, &c, |mem| {
-                text(mem, z.fonts.name, p.text, "Mac ekran boyutu", [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_LEFT);
-                text(mem, z.fonts.body, p.secondary, &format!("%{pct}"), [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_RIGHT);
-                text(mem, z.fonts.body, [1.0, 1.0, 1.0], label, bt, DT_CENTER);
-                text(mem, z.fonts.body, p.text, phone_label, ph, DT_CENTER);
+                text(mem, z.fonts.name, p.text, t("Mac ekran boyutu", "Mac screen size"), [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_LEFT);
+                text(mem, z.fonts.body, p.secondary, &crate::i18n::tf("%{}", "{}%", &[&pct]), [20.0 * s, 14.0 * s, w as f32 - 20.0 * s, 38.0 * s], DT_RIGHT);
+                for (label, b, color) in &labels {
+                    text(mem, z.fonts.body, *color, label, *b, DT_CENTER);
+                }
             });
         }
     });

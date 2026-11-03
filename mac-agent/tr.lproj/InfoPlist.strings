@@ -1,0 +1,3 @@
+/* İzin pencerelerindeki açıklamalar (Türkçe). */
+"NSAppleEventsUsageDescription" = "Windows'tan sürüklenen dosyaları bırakıldıkları Finder penceresinin klasörüne kaydetmek için.";
+"NSLocalNetworkUsageDescription" = "Windows'taki Ayna Merkezi'nin bu Mac'i yerel ağda bulabilmesi için.";

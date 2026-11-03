@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::mirror::{self, WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
 use crate::transfer;
+use crate::i18n::t;
 use crate::util;
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -35,6 +36,7 @@ const MENU_AUTOSTART: usize = 2;
 const MENU_EXIT: usize = 3;
 const MENU_HUB: usize = 4;
 const MENU_DISCONNECT: usize = 5;
+const MENU_UPDATE: usize = 6;
 
 /// Cihazın hedef penceresine "bağlantıyı kes" isteği (Mac ikonunun menüsünden).
 pub const WM_APP_DISCONNECT: u32 = WM_APP + 21;
@@ -398,27 +400,51 @@ fn with<R>(hwnd: HWND, f: impl FnOnce(&mut Icon) -> R) -> Option<R> {
     ICONS.with(|c| c.try_borrow_mut().ok().and_then(|mut v| v.iter_mut().find(|i| i.hwnd == hwnd).map(f)))
 }
 
+/// Ayarlar (Ayna Merkezi) penceresini açar.
+pub fn open_hub() {
+    let hub = HWND(HUB.with(|h| h.get()) as _);
+    unsafe {
+        let _ = PostMessageW(hub, WM_APP_HUB, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Uygulamadan çıkar (iPhone penceresi kapanınca ileti döngüsü biter).
+pub fn quit() {
+    unsafe {
+        let _ = DestroyWindow(target(Device::IPhone));
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
     let Some((device, tray)) = with(hwnd, |i| (i.device, i.tray)) else { return };
     let Ok(menu) = CreatePopupMenu() else { return };
     let v = view(device);
     let open = IsWindowVisible(v).as_bool() && !IsIconic(v).as_bool();
     let label = match (device, open) {
-        (Device::IPhone, true) => w!("iPhone ekranını gizle"),
-        (Device::IPhone, false) => w!("iPhone ekranını aç"),
-        (Device::Mac, true) => w!("Mac ekranını gizle"),
-        (Device::Mac, false) => w!("Mac ekranını göster"),
+        (Device::IPhone, true) => t("iPhone ekranını gizle", "Hide iPhone screen"),
+        (Device::IPhone, false) => t("iPhone ekranını aç", "Show iPhone screen"),
+        (Device::Mac, true) => t("Mac ekranını gizle", "Hide Mac screen"),
+        (Device::Mac, false) => t("Mac ekranını göster", "Show Mac screen"),
     };
-    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, label);
-    if device == Device::Mac {
-        let _ = AppendMenuW(menu, MF_STRING, MENU_DISCONNECT, w!("Mac bağlantısını kes"));
-    }
+    // Menü metinleri menü yaşadıkça bellekte kalmalı.
+    let items = [
+        util::wide(label),
+        util::wide(t("Bağlantıyı kes", "Disconnect")),
+        util::wide(t("Ayarları aç", "Settings")),
+        util::wide(t("Güncellemeleri denetle", "Check for updates")),
+        util::wide(t("Windows ile başlat", "Start with Windows")),
+        util::wide(t("Çık", "Quit")),
+    ];
+    let item = |i: usize| PCWSTR(items[i].as_ptr());
+    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, item(0));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_DISCONNECT, item(1));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, MENU_HUB, w!("Ayna Merkezi"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_HUB, item(2));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_UPDATE, item(3));
     let auto = if util::autostart_enabled() { MF_STRING | MF_CHECKED } else { MF_STRING };
-    let _ = AppendMenuW(menu, auto, MENU_AUTOSTART, w!("Windows ile başlat"));
+    let _ = AppendMenuW(menu, auto, MENU_AUTOSTART, item(4));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Çıkış"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, item(5));
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
@@ -440,17 +466,19 @@ unsafe fn show_menu(hwnd: HWND) {
             set_anchor(device, tray);
             let _ = PostMessageW(target(device), WM_APP_TOGGLE, WPARAM(0), LPARAM(0));
         }
-        MENU_DISCONNECT => {
-            let _ = PostMessageW(target(device), WM_APP_DISCONNECT, WPARAM(0), LPARAM(0));
-        }
-        MENU_HUB => {
-            let hub = HWND(HUB.with(|h| h.get()) as _);
-            let _ = PostMessageW(hub, WM_APP_HUB, WPARAM(0), LPARAM(0));
+        MENU_DISCONNECT => match device {
+            Device::Mac => {
+                let _ = PostMessageW(target(device), WM_APP_DISCONNECT, WPARAM(0), LPARAM(0));
+            }
+            Device::IPhone => mirror::disconnect(),
+        },
+        MENU_HUB => open_hub(),
+        MENU_UPDATE => {
+            open_hub();
+            crate::hub::check_updates();
         }
         MENU_AUTOSTART => util::set_autostart(!util::autostart_enabled()),
-        MENU_EXIT => {
-            let _ = DestroyWindow(target(Device::IPhone));
-        }
+        MENU_EXIT => quit(),
         _ => {}
     }
 }
@@ -763,18 +791,6 @@ impl Canvas {
             })
             .collect()
     }
-
-    fn to_straight_bgra(&self) -> Vec<u32> {
-        self.px
-            .iter()
-            .map(|p| {
-                let a = p[3];
-                let un = |v: f32| if a > 0.0 { v / a } else { 0.0 };
-                let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
-                b(un(p[2])) | b(un(p[1])) << 8 | b(un(p[0])) << 16 | b(a) << 24
-            })
-            .collect()
-    }
 }
 
 pub(crate) fn round_rect_sdf(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
@@ -860,39 +876,29 @@ fn render_taskbar_icon(
     c.to_premultiplied_bgra()
 }
 
-/// Pencere başlığı ve Alt+Tab için mavi zeminli uygulama ikonu.
-pub fn app_icon(size: i32) -> HICON {
-    let n = size as usize;
-    let mut c = Canvas::new(n, n);
-    let s = size as f32 / 32.0;
-    let half = n as f32 / 2.0;
-    c.draw(hex(0x0A84FF), 1.0, |x, y| fill(round_rect_sdf(x, y, half, half, half - 0.5, half - 0.5, 7.0 * s)));
-    draw_phone(&mut c, half, half, s * 1.15, [1.0, 1.0, 1.0]);
-    let pixels = c.to_straight_bgra();
+/// Uygulama logosu (assets/icon.ico gömülü): pencere başlığı, Alt+Tab, bildirim alanı.
+static APP_ICO: &[u8] = include_bytes!("../assets/icon.ico");
 
+/// Logodan `size` piksellik simge: istenen boyuta en yakın büyük görüntü kullanılır.
+pub fn app_icon(size: i32) -> HICON {
+    let ico = APP_ICO;
+    let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+    let mut best: Option<(i32, usize, usize)> = None;
+    for i in 0..count {
+        let e = &ico[6 + 16 * i..6 + 16 * (i + 1)];
+        let w = if e[0] == 0 { 256 } else { e[0] as i32 };
+        let len = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+        let off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+        let better = match best {
+            None => true,
+            Some((bw, _, _)) => (w >= size && (bw < size || w < bw)) || (bw < size && w > bw),
+        };
+        if better {
+            best = Some((w, off, len));
+        }
+    }
+    let Some((_, off, len)) = best else { return HICON::default() };
     unsafe {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let Ok(color) = CreateDIBSection(HDC::default(), &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) else {
-            return HICON::default();
-        };
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u32, pixels.len());
-        let mask = CreateBitmap(size, size, 1, 1, None);
-        let ii = ICONINFO { fIcon: TRUE, xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
-        let icon = CreateIconIndirect(&ii).unwrap_or_default();
-        let _ = DeleteObject(color);
-        let _ = DeleteObject(mask);
-        icon
+        CreateIconFromResourceEx(&ico[off..off + len], TRUE, 0x0003_0000, size, size, LR_DEFAULTCOLOR).unwrap_or_default()
     }
 }

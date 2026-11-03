@@ -1,11 +1,11 @@
-name: Derleme
+name: Build
 
-# Her main gönderiminde Windows ve Mac derlenir, numaralı bir GitHub sürümü yayınlanır; uygulamalar
-# kendilerini bu sürümden günceller. Sürüm numarası = çalıştırma numarası.
+# Every push to main builds Windows and Mac and publishes a numbered GitHub release; the apps update
+# themselves from it. Version number = run number.
 #
-# Güven: sürüm bildirgesi (manifest.txt: sürüm + dosya özetleri) projenin imza anahtarıyla
-# (MAC_SIGN_P12; Mac uygulamasını da imzalar) imzalanır; uygulamalar yalnız bu imzayı taşıyan
-# güncellemeyi kurar. Çatallar ve PR'lar bu iş akışını tetikleyemez (gizli değişkenlere erişemez).
+# Trust: the release manifest (manifest.txt: version + file hashes) is signed with the project's
+# signing key (MAC_SIGN_P12, which also signs the Mac app); the apps only install updates carrying
+# this signature. Forks and pull requests cannot trigger this workflow (no access to secrets).
 on:
   push:
     branches: [main]
@@ -25,11 +25,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Rust araç zinciri
+      - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - name: Test
         run: cargo test --release --locked
-      - name: Derle
+      - name: Build
         shell: bash
         run: |
           cargo build --release --locked
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Derle, imzala ve paketle
+      - name: Build, sign and package
         env:
           MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
           MAC_SIGN_PASSWORD: ${{ secrets.MAC_SIGN_PASSWORD }}
@@ -59,7 +59,7 @@ jobs:
             mac-agent/build/AynaAjan.zip
 
   release:
-    name: Sürüm yayınla
+    name: Publish release
     needs: [windows, mac]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -70,7 +70,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Bildirgeyi imzala
+      - name: Sign manifest
         env:
           MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
           MAC_SIGN_PASSWORD: ${{ secrets.MAC_SIGN_PASSWORD }}
@@ -88,11 +88,21 @@ jobs:
           od -An -tx1 -v manifest.bin | tr -d ' \n' > manifest.sig
           rm -f manifest.bin pub.pem
           cat manifest.txt
-      - name: Yayınla
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
+          {
+            echo "Ayna Merkezi (Windows) and Ayna Ajan (Mac), version ${AYNA_BUILD}."
+            echo
+            echo "- Windows: iPhoneAyna.exe (keep it next to the bin/uxplay folder)"
+            echo "- Mac: AynaAjan.dmg"
+            echo
+            echo "Installed apps update themselves. Signed manifest (SHA-256):"
+            echo
+            sed 's/^/    /' manifest.txt
+          } > notes.md
           gh release create "v${AYNA_BUILD}" iPhoneAyna.exe AynaAjan.zip AynaAjan.dmg manifest.txt manifest.sig \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "Sürüm ${AYNA_BUILD}" --notes-file manifest.txt
+            --title "Version ${AYNA_BUILD}" --notes-file notes.md

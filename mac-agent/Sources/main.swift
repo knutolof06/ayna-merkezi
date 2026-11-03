@@ -73,6 +73,11 @@ func unhex(_ s: String) -> Data? {
     return out
 }
 
+/// Arayüz dili Mac'in diline göre: Türkçe ya da İngilizce.
+let turkishUI = Locale.preferredLanguages.first?.lowercased().hasPrefix("tr") ?? false
+
+func L(_ turkish: String, _ english: String) -> String { turkishUI ? turkish : english }
+
 func isHex(_ s: String, length: Int) -> Bool { s.count == length && s.allSatisfy(\.isHexDigit) }
 
 func randomBytes(_ count: Int) -> Data {
@@ -319,7 +324,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let content,
                   let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
             else {
-                self.onError("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).")
+                self.onError(L("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).", "Screen Recording permission is required (System Settings > Privacy & Security > Screen Recording)."))
                 return
             }
             // Gerçek piksel boyutu (Retina), en uzun kenar sınırına ölçeklenir; kodlayıcı çift sayı ister.
@@ -348,7 +353,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
         } catch {
-            self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+            self.onError(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
             return
         }
         // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
@@ -363,7 +368,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream.startCapture { [weak self] error in
             guard let self else { return }
             if let error {
-                self.onError("Ekran yakalanamadı: \(error.localizedDescription)")
+                self.onError(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
                 return
             }
             // Başlarken durdurulduysa hemen kapat.
@@ -406,7 +411,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let lowLatency = create(lowLatency: true)
         guard let s = lowLatency ?? create(lowLatency: false) else {
-            onError("Görüntü kodlayıcı açılamadı.")
+            onError(L("Görüntü kodlayıcı açılamadı.", "The video encoder could not be started."))
             return
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -1056,15 +1061,15 @@ final class PhoneMirror {
 
     func start() {
         guard AXIsProcessTrusted() else {
-            fail("Erişilebilirlik izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik > Ayna Ajan).")
+            fail(L("Erişilebilirlik izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik > Ayna Ajan).", "Accessibility permission is required (System Settings > Privacy & Security > Accessibility > Ayna Ajan)."))
             return
         }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.bundleID) else {
-            fail("Bu Mac'te iPhone Mirroring yok (macOS 15 Sequoia ve Apple çipli Mac gerekir).")
+            fail(L("Bu Mac'te iPhone Mirroring yok (macOS 15 Sequoia ve Apple çipli Mac gerekir).", "iPhone Mirroring is not available on this Mac (requires macOS 15 Sequoia and an Apple silicon Mac)."))
             return
         }
         guard let d = Self.makeDisplay() else {
-            fail("Görünmez ekran açılamadı.")
+            fail(L("Görünmez ekran açılamadı.", "The hidden display could not be created."))
             return
         }
         display = d
@@ -1076,7 +1081,7 @@ final class PhoneMirror {
         NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] _, error in
             DispatchQueue.main.async {
                 self?.openFinished = true
-                if let error { self?.fail("iPhone Mirroring açılamadı: \(error.localizedDescription)") }
+                if let error { self?.fail(L("iPhone Mirroring açılamadı: ", "iPhone Mirroring could not be opened: ") + error.localizedDescription) }
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
@@ -1142,17 +1147,17 @@ final class PhoneMirror {
         let bounds = CGDisplayBounds(id)
         // Sanal ekran hazır olmadan taşınırsa pencere ana ekranda bir yere gider.
         guard CGDisplayIsActive(id) != 0, bounds.width >= 300, bounds.height >= 300 else {
-            if elapsed > 10 { fail("Görünmez ekran hazır olmadı.") }
+            if elapsed > 10 { fail(L("Görünmez ekran hazır olmadı.", "The hidden display did not become ready.")) }
             return
         }
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first(where: { !$0.isTerminated })
         else {
-            if seenRunning { fail("iPhone Mirroring kapandı.") } else if elapsed > 20 { fail("iPhone Mirroring açılmadı.") }
+            if seenRunning { fail(L("iPhone Mirroring kapandı.", "iPhone Mirroring quit.")) } else if elapsed > 20 { fail(L("iPhone Mirroring açılmadı.", "iPhone Mirroring did not open.")) }
             return
         }
         seenRunning = true
         guard let found = Self.mainWindow(pid: app.processIdentifier) else {
-            if windowID == nil && elapsed > 30 { fail("iPhone Mirroring penceresi bulunamadı.") }
+            if windowID == nil && elapsed > 30 { fail(L("iPhone Mirroring penceresi bulunamadı.", "The iPhone Mirroring window was not found.")) }
             return
         }
         let (wid, rect) = found
@@ -1162,7 +1167,7 @@ final class PhoneMirror {
             let since = moveStarted ?? Date()
             moveStarted = since
             if Date().timeIntervalSince(since) > 10 {
-                fail("iPhone Mirroring penceresi görünmez ekrana taşınamadı.")
+                fail(L("iPhone Mirroring penceresi görünmez ekrana taşınamadı.", "The iPhone Mirroring window could not be moved to the hidden display."))
             } else {
                 Self.move(pid: app.processIdentifier, to: CGPoint(x: bounds.minX + 40, y: bounds.minY + 40))
             }
@@ -1806,7 +1811,7 @@ final class Session {
             phone = p
             phoneAnnounced = false
             injector.area = { [weak p] in p?.frame }
-            sendState(mode: 1, ok: true, "iPhone Mirroring açılıyor…")
+            sendState(mode: 1, ok: true, L("iPhone Mirroring açılıyor…", "Opening iPhone Mirroring…"))
             p.start()
         } else {
             phone?.stop()
@@ -1823,7 +1828,7 @@ final class Session {
         _ = phone.focus()
         if !phoneAnnounced {
             phoneAnnounced = true
-            sendState(mode: 1, ok: true, "iPhone hazır")
+            sendState(mode: 1, ok: true, L("iPhone hazır", "iPhone is ready"))
         }
     }
 
@@ -2138,21 +2143,21 @@ enum Updater {
                 func download(_ name: String) throws -> Data {
                     guard let a = release.assets.first(where: { $0.name == name }),
                           a.browser_download_url.hasPrefix(downloadPrefix), let url = URL(string: a.browser_download_url)
-                    else { throw UpdateError("Sürüm \(version) eksik yayınlanmış (\(name)).") }
+                    else { throw UpdateError(L("Sürüm \(version) eksik yayınlanmış (\(name)).", "Version \(version) was published incomplete (\(name)).")) }
                     return try fetch(URLRequest(url: url))
                 }
                 let manifest = try download("manifest.txt")
                 let sigText = String(decoding: try download("manifest.sig"), as: UTF8.self)
                 guard let sig = unhex(sigText.trimmingCharacters(in: .whitespacesAndNewlines)), verify(manifest, sig) else {
-                    throw UpdateError("Güncellemenin imzası doğrulanamadı.")
+                    throw UpdateError(L("Güncellemenin imzası doğrulanamadı.", "The update signature could not be verified."))
                 }
                 let text = String(decoding: manifest, as: UTF8.self)
                 guard text.split(whereSeparator: \.isNewline).first.map(String.init) == "AYNA-SURUM \(version)",
                       let expected = sha256(in: text, for: asset) else {
-                    throw UpdateError("Güncelleme bildirgesi sürümle uyuşmuyor.")
+                    throw UpdateError(L("Güncelleme bildirgesi sürümle uyuşmuyor.", "The update manifest does not match the version."))
                 }
                 let zip = try download(asset)
-                guard hex(SHA256.hash(data: zip)) == expected else { throw UpdateError("İndirilen güncellemenin özeti tutmuyor.") }
+                guard hex(SHA256.hash(data: zip)) == expected else { throw UpdateError(L("İndirilen güncellemenin özeti tutmuyor.", "The downloaded update failed its checksum.")) }
                 let dir = FileManager.default.temporaryDirectory.appendingPathComponent("AynaAjan-\(version)")
                 try? FileManager.default.removeItem(at: dir)
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -2161,7 +2166,7 @@ enum Updater {
                 try zip.write(to: zipURL)
                 guard run("/usr/bin/ditto", ["-x", "-k", zipURL.path, dir.path]), signatureValid(app),
                       bundleVersion(app) == version else {
-                    throw UpdateError("Güncelleme doğrulanamadı (imza ya da sürüm).")
+                    throw UpdateError(L("Güncelleme doğrulanamadı (imza ya da sürüm).", "The update could not be verified (signature or version)."))
                 }
                 DispatchQueue.main.async { completion(version, app) }
             } catch let e as UpdateError {
@@ -2293,7 +2298,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard pendingUpdate == nil else { return }
         Updater.check(completion: { [weak self] version, app in
             self?.pendingUpdate = (version, app)
-            self?.updateNote = "Sürüm \(version) hazır; bağlantı yokken kurulacak."
+            self?.updateNote = L("Sürüm \(version) hazır; bağlantı yokken kurulacak.", "Version \(version) is ready; it installs when no one is connected.")
             self?.installIfIdle()
         }, failed: { [weak self] message in
             DispatchQueue.main.async { self?.updateNote = message }
@@ -2307,12 +2312,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if Updater.install(app) {
             NSApp.terminate(nil)
         } else {
-            updateNote = "Sürüm \(version) kurulamadı (Uygulamalar klasörüne yazılamadı)."
+            updateNote = L("Sürüm \(version) kurulamadı (Uygulamalar klasörüne yazılamadı).", "Version \(version) could not be installed (cannot write to Applications).")
         }
     }
 
     @objc private func checkNow() {
-        updateNote = "Güncelleme denetleniyor…"
+        updateNote = L("Güncelleme denetleniyor…", "Checking for updates…")
         checkForUpdate()
     }
 
@@ -2370,7 +2375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             l.start(queue: .main)
             listener = l
         } catch {
-            show(error: "Bağlantı noktası \(agentPort) açılamadı: \(error.localizedDescription)")
+            show(error: L("Bağlantı noktası \(agentPort) açılamadı: ", "Port \(agentPort) could not be opened: ") + error.localizedDescription)
         }
     }
 
@@ -2441,33 +2446,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let alert = NSAlert()
             switch (known, authenticated) {
             case (.some(let k), true):
-                alert.messageText = "“\(k.name)” yeni bir adresten bağlanıyor"
-                alert.informativeText = "Güvenilen bu bilgisayar artık \(ip) adresinde (önceden \(k.ip))."
+                alert.messageText = L("“\(k.name)” yeni bir adresten bağlanıyor", "“\(k.name)” is connecting from a new address")
+                alert.informativeText = L("Güvenilen bu bilgisayar artık \(ip) adresinde (önceden \(k.ip)).", "This trusted computer is now at \(ip) (previously \(k.ip)).")
             case (.some(let k), false):
                 alert.alertStyle = .critical
-                alert.messageText = "“\(name)” kimliğini kanıtlayamadı"
-                alert.informativeText = """
+                alert.messageText = L("“\(name)” kimliğini kanıtlayamadı", "“\(name)” could not prove its identity")
+                alert.informativeText = L("""
                     Bu cihaz kendini güvendiğiniz “\(k.name)” gibi gösteriyor ama onun anahtarına sahip değil. \
                     Kendi bilgisayarınızın eşleşmesini sıfırlamadıysanız reddedin.
-                    """
+                    """, """
+                    This device claims to be your trusted “\(k.name)” but does not have its key. \
+                    Deny unless you reset the pairing on your own computer.
+                    """)
             default:
-                alert.messageText = "“\(name)” bu Mac'e bağlanmak istiyor"
-                alert.informativeText = """
+                alert.messageText = L("“\(name)” bu Mac'e bağlanmak istiyor", "“\(name)” wants to connect to this Mac")
+                alert.informativeText = L("""
                     İzin verirseniz bu bilgisayar Mac'in ekranını görüp fare ve klavyeyle kontrol edebilir \
                     ve güvenilenler listesine eklenir.
-                    """
+                    """, """
+                    If you allow it, this computer can see the Mac's screen, control it with mouse and keyboard, \
+                    and is added to the trusted list.
+                    """)
             }
-            alert.informativeText += """
+            alert.informativeText += L("""
 
 
                 Windows'taki Mac penceresinde görünen kod bununla aynı olmalı:
                 \(sas)
 
                 Adres: \(ip)   Cihaz: …\(id.suffix(6).uppercased())
-                """
+                """, """
+
+
+                The code shown in the Mac window on Windows must match:
+                \(sas)
+
+                Address: \(ip)   Device: …\(id.suffix(6).uppercased())
+                """)
             // Varsayılan (Enter) düğme "Reddet": o an yazı yazan kullanıcı yanlışlıkla izin vermesin.
-            alert.addButton(withTitle: "Reddet")
-            alert.addButton(withTitle: "İzin ver")
+            alert.addButton(withTitle: L("Reddet", "Deny"))
+            alert.addButton(withTitle: L("İzin ver", "Allow"))
             guard case .ready = session.conn.state else { completion(false); return }
             let allowed = alert.runModal() == .alertSecondButtonReturn
             // Yanıt geç verildiyse Windows çoktan vazgeçmiştir.
@@ -2481,25 +2499,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let codeItem = item("Kod: \(formatted(Store.code))", #selector(copyCode))
-        codeItem.toolTip = "Kopyalamak için tıklayın"
+        let codeItem = item(L("Kod: ", "Code: ") + formatted(Store.code), #selector(copyCode))
+        codeItem.toolTip = L("Kopyalamak için tıklayın", "Click to copy")
         menu.addItem(codeItem)
         if let s = active {
-            menu.addItem(item("Bağlı: \(s.name) (\(s.ip))", nil))
-            menu.addItem(item("Bağlantıyı kes", #selector(disconnect)))
+            menu.addItem(item(L("Bağlı: ", "Connected: ") + "\(s.name) (\(s.ip))", nil))
+            menu.addItem(item(L("Bağlantıyı kes", "Disconnect"), #selector(disconnect)))
         }
-        let accepting = item("Bağlantılara izin ver", #selector(toggleAccepting))
+        let accepting = item(L("Bağlantılara izin ver", "Allow connections"), #selector(toggleAccepting))
         accepting.state = Store.accepting ? .on : .off
         menu.addItem(accepting)
         menu.addItem(.separator())
 
-        let trustedItem = item("Güvenilen bilgisayarlar", nil)
+        let trustedItem = item(L("Güvenilen bilgisayarlar", "Trusted computers"), nil)
         let sub = NSMenu()
-        if Store.trusted.isEmpty { sub.addItem(item("Henüz yok", nil)) }
+        if Store.trusted.isEmpty { sub.addItem(item(L("Henüz yok", "None yet"), nil)) }
         for device in Store.trusted {
             let entry = NSMenuItem(title: "\(device.name) (\(device.ip))", action: nil, keyEquivalent: "")
             let actions = NSMenu()
-            let remove = item("Güveni kaldır", #selector(removeTrusted(_:)))
+            let remove = item(L("Güveni kaldır", "Remove trust"), #selector(removeTrusted(_:)))
             remove.representedObject = device.id
             actions.addItem(remove)
             entry.submenu = actions
@@ -2508,16 +2526,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         trustedItem.submenu = sub
         menu.addItem(trustedItem)
         menu.addItem(.separator())
-        menu.addItem(item(screenAllowed ? "Ekran Kaydı izni: verildi" : "Ekran Kaydı izni ver…", #selector(openScreenPrivacy)))
-        menu.addItem(item(inputAllowed ? "Erişilebilirlik izni: verildi" : "Erişilebilirlik izni ver…", #selector(openInputPrivacy)))
-        let version = Updater.build > 0 ? "Sürüm \(Updater.build)" : "Geliştirme sürümü"
+        menu.addItem(item(screenAllowed ? L("Ekran Kaydı izni: verildi", "Screen Recording: allowed") : L("Ekran Kaydı izni ver…", "Allow Screen Recording…"), #selector(openScreenPrivacy)))
+        menu.addItem(item(inputAllowed ? L("Erişilebilirlik izni: verildi", "Accessibility: allowed") : L("Erişilebilirlik izni ver…", "Allow Accessibility…"), #selector(openInputPrivacy)))
+        let version = Updater.build > 0 ? L("Sürüm ", "Version ") + "\(Updater.build)" : L("Geliştirme sürümü", "Development build")
         menu.addItem(item(updateNote.map { "\(version) · \($0)" } ?? version, nil))
-        menu.addItem(item("Güncellemeleri denetle", #selector(checkNow)))
-        let login = item("Oturum açınca başlat", #selector(toggleLogin))
+        menu.addItem(item(L("Güncellemeleri denetle", "Check for Updates"), #selector(checkNow)))
+        let login = item(L("Oturum açınca başlat", "Open at Login"), #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
         menu.addItem(.separator())
-        menu.addItem(item("Çıkış", #selector(quit)))
+        menu.addItem(item(L("Çıkış", "Quit"), #selector(quit)))
     }
 
     private func item(_ title: String, _ action: Selector?) -> NSMenuItem {
@@ -2566,7 +2584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try SMAppService.mainApp.register()
             }
         } catch {
-            show(error: "Oturum açılış ayarı değiştirilemedi.", detail: error.localizedDescription)
+            show(error: L("Oturum açılış ayarı değiştirilemedi.", "The login item setting could not be changed."), detail: error.localizedDescription)
         }
     }
 

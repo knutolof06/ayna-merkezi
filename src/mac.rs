@@ -37,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::crypto::{self, ct_eq, hex, unhex, Aead, EcdhKey};
 use crate::gst::Player;
+use crate::i18n::{self, tf};
 use crate::util;
 
 /// Durum değişti (iş parçacığı → Mac penceresi).
@@ -135,12 +136,12 @@ pub enum State {
 impl State {
     pub fn text(&self) -> String {
         match self {
-            State::Idle => "Bağlı değil".into(),
-            State::Searching => "Ağda aranıyor…".into(),
-            State::Waiting { name, .. } => format!("{name}: Mac'te onay bekleniyor…"),
-            State::Confirm { name, .. } => format!("{name}: doğrulama kodunu onaylayın"),
-            State::Connecting(name) => format!("{name}: bağlanılıyor…"),
-            State::Connected(name) => format!("Bağlı: {name}"),
+            State::Idle => i18n::t("Bağlı değil", "Not connected").into(),
+            State::Searching => i18n::t("Ağda aranıyor…", "Searching the network…").into(),
+            State::Waiting { name, .. } => tf("{}: Mac'te onay bekleniyor…", "{}: waiting for approval on the Mac…", &[name]),
+            State::Confirm { name, .. } => tf("{}: doğrulama kodunu onaylayın", "{}: confirm the verification code", &[name]),
+            State::Connecting(name) => tf("{}: bağlanılıyor…", "{}: connecting…", &[name]),
+            State::Connected(name) => tf("Bağlı: {}", "Connected: {}", &[name]),
             State::Failed(why) => why.clone(),
         }
     }
@@ -419,7 +420,7 @@ impl Mac {
             *asked = None;
             self.shared.phone.store(false, Ordering::SeqCst);
             *self.shared.note.lock().unwrap() =
-                Some("Mac'teki Ayna Ajan bu özelliği bilmiyor: Mac'te menüden \"Güncellemeleri denetle\".".into());
+                Some(i18n::t("Mac'teki Ayna Ajan bu özelliği bilmiyor: Mac'te menüden \"Güncellemeleri denetle\".", "Ayna Ajan on the Mac does not support this yet: choose \"Check for updates\" in its menu.").into());
             post_files(self.notify.0 as isize, FILES_NOTE);
         }
     }
@@ -500,12 +501,12 @@ impl Mac {
                     // Mac'te bağlantı kesildi: kendiliğinden yeniden bağlanılmaz.
                     Ok(true) => {
                         inner.dropped = false;
-                        inner.state = State::Failed("Mac'te bağlantı kesildi.".into());
+                        inner.state = State::Failed(i18n::t("Mac'te bağlantı kesildi.", "Disconnected on the Mac.").into());
                     }
                     Ok(false) => {
                         // Bağlantı koptu (ağ, uyku).
                         inner.dropped = true;
-                        inner.state = State::Failed("Mac bağlantısı koptu; yeniden bağlanılıyor…".into());
+                        inner.state = State::Failed(i18n::t("Mac bağlantısı koptu; yeniden bağlanılıyor…", "Connection to the Mac was lost; reconnecting…").into());
                     }
                     Err(why) => {
                         util::log(&format!("Mac bağlantısı başarısız: {why}"));
@@ -573,12 +574,18 @@ impl Mac {
 /// Ağdan kaynaklanan, yeniden denemeye değer hatalar (ret ya da kimlik hatası değil).
 fn transient(why: &str) -> bool {
     why.starts_with("Mac bulunamadı")
+        || why.starts_with("Mac not found")
         || why.starts_with("Mac'teki Ayna Ajan'a bağlanılamadı")
+        || why.starts_with("Could not connect to Ayna Ajan")
         || why.starts_with("Mac bağlantıyı kapattı")
+        || why.starts_with("The Mac closed the connection")
         || why.starts_with("Mac'e şu an başka")
+        || why.starts_with("Another computer is connected to the Mac")
         // Son bilinen adreste artık başka bir cihaz olabilir (Mac'in adresi değişti): yeniden denenir.
         || why.starts_with("Mac'ten beklenmeyen yanıt")
+        || why.starts_with("Unexpected reply from the Mac")
         || why.starts_with("Mac'ten geçersiz el sıkışma")
+        || why.starts_with("Invalid handshake from the Mac")
 }
 
 fn post(notify: isize) {
@@ -602,7 +609,7 @@ enum Found {
 /// anahtarla imzalı olmalıdır (bağlantı noktası ve ad dahil).
 fn discover(code: &str) -> Result<Found, String> {
     let key = mac_key(code);
-    let nonce = hex(&crypto::random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
+    let nonce = hex(&crypto::random::<16>().ok_or(i18n::t("Rastgele sayı üretilemedi.", "Could not generate a random number."))?);
     let query = format!("AYNA1 FIND {code} {} {nonce}", device_id()?);
     let mut sockets = Vec::new();
     for ip in local_ipv4() {
@@ -613,7 +620,7 @@ fn discover(code: &str) -> Result<Found, String> {
         }
     }
     if sockets.is_empty() {
-        let s = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("Ağ kullanılamıyor ({e})."))?;
+        let s = UdpSocket::bind("0.0.0.0:0").map_err(|e| tf("Ağ kullanılamıyor ({}).", "Network unavailable ({}).", &[&e]))?;
         let _ = s.set_broadcast(true);
         let _ = s.set_nonblocking(true);
         sockets.push(s);
@@ -704,13 +711,18 @@ unsafe fn message_box(owner: isize, text: &str, flags: MESSAGEBOX_STYLE) -> MESS
 }
 
 fn ask_repair(owner: isize, peer: &Peer) -> bool {
-    let text = format!(
+    let text = tf(
         "“{}” ({}) yanıt verdi ama bu bilgisayarla yapılmış eşleşmeyi kanıtlayamadı.\n\n\
          Mac'te bu bilgisayarın güvenini kaldırdıysanız ya da Ayna Ajan'ı yeniden kurduysanız \
          \"Evet\" deyin; Mac'te yeniden onay istenir.\n\n\
          Böyle bir şey yapmadıysanız \"Hayır\" deyin: ağdaki başka bir cihaz kendini bu Mac gibi \
          gösteriyor olabilir.\n\nYeniden eşleşilsin mi?",
-        peer.name, peer.ip
+        "\"{}\" ({}) replied but could not prove the pairing made with this computer.\n\n\
+         Choose \"Yes\" if you removed this computer's trust on the Mac or reinstalled Ayna Ajan; \
+         the Mac will ask for approval again.\n\n\
+         If you did not, choose \"No\": another device on the network may be posing as this Mac.\n\n\
+         Pair again?",
+        &[&peer.name, &peer.ip],
     );
     unsafe { message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
 }
@@ -726,7 +738,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         Found::UnsignedOnly(peer) => {
             // Soru açıkken vazgeçilmiş olabilir: eşleşme ancak deneme hâlâ geçerliyse silinir.
             if !shared.alive(attempt) || !ask_repair(notify, &peer) || !shared.alive(attempt) {
-                return Err("Mac'in kimliği doğrulanamadı; eşleşme yenilenmedi.".into());
+                return Err(i18n::t("Mac'in kimliği doğrulanamadı; eşleşme yenilenmedi.", "Could not verify the Mac's identity; pairing was not renewed.").into());
             }
             Mac::forget(code);
             util::log(&format!("Mac kodu {code} için eşleşme kullanıcı onayıyla sıfırlandı."));
@@ -740,7 +752,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 util::log(&format!("Bulma yanıtı yok; son bilinen adres deneniyor: {}:{}", peer.ip, peer.port));
                 peer
             }
-            None => return Err("Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?".into()),
+            None => return Err(i18n::t("Mac bulunamadı. Mac'te Ayna Ajan açık mı, iki cihaz aynı ağda mı?", "Mac not found. Is Ayna Ajan running on the Mac, and are both devices on the same network?").into()),
         },
     };
     util::log(&format!("Mac bulundu: {} ({}:{})", peer.name, peer.ip, peer.port));
@@ -751,7 +763,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
 
     let addr = SocketAddr::new(IpAddr::V4(peer.ip), peer.port);
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(4))
-        .map_err(|e| format!("Mac'teki Ayna Ajan'a bağlanılamadı ({e})."))?;
+        .map_err(|e| tf("Mac'teki Ayna Ajan'a bağlanılamadı ({}).", "Could not connect to Ayna Ajan on the Mac ({}).", &[&e]))?;
     let _ = stream.set_nodelay(true);
     // Kısa okuma süresi: vazgeçme ve süre aşımı her saniye denetlenir.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
@@ -765,13 +777,13 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
 
     // --- El sıkışma
     let id = device_id()?;
-    let ecdh = EcdhKey::generate().ok_or("Anahtar üretilemedi.")?;
-    let win_pub = hex(&ecdh.public_x963().ok_or("Anahtar üretilemedi.")?);
+    let ecdh = EcdhKey::generate().ok_or(i18n::t("Anahtar üretilemedi.", "Could not generate a key."))?;
+    let win_pub = hex(&ecdh.public_x963().ok_or(i18n::t("Anahtar üretilemedi.", "Could not generate a key."))?);
     // Açık anahtar, Mac'inki görülmeden önce özetiyle bağlanır (doğrulama kodu denenerek eşitlenemesin).
-    let commit = hex(&crypto::sha256(format!("{win_pub}|{id}").as_bytes()).ok_or("Özet hesaplanamadı.")?);
+    let commit = hex(&crypto::sha256(format!("{win_pub}|{id}").as_bytes()).ok_or(i18n::t("Özet hesaplanamadı.", "Could not compute the digest."))?);
     writer
         .write_all(format!("AYNA2 COMMIT {id} {commit}\n").as_bytes())
-        .map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
+        .map_err(|e| tf("Mac'e ulaşılamadı ({}).", "Could not reach the Mac ({}).", &[&e]))?;
     let started = Instant::now();
     let mut pending = String::new();
     let first = read_line_limited(&mut reader, &mut pending, started, &alive)?;
@@ -779,28 +791,28 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     let (Some("AYNA2"), Some("HI"), Some(nonce), Some(mac_pub), None) =
         (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
     else {
-        return Err(format!("Mac'ten beklenmeyen yanıt: {}", clean_name(&first)));
+        return Err(tf("Mac'ten beklenmeyen yanıt: {}", "Unexpected reply from the Mac: {}", &[&clean_name(&first)]));
     };
     if nonce.len() != 32 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Mac'ten geçersiz el sıkışma.".into());
+        return Err(i18n::t("Mac'ten geçersiz el sıkışma.", "Invalid handshake from the Mac.").into());
     }
-    let mac_pub_bytes = unhex(mac_pub).filter(|b| b.len() == 65).ok_or("Mac'ten geçersiz anahtar.")?;
-    let shared_secret = ecdh.agree(&mac_pub_bytes).ok_or("Mac'in anahtarı geçersiz.")?;
+    let mac_pub_bytes = unhex(mac_pub).filter(|b| b.len() == 65).ok_or(i18n::t("Mac'ten geçersiz anahtar.", "Invalid key from the Mac."))?;
+    let shared_secret = ecdh.agree(&mac_pub_bytes).ok_or(i18n::t("Mac'in anahtarı geçersiz.", "The Mac's key is invalid."))?;
     let name = clean_name(&std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into())).replace(' ', "_");
     let name = if name.is_empty() { "Windows".to_string() } else { name };
     let t = format!("AYNA2|{nonce}|{mac_pub}|{win_pub}|{id}|{name}");
     let key = mac_key(code);
     let proof = match &key {
-        Some(k) => hex(&crypto::hmac(k, format!("hello|{t}").as_bytes()).ok_or("İmza hesaplanamadı.")?),
+        Some(k) => hex(&crypto::hmac(k, format!("hello|{t}").as_bytes()).ok_or(i18n::t("İmza hesaplanamadı.", "Could not compute the signature."))?),
         None => "-".to_string(),
     };
     writer
         .write_all(format!("AYNA2 HELLO {id} {proof} {win_pub} {name}\n").as_bytes())
-        .map_err(|e| format!("Mac'e ulaşılamadı ({e})."))?;
+        .map_err(|e| tf("Mac'e ulaşılamadı ({}).", "Could not reach the Mac ({}).", &[&e]))?;
 
     let derive = |info: &str, n: usize| crypto::hkdf(&shared_secret, &[], format!("{info}|{t}").as_bytes(), n);
-    let keys = derive("keys", 64).ok_or("Anahtar türetilemedi.")?;
-    let sas_bytes = derive("sas", 4).ok_or("Anahtar türetilemedi.")?;
+    let keys = derive("keys", 64).ok_or(i18n::t("Anahtar türetilemedi.", "Could not derive the key."))?;
+    let sas_bytes = derive("sas", 4).ok_or(i18n::t("Anahtar türetilemedi.", "Could not derive the key."))?;
     let sas_n = u32::from_be_bytes([sas_bytes[0], sas_bytes[1], sas_bytes[2], sas_bytes[3]]) % 1_000_000;
     let sas = format!("{:03} {:03}", sas_n / 1000, sas_n % 1000);
 
@@ -821,9 +833,9 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                     // Eşleşilmiş Mac onayını kayıtlı anahtarla imzalar; anahtar değiştirilemez.
                     (Some(k), "SAME") if proof_matches(k, &ok_msg, proof) => {}
                     (None, "NEW") => {
-                        let token = derive("token", 32).ok_or("Anahtar türetilemedi.")?;
+                        let token = derive("token", 32).ok_or(i18n::t("Anahtar türetilemedi.", "Could not derive the key."))?;
                         if !proof_matches(&token, &ok_msg, proof) {
-                            return Err("Mac'in onayı doğrulanamadı.".into());
+                            return Err(i18n::t("Mac'in onayı doğrulanamadı.", "Could not verify the Mac's approval.").into());
                         }
                         // Sahte bir Mac de "OK" diyebilir: eşleşme, Windows kullanıcısı Mac'in
                         // ekranında aynı kodu gördüğünü onaylamadan kurulmaz.
@@ -832,20 +844,20 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                             util::log("Mac anahtarı kaydedilemedi; sonraki bağlantıda yeniden onay istenecek.");
                         }
                     }
-                    _ => return Err("Mac'in onayı doğrulanamadı.".into()),
+                    _ => return Err(i18n::t("Mac'in onayı doğrulanamadı.", "Could not verify the Mac's approval.").into()),
                 }
                 break;
             }
-            ["AYNA2", "DENY"] => return Err("Mac bu bilgisayarın bağlanmasını reddetti.".into()),
-            ["AYNA2", "OFF"] => return Err("Mac'te Ayna Ajan bağlantılara kapalı.".into()),
-            ["AYNA2", "BUSY"] => return Err("Mac'e şu an başka bir bilgisayar bağlı.".into()),
-            _ => return Err(format!("Mac'ten beklenmeyen yanıt: {}", clean_name(&line))),
+            ["AYNA2", "DENY"] => return Err(i18n::t("Mac bu bilgisayarın bağlanmasını reddetti.", "The Mac refused this computer's connection.").into()),
+            ["AYNA2", "OFF"] => return Err(i18n::t("Mac'te Ayna Ajan bağlantılara kapalı.", "Ayna Ajan on the Mac is not accepting connections.").into()),
+            ["AYNA2", "BUSY"] => return Err(i18n::t("Mac'e şu an başka bir bilgisayar bağlı.", "Another computer is connected to the Mac right now.").into()),
+            _ => return Err(tf("Mac'ten beklenmeyen yanıt: {}", "Unexpected reply from the Mac: {}", &[&clean_name(&line)])),
         }
     }
 
     // --- Şifreli oturum
-    let mut rx_aead = Aead::new(&keys[32..64]).ok_or("Şifreleme başlatılamadı.")?;
-    let tx_aead = Aead::new(&keys[0..32]).ok_or("Şifreleme başlatılamadı.")?;
+    let mut rx_aead = Aead::new(&keys[32..64]).ok_or(i18n::t("Şifreleme başlatılamadı.", "Could not start encryption."))?;
+    let tx_aead = Aead::new(&keys[0..32]).ok_or(i18n::t("Şifreleme başlatılamadı.", "Could not start encryption."))?;
     let (tx, out) = mpsc::channel::<Vec<u8>>();
     let pname = peer.name.clone();
     if !shared.publish(attempt, |i| {
@@ -893,13 +905,13 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         }
         let n = u32::from_be_bytes(len) as usize;
         if !(crypto::TAG_LEN + 1..=MAX_FRAME).contains(&n) {
-            return Err("Mac'ten geçersiz veri geldi.".into());
+            return Err(i18n::t("Mac'ten geçersiz veri geldi.", "Invalid data from the Mac.").into());
         }
         let mut frame = vec![0u8; n];
         if !read_exact_patient(&mut reader, &mut frame, &alive, &mut last_data) {
             return Ok(false);
         }
-        let plain = rx_aead.open(&frame).ok_or("Mac'ten gelen veri doğrulanamadı.")?;
+        let plain = rx_aead.open(&frame).ok_or(i18n::t("Mac'ten gelen veri doğrulanamadı.", "Could not verify data from the Mac."))?;
         stats.report(&peer.name);
         match plain[0] {
             MSG_VIDEO if plain.len() > 2 => {
@@ -995,11 +1007,11 @@ fn wait_for_decision(
         }
         match shared.inner.lock().unwrap().decision {
             Some(true) => return Ok(()),
-            Some(false) => return Err("Doğrulama kodu onaylanmadı; eşleşme kurulmadı.".into()),
+            Some(false) => return Err(i18n::t("Doğrulama kodu onaylanmadı; eşleşme kurulmadı.", "The verification code was not confirmed; pairing was not set up.").into()),
             None => {}
         }
         if started.elapsed() > APPROVAL_TIMEOUT {
-            return Err("Doğrulama kodu onaylanmadı (süre doldu).".into());
+            return Err(i18n::t("Doğrulama kodu onaylanmadı (süre doldu).", "The verification code was not confirmed (timed out).").into());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1090,8 +1102,8 @@ fn finish_batch(shared: &Shared, batches: &mut HashMap<u32, (usize, usize)>, bat
     }
     let folder = dest.map(|d| d.trim_end_matches('/').rsplit('/').next().unwrap_or("Mac").to_string());
     *shared.note.lock().unwrap() = Some(match folder {
-        Some(f) => format!("Mac'e kopyalandı: {done} dosya → {f}"),
-        None => format!("Mac'e kopyalandı: {done} dosya"),
+        Some(f) => tf("Mac'e kopyalandı: {} dosya → {}", "Copied to Mac: {} files → {}", &[&done, &f]),
+        None => tf("Mac'e kopyalandı: {} dosya", "Copied to Mac: {} files", &[&done]),
     });
     post_files(notify, FILES_NOTE);
 }
@@ -1387,18 +1399,18 @@ fn read_line_limited(
             return Err(String::new());
         }
         if started.elapsed() > APPROVAL_TIMEOUT {
-            return Err("Mac'te onay verilmedi (süre doldu).".into());
+            return Err(i18n::t("Mac'te onay verilmedi (süre doldu).", "Approval was not given on the Mac (timed out).").into());
         }
         let room = 512u64.saturating_sub(pending.len() as u64);
         if room == 0 {
-            return Err("Mac'ten çok uzun yanıt geldi.".into());
+            return Err(i18n::t("Mac'ten çok uzun yanıt geldi.", "The Mac sent an overly long reply.").into());
         }
         match reader.by_ref().take(room).read_line(pending) {
-            Ok(0) => return Err("Mac bağlantıyı kapattı.".into()),
+            Ok(0) => return Err(i18n::t("Mac bağlantıyı kapattı.", "The Mac closed the connection.").into()),
             Ok(_) if pending.ends_with('\n') => return Ok(std::mem::take(pending).trim().to_string()),
             Ok(_) => continue,
             Err(e) if matches!(e.kind(), WouldBlock | TimedOut) => continue,
-            Err(_) => return Err("Mac'ten geçersiz yanıt geldi.".into()),
+            Err(_) => return Err(i18n::t("Mac'ten geçersiz yanıt geldi.", "Invalid reply from the Mac.").into()),
         }
     }
 }
@@ -1448,7 +1460,7 @@ fn device_id() -> Result<String, String> {
     if let Some(id) = util::read_text_setting(DEVICE_SETTING).filter(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())) {
         return Ok(id);
     }
-    let id = hex(&crypto::random::<16>().ok_or("Rastgele sayı üretilemedi.")?);
+    let id = hex(&crypto::random::<16>().ok_or(i18n::t("Rastgele sayı üretilemedi.", "Could not generate a random number."))?);
     let _ = util::write_text_setting(DEVICE_SETTING, &id);
     Ok(id)
 }

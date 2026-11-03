@@ -15,6 +15,7 @@
 //! kapanmasını bekleyip açılır; `.eski` sonraki açılışta silinir.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -48,6 +49,79 @@ pub fn build() -> u32 {
     option_env!("AYNA_BUILD").and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Güncelleme durumu (Ayarlar penceresinde gösterilir).
+#[derive(Clone, PartialEq)]
+pub enum Status {
+    Idle,
+    Checking,
+    UpToDate,
+    Ready(u32),
+    Failed,
+}
+
+static STATUS: Mutex<Status> = Mutex::new(Status::Idle);
+
+pub fn status() -> Status {
+    STATUS.lock().unwrap().clone()
+}
+
+fn set_status(s: Status) {
+    *STATUS.lock().unwrap() = s;
+}
+
+/// Kurulum yapılamadı (dosya değişmiş, taşınamadı): kullanıcı yeniden deneyebilsin.
+pub fn mark_failed() {
+    set_status(Status::Failed);
+}
+
+/// Aynı anda tek denetim: iki denetim aynı dosyaya yazıp birbirinin sonucunu ezmesin.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Bir denetim yapar, sonucu durum olarak bırakır; yeni sürüm indiyse true.
+fn run_check(notify: isize) -> bool {
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    set_status(Status::Checking);
+    let ready = match check() {
+        Ok(Some(v)) => {
+            util::log(&format!("Güncelleme indirildi: sürüm {v}."));
+            set_status(Status::Ready(v));
+            unsafe {
+                let _ = PostMessageW(HWND(notify as _), WM_APP_UPDATE, WPARAM(v as usize), LPARAM(0));
+            }
+            true
+        }
+        Ok(None) => {
+            set_status(Status::UpToDate);
+            false
+        }
+        Err(e) => {
+            util::log(&format!("Güncelleme denetlenemedi: {e}"));
+            set_status(Status::Failed);
+            false
+        }
+    };
+    BUSY.store(false, Ordering::SeqCst);
+    ready
+}
+
+/// Kullanıcı istedi: hemen denetler; yeni sürüm inerse `notify`'a `WM_APP_UPDATE`.
+pub fn check_now(notify: HWND) {
+    if build() == 0 || matches!(status(), Status::Ready(_)) {
+        return;
+    }
+    if BUSY.load(Ordering::SeqCst) {
+        // Arka plandaki denetim sürüyor; sonucu o bildirir.
+        set_status(Status::Checking);
+        return;
+    }
+    let notify = notify.0 as isize;
+    std::thread::spawn(move || {
+        run_check(notify);
+    });
+}
+
 /// İndirilmiş, uygulanmayı bekleyen sürüm: numara, dosya, beklenen özet.
 static READY: Mutex<Option<(u32, PathBuf, String)>> = Mutex::new(None);
 
@@ -60,16 +134,8 @@ pub fn start(notify: HWND) {
     std::thread::spawn(move || {
         std::thread::sleep(FIRST_CHECK);
         loop {
-            match check() {
-                Ok(Some(v)) => {
-                    util::log(&format!("Güncelleme indirildi: sürüm {v}."));
-                    unsafe {
-                        let _ = PostMessageW(HWND(notify as _), WM_APP_UPDATE, WPARAM(v as usize), LPARAM(0));
-                    }
-                    return;
-                }
-                Ok(None) => {}
-                Err(e) => util::log(&format!("Güncelleme denetlenemedi: {e}")),
+            if matches!(status(), Status::Ready(_)) || run_check(notify) {
+                return;
             }
             std::thread::sleep(CHECK_EVERY);
         }
@@ -108,7 +174,11 @@ fn check() -> Result<Option<u32>, String> {
     // Uzantısız: çift tıklanıp ya da görev çubuğuna sabitlenip uygulama bu dosyadan açılmasın.
     let exe = util::exe_path();
     let new = exe.with_extension("guncelleme");
-    std::fs::write(&new, &bytes).map_err(|e| format!("yazılamadı: {e}"))?;
+    // Önce geçici dosyaya: yarım yazılmış dosya hiç "hazır" görünmesin.
+    let partial = exe.with_extension("guncelleme.tmp");
+    std::fs::write(&partial, &bytes).map_err(|e| format!("yazılamadı: {e}"))?;
+    let _ = std::fs::remove_file(&new);
+    std::fs::rename(&partial, &new).map_err(|e| format!("yazılamadı: {e}"))?;
     *READY.lock().unwrap() = Some((version, new, expected));
     Ok(Some(version))
 }

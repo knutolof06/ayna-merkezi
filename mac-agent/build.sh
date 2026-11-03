@@ -22,6 +22,9 @@ for arch in arm64 x86_64; do
 done
 lipo -create -output "$APP/Contents/MacOS/AynaAjan" "$OUT/AynaAjan-arm64" "$OUT/AynaAjan-x86_64"
 cp Info.plist "$APP/Contents/Info.plist"
+# İzin açıklamalarının Türkçesi (Mac Türkçeyse bunlar görünür).
+mkdir -p "$APP/Contents/Resources"
+cp -R tr.lproj "$APP/Contents/Resources/"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" -c "Set :CFBundleShortVersionString 1.$VERSION" "$APP/Contents/Info.plist"
 
 if [ -n "${MAC_SIGN_P12:-}" ]; then

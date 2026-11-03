@@ -4,8 +4,10 @@ mod ble;
 mod buttons;
 mod corners;
 mod crypto;
+mod countdown;
 mod dragout;
 mod ghost;
+mod i18n;
 mod gst;
 mod hid;
 mod hub;
@@ -15,6 +17,7 @@ mod mirror;
 mod taskbar;
 mod toast;
 mod transfer;
+mod tray;
 mod util;
 mod update;
 mod uxplay;
@@ -62,8 +65,9 @@ fn main() {
         macview::create();
         taskbar::ensure(hwnd);
         update::start(hub);
+        tray::create();
         if update::just_updated() {
-            toast::show(hwnd, &format!("Ayna Merkezi güncellendi (sürüm {}).", update::build()));
+            toast::show(hwnd, &crate::i18n::tf("Ayna Merkezi güncellendi (sürüm {}).", "Ayna Merkezi was updated (version {}).", &[&update::build()]));
         }
 
         // Uygulamayı açmak ana pencereyi açar; iPhone ekranı görev çubuğundaki ikondan.
@@ -76,7 +80,8 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        // Mac penceresi fareyi hapsetmişse çıkışta kesin bırakılır.
+        // Mac penceresi fareyi hapsetmişse çıkışta kesin bırakılır; bildirim simgesi kalkar.
         let _ = ClipCursor(None);
+        tray::remove();
     }
 }

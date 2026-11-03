@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::macview;
 use crate::mirror;
 use crate::taskbar::{self, draw_mac, draw_phone, fill, hex, round_rect_sdf, Canvas, Device, WM_APP_HUB};
+use crate::i18n::t;
 use crate::update;
 use crate::util::{self, height, width};
 
@@ -31,7 +32,7 @@ const PAD: f32 = 16.0;
 const TITLE_H: f32 = 56.0;
 const IPHONE_H: f32 = 142.0;
 const MAC_H: f32 = 150.0;
-const GENERAL_H: f32 = 108.0;
+const GENERAL_H: f32 = 216.0;
 const GAP: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +44,8 @@ enum Ctl {
     MacButton,
     AutostartSwitch,
     ZoomSwitch,
+    Language,
+    Update,
 }
 
 struct Hub {
@@ -56,6 +59,7 @@ struct Hub {
     fonts: Fonts,
     /// Son çizimdeki durum metinleri; değişmedikçe zamanlayıcı yeniden çizmez.
     painted: (String, String, bool, bool),
+    painted_update: Option<update::Status>,
 }
 
 pub(crate) struct Fonts {
@@ -213,6 +217,7 @@ pub fn create() -> Option<HWND> {
             tracking: false,
             fonts: Fonts::new(scale),
             painted: Default::default(),
+            painted_update: None,
         };
         STATE.with(|c| *c.borrow_mut() = Some(hub));
         with(|h| h.apply_theme());
@@ -263,6 +268,8 @@ struct Layout {
     general: [f32; 4],
     autostart_switch: [f32; 4],
     zoom_switch: [f32; 4],
+    language: [f32; 4],
+    update: [f32; 4],
 }
 
 fn layout(s: f32) -> Layout {
@@ -283,6 +290,8 @@ fn layout(s: f32) -> Layout {
         general: [x0, gy, x1, gy + GENERAL_H * s],
         autostart_switch: sw(gy + 13.0 * s),
         zoom_switch: sw(gy + 67.0 * s),
+        language: [x1 - (16.0 + 110.0) * s, gy + 121.0 * s, x1 - 16.0 * s, gy + 149.0 * s],
+        update: [x1 - (16.0 + 110.0) * s, gy + 175.0 * s, x1 - 16.0 * s, gy + 203.0 * s],
     }
 }
 
@@ -304,6 +313,8 @@ enum Action {
     MacButton,
     Autostart,
     Zoom,
+    Language,
+    Update,
     Paint,
 }
 
@@ -338,6 +349,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         update::WM_APP_UPDATE => {
             UPDATE_PENDING.with(|p| p.set(true));
+            invalidate(hwnd);
             return LRESULT(0);
         }
         WM_MOUSEMOVE => with(|h| h.mouse_move(point(lp))).unwrap_or(Action::None),
@@ -423,6 +435,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             util::write_setting(ZOOM_SETTING, u32::from(!on));
             invalidate(hwnd);
         }
+        Action::Language => {
+            crate::i18n::set_english(!crate::i18n::english());
+            taskbar::refresh();
+            invalidate(hwnd);
+        }
+        Action::Update => {
+            if matches!(update::status(), update::Status::Ready(_)) {
+                install_update();
+            } else {
+                update::check_now(hwnd);
+                invalidate(hwnd);
+            }
+        }
         Action::Paint => invalidate(hwnd),
     }
     LRESULT(0)
@@ -431,6 +456,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 thread_local! {
     /// Bir güncelleme indirildi; uygulama kullanılmıyorken uygulanacak.
     static UPDATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ayarlar penceresinden ya da menüden: hemen denetler.
+pub fn check_updates() {
+    if let Some(hwnd) = with(|h| h.hwnd) {
+        update::check_now(hwnd);
+        invalidate(hwnd);
+    }
+}
+
+/// Kullanıcı "Yükle" dedi: indirilmiş sürüm hemen kurulur, uygulama yeniden başlar.
+fn install_update() {
+    UPDATE_PENDING.with(|p| p.set(false));
+    unsafe {
+        if update::apply() {
+            match FindWindowW(mirror::CLASS, PCWSTR::null()) {
+                Ok(m) => {
+                    let _ = DestroyWindow(m);
+                }
+                Err(_) => PostQuitMessage(0),
+            }
+        } else {
+            // "Yükle" düğmesi takılı kalmasın: yeniden denetlenebilir.
+            update::mark_failed();
+        }
+    }
 }
 
 /// İndirilmiş güncelleme, hiçbir pencere açık değilken (iPhone, Mac, Ayna Merkezi) uygulanır;
@@ -488,6 +539,8 @@ impl Hub {
             (Ctl::MacButton, l.mac_button),
             (Ctl::AutostartSwitch, l.autostart_switch),
             (Ctl::ZoomSwitch, l.zoom_switch),
+            (Ctl::Language, l.language),
+            (Ctl::Update, if update::build() > 0 { l.update } else { [0.0; 4] }),
         ]
         .into_iter()
         .find(|(_, b)| hit(b, x, y))
@@ -559,13 +612,15 @@ impl Hub {
             Some(Ctl::MacButton) => Action::MacButton,
             Some(Ctl::AutostartSwitch) => Action::Autostart,
             Some(Ctl::ZoomSwitch) => Action::Zoom,
+            Some(Ctl::Language) => Action::Language,
+            Some(Ctl::Update) => Action::Update,
             _ => Action::Paint,
         }
     }
 
     fn refresh_if_changed(&mut self) {
         let now = (mirror::status(), macview::status(), mirror::enabled(), macview::enabled());
-        if now != self.painted {
+        if now != self.painted || Some(update::status()) != self.painted_update {
             invalidate(self.hwnd);
         }
     }
@@ -587,6 +642,8 @@ impl Hub {
             let mac_on = macview::enabled();
             let mac_connected = macview::connected();
             self.painted = (iphone_status.clone(), mac_status.clone(), iphone_on, mac_on);
+            let update_status = update::status();
+            self.painted_update = Some(update_status.clone());
 
             // Şekiller: yazılım rasterleyicisi (kenar yumuşatmalı).
             let mut c = Canvas::new(w as usize, h as usize);
@@ -607,15 +664,15 @@ impl Hub {
             separator(&mut c, ib[0] + 16.0 * s, ib[2], ib[1] + 64.0 * s, p.separator, s);
             switch(&mut c, l.iphone_switch, iphone_on, p.accent, p.switch_off, s);
             let pct = mirror::size_percent();
-            let t = (pct - mirror::SIZE_MIN) as f32 / (mirror::SIZE_MAX - mirror::SIZE_MIN) as f32;
-            slider(&mut c, l.slider, t, iphone_on, &p, s, self.dragging || self.hover == Some(Ctl::Slider));
+            let frac = (pct - mirror::SIZE_MIN) as f32 / (mirror::SIZE_MAX - mirror::SIZE_MIN) as f32;
+            slider(&mut c, l.slider, frac, iphone_on, &p, s, self.dragging || self.hover == Some(Ctl::Slider));
 
             // Mac kartı.
             let mb = l.mac;
             badge(&mut c, mb[0] + 16.0 * s, mb[1] + 16.0 * s, s, hex(0x8E8E93), Device::Mac);
             separator(&mut c, mb[0] + 16.0 * s, mb[2], mb[1] + 64.0 * s, p.separator, s);
             switch(&mut c, l.mac_switch, mac_on, p.accent, p.switch_off, s);
-            let (label, color) = if mac_connected { ("Bağlantıyı kes", p.danger) } else { ("Mac ekranını aç", p.accent) };
+            let (label, color) = if mac_connected { (t("Bağlantıyı kes", "Disconnect"), p.danger) } else { (t("Mac ekranını aç", "Open Mac screen"), p.accent) };
             let pressed = self.pressed == Some(Ctl::MacButton);
             let hover = self.hover == Some(Ctl::MacButton);
             let alpha = if pressed { 0.75 } else if hover { 0.9 } else { 1.0 };
@@ -624,6 +681,17 @@ impl Hub {
             // Genel kart.
             let gb = l.general;
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 54.0 * s, p.separator, s);
+            separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 108.0 * s, p.separator, s);
+            separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 162.0 * s, p.separator, s);
+            let mut buttons = vec![(Ctl::Language, l.language)];
+            if update::build() > 0 {
+                buttons.push((Ctl::Update, l.update));
+            }
+            for (ctl, b) in buttons {
+                let ready = ctl == Ctl::Update && matches!(update_status, update::Status::Ready(_));
+                let alpha = if self.pressed == Some(ctl) { 0.75 } else if self.hover == Some(ctl) { 0.85 } else { 1.0 };
+                card_bg_alpha(&mut c, b, if ready { p.accent } else { p.field }, 8.0 * s, alpha);
+            }
             switch(&mut c, l.autostart_switch, util::autostart_enabled(), p.accent, p.switch_off, s);
             switch(&mut c, l.zoom_switch, util::read_setting(ZOOM_SETTING) != Some(0), p.accent, p.switch_off, s);
 
@@ -632,8 +700,8 @@ impl Hub {
                 let f = &self.fonts;
                 text(mem, f.title, p.text, "Ayna Merkezi", [20.0 * s, 16.0 * s, 300.0 * s, 42.0 * s], DT_LEFT);
                 let version = match update::build() {
-                    0 => "geliştirme".to_string(),
-                    n => format!("sürüm {n}"),
+                    0 => t("geliştirme", "development").to_string(),
+                    n => format!("{} {n}", t("sürüm", "version")),
                 };
                 text(mem, f.small, p.secondary, &version, [140.0 * s, 16.0 * s, (W - 52.0) * s, 42.0 * s], DT_RIGHT);
 
@@ -641,8 +709,8 @@ impl Hub {
                 text(mem, f.name, p.text, "iPhone", [tx, ib[1] + 13.0 * s, ib[2] - 80.0 * s, ib[1] + 34.0 * s], DT_LEFT);
                 text(mem, f.small, p.secondary, &iphone_status, [tx, ib[1] + 34.0 * s, ib[2] - 80.0 * s, ib[1] + 54.0 * s], DT_LEFT | DT_END_ELLIPSIS);
                 let size_color = if iphone_on { p.text } else { p.secondary };
-                text(mem, f.body, size_color, "Ekran boyutu", [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_LEFT);
-                text(mem, f.body, p.secondary, &format!("%{pct}"), [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_RIGHT);
+                text(mem, f.body, size_color, t("Ekran boyutu", "Screen size"), [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_LEFT);
+                text(mem, f.body, p.secondary, &crate::i18n::tf("%{}", "{}%", &[&pct]), [ib[0] + 16.0 * s, ib[1] + 76.0 * s, ib[2] - 16.0 * s, ib[1] + 98.0 * s], DT_RIGHT);
 
                 text(mem, f.name, p.text, "Mac", [tx, mb[1] + 13.0 * s, mb[2] - 80.0 * s, mb[1] + 34.0 * s], DT_LEFT);
                 text(mem, f.small, p.secondary, &mac_status, [tx, mb[1] + 34.0 * s, mb[2] - 80.0 * s, mb[1] + 54.0 * s], DT_LEFT | DT_END_ELLIPSIS);
@@ -651,13 +719,29 @@ impl Hub {
                     mem,
                     f.small,
                     p.secondary,
-                    "Kod, Mac'teki Ayna Ajan menüsünde; Mac ekranında yazılır.",
+                    t("Kod, Mac'teki Ayna Ajan menüsünde; Mac ekranında yazılır.", "Get the code from the Ayna Ajan menu on the Mac."),
                     [mb[0] + 16.0 * s, mb[1] + 118.0 * s, mb[2] - 16.0 * s, mb[1] + 140.0 * s],
                     DT_LEFT,
                 );
 
-                text(mem, f.body, p.text, "Windows ile başlat", [gb[0] + 16.0 * s, gb[1] + 14.0 * s, gb[2] - 80.0 * s, gb[1] + 40.0 * s], DT_LEFT);
-                text(mem, f.body, p.text, "Bağlanınca Büyütme'yi yenile", [gb[0] + 16.0 * s, gb[1] + 68.0 * s, gb[2] - 80.0 * s, gb[1] + 94.0 * s], DT_LEFT);
+                text(mem, f.body, p.text, t("Windows ile başlat", "Start with Windows"), [gb[0] + 16.0 * s, gb[1] + 14.0 * s, gb[2] - 80.0 * s, gb[1] + 40.0 * s], DT_LEFT);
+                text(mem, f.body, p.text, t("Dil", "Language"), [gb[0] + 16.0 * s, gb[1] + 122.0 * s, gb[2] - 140.0 * s, gb[1] + 148.0 * s], DT_LEFT);
+                text(mem, f.body, p.text, if crate::i18n::english() { "English" } else { "Türkçe" }, l.language, DT_CENTER);
+                let (update_line, button) = match &update_status {
+                    update::Status::Idle if update::build() == 0 => (t("Geliştirme sürümü", "Development build").to_string(), t("Denetle", "Check")),
+                    update::Status::Idle => (format!("{} {}", t("Sürüm", "Version"), update::build()), t("Denetle", "Check")),
+                    update::Status::Checking => (t("Denetleniyor…", "Checking…").to_string(), t("Denetle", "Check")),
+                    update::Status::UpToDate => (format!("{} ({} {})", t("Güncel", "Up to date"), t("sürüm", "version"), update::build()), t("Denetle", "Check")),
+                    update::Status::Ready(v) => (format!("{} {v} {}", t("Sürüm", "Version"), t("hazır", "is ready")), t("Yükle", "Install")),
+                    update::Status::Failed => (t("Denetlenemedi", "Check failed").to_string(), t("Yeniden dene", "Retry")),
+                };
+                text(mem, f.body, p.text, t("Güncelleme", "Updates"), [gb[0] + 16.0 * s, gb[1] + 168.0 * s, gb[2] - 140.0 * s, gb[1] + 188.0 * s], DT_LEFT);
+                text(mem, f.small, p.secondary, &update_line, [gb[0] + 16.0 * s, gb[1] + 187.0 * s, gb[2] - 140.0 * s, gb[1] + 207.0 * s], DT_LEFT | DT_END_ELLIPSIS);
+                let ready = matches!(update_status, update::Status::Ready(_));
+                if update::build() > 0 {
+                    text(mem, f.body, if ready { [1.0, 1.0, 1.0] } else { p.text }, button, l.update, DT_CENTER);
+                }
+                text(mem, f.body, p.text, t("Bağlanınca Büyütme'yi yenile", "Refresh Zoom on connect"), [gb[0] + 16.0 * s, gb[1] + 68.0 * s, gb[2] - 80.0 * s, gb[1] + 94.0 * s], DT_LEFT);
             });
         }
     }

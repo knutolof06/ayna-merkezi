@@ -26,6 +26,7 @@ use crate::ble::{self, Ble, Status, Step};
 use crate::buttons;
 use crate::corners;
 use crate::hid;
+use crate::i18n::{self, tf};
 use crate::taskbar;
 use crate::toast;
 use crate::transfer::{self, Target};
@@ -277,6 +278,20 @@ fn mirror_hwnd() -> HWND {
     HWND(MIRROR.with(|c| c.get()) as _)
 }
 
+/// iPhone yansıtmasını keser: pencere gizlenir, alıcı (UxPlay) kapanıp yeniden başlar; iPhone yeniden
+/// bağlanabilir.
+pub fn disconnect() {
+    unsafe {
+        let _ = ShowWindow(mirror_hwnd(), SW_HIDE);
+    }
+    corners::hide();
+    buttons::hide();
+    with(|m| {
+        m.ble.cancel_typing();
+        m.engine.shutdown();
+    });
+}
+
 /// iPhone'u ana uygulamadan açar/kapatır: kapalıyken yansıtma alıcısı (UxPlay) durur, pencere
 /// ve görev çubuğu ikonu kalkar.
 pub fn set_enabled(on: bool) {
@@ -316,17 +331,17 @@ pub fn set_size_percent(pct: u32) {
 /// Ana uygulamada gösterilen kısa durum.
 pub fn status() -> String {
     if !enabled() {
-        return "Kapalı".into();
+        return i18n::t("Kapalı", "Off").into();
     }
     with(|m| {
         if m.engine.problem().is_some() {
-            return "Yansıtma motoru bulunamadı (bin\\uxplay)".to_string();
+            return i18n::t("Yansıtma motoru bulunamadı (bin\\uxplay)", "Mirroring engine not found (bin\\uxplay)").to_string();
         }
         match (m.video.is_some(), m.ble.connected()) {
-            (true, true) => "Yansıtılıyor · kontrol açık".into(),
-            (true, false) => "Yansıtılıyor · kontrol için Bluetooth bekleniyor".into(),
-            (false, true) => "Bluetooth bağlı · yansıtma bekleniyor".into(),
-            (false, false) => "Yansıtma bekleniyor".into(),
+            (true, true) => i18n::t("Yansıtılıyor · kontrol açık", "Mirroring · control on").into(),
+            (true, false) => i18n::t("Yansıtılıyor · kontrol için Bluetooth bekleniyor", "Mirroring · waiting for Bluetooth for control").into(),
+            (false, true) => i18n::t("Bluetooth bağlı · yansıtma bekleniyor", "Bluetooth connected · waiting for mirroring").into(),
+            (false, false) => i18n::t("Yansıtma bekleniyor", "Waiting for mirroring").into(),
         }
     })
     .unwrap_or_default()
@@ -401,8 +416,8 @@ unsafe fn run_after(hwnd: HWND, a: After) {
         After::Paste => {
             // Pano okuma (OpenClipboard) mesaj pompalayabilir: durum ödünç alınmadan yapılır.
             let note = match clipboard_text() {
-                Clipboard::Busy => "Pano şu an başka bir uygulamada açık; tekrar deneyin.".to_string(),
-                Clipboard::Empty => "Panoda metin yok.".to_string(),
+                Clipboard::Busy => i18n::t("Pano şu an başka bir uygulamada açık; tekrar deneyin.", "The clipboard is in use by another app; try again.").to_string(),
+                Clipboard::Empty => i18n::t("Panoda metin yok.", "No text on the clipboard.").to_string(),
                 Clipboard::Text(text) => with(|m| m.start_paste(&text)).unwrap_or_default(),
             };
             if !note.is_empty() {
@@ -421,23 +436,38 @@ unsafe fn send_files(hwnd: HWND, paths: Vec<PathBuf>) {
     let dest = match transfer::target() {
         Target::Ready(dest) => dest,
         Target::DriveOff => {
-            let text = "iCloud kurulu ama iCloud Drive açık değil.\n\n\
-                        iCloud uygulamasını açıp Apple kimliğinizle giriş yapın ve \"iCloud Drive\" \
-                        kutusunu işaretleyin. Eşitleme başladıktan sonra dosyayı tekrar bırakın.\n\n\
-                        Microsoft Store'daki iCloud sayfası açılsın mı? (Oradaki \"Aç\" düğmesi iCloud'u başlatır.)";
+            let text = i18n::t(
+                "iCloud kurulu ama iCloud Drive açık değil.\n\n\
+                 iCloud uygulamasını açıp Apple kimliğinizle giriş yapın ve \"iCloud Drive\" \
+                 kutusunu işaretleyin. Eşitleme başladıktan sonra dosyayı tekrar bırakın.\n\n\
+                 Microsoft Store'daki iCloud sayfası açılsın mı? (Oradaki \"Aç\" düğmesi iCloud'u başlatır.)",
+                "iCloud is installed but iCloud Drive is turned off.\n\n\
+                 Open the iCloud app, sign in with your Apple ID and tick \"iCloud Drive\". \
+                 Once syncing starts, drop the file again.\n\n\
+                 Open the iCloud page in the Microsoft Store? (Its \"Open\" button launches iCloud.)",
+            );
             if ask(hwnd, text) {
                 open_store(hwnd);
             }
             return;
         }
         Target::NotInstalled => {
-            let text = "iPhone, Windows'tan Bluetooth ile dosya almıyor; dosyalar iCloud Drive üzerinden \
-                        gönderilir. Bunun için bu bilgisayara ücretsiz \"iCloud for Windows\" gerekli.\n\n\
-                        Kurulumdan sonra:\n\
-                        1. Apple kimliğinizle giriş yapın.\n\
-                        2. \"iCloud Drive\" kutusunu işaretleyin.\n\
-                        3. Dosyayı tekrar bırakın; iPhone'da Dosyalar > iCloud Drive > iPhone Ayna'da görünür.\n\n\
-                        Microsoft Store'da iCloud sayfası açılsın mı?";
+            let text = i18n::t(
+                "iPhone, Windows'tan Bluetooth ile dosya almıyor; dosyalar iCloud Drive üzerinden \
+                 gönderilir. Bunun için bu bilgisayara ücretsiz \"iCloud for Windows\" gerekli.\n\n\
+                 Kurulumdan sonra:\n\
+                 1. Apple kimliğinizle giriş yapın.\n\
+                 2. \"iCloud Drive\" kutusunu işaretleyin.\n\
+                 3. Dosyayı tekrar bırakın; iPhone'da Dosyalar > iCloud Drive > iPhone Ayna'da görünür.\n\n\
+                 Microsoft Store'da iCloud sayfası açılsın mı?",
+                "iPhone does not accept files from Windows over Bluetooth; files are sent through \
+                 iCloud Drive. This needs the free \"iCloud for Windows\" on this computer.\n\n\
+                 After installing:\n\
+                 1. Sign in with your Apple ID.\n\
+                 2. Tick \"iCloud Drive\".\n\
+                 3. Drop the file again; it will appear on the iPhone in Files > iCloud Drive > iPhone Ayna.\n\n\
+                 Open the iCloud page in the Microsoft Store?",
+            );
             if ask(hwnd, text) {
                 open_store(hwnd);
             }
@@ -447,20 +477,24 @@ unsafe fn send_files(hwnd: HWND, paths: Vec<PathBuf>) {
 
     let (files, bytes) = transfer::measure(&paths);
     if files > transfer::LARGE_FILES || bytes > transfer::LARGE_BYTES {
-        let text = format!(
-            "Bırakılanlar büyük: {}{} dosya, {}{:.1} GB.\n\n\
+        let text = tf(
+            "Bırakılanlar büyük: {}{} dosya, {}{} GB.\n\n\
              Hepsi iCloud'a yüklenecek ve iCloud kotanızdan düşecek. Devam edilsin mi?",
-            if files > transfer::LARGE_FILES { "en az " } else { "" },
-            files,
-            if bytes > transfer::LARGE_BYTES { "en az " } else { "" },
-            bytes as f64 / (1u64 << 30) as f64
+            "What you dropped is large: {}{} files, {}{} GB.\n\n\
+             All of it will be uploaded to iCloud and count against your iCloud storage. Continue?",
+            &[
+                &if files > transfer::LARGE_FILES { i18n::t("en az ", "at least ") } else { "" },
+                &files,
+                &if bytes > transfer::LARGE_BYTES { i18n::t("en az ", "at least ") } else { "" },
+                &format!("{:.1}", bytes as f64 / (1u64 << 30) as f64),
+            ],
         );
         if !ask(hwnd, &text) {
             return;
         }
     }
 
-    toast::show(hwnd, &format!("{} öğe iPhone'a gönderiliyor…", paths.len()));
+    toast::show(hwnd, &tf("{} öğe iPhone'a gönderiliyor…", "Sending {} items to iPhone…", &[&paths.len()]));
     let target = hwnd.0 as isize;
     std::thread::spawn(move || {
         let notify = |text: String| {
@@ -490,23 +524,26 @@ fn watch_upload(files: &[PathBuf], notify: impl Fn(String)) {
         std::thread::sleep(POLL);
         let done = files.iter().filter(|f| transfer::uploaded(f) == Some(true)).count();
         if done == files.len() {
-            notify(format!(
-                "{done} dosya iCloud'a yüklendi.\niPhone'da Dosyalar > iCloud Drive > {} klasöründe.",
-                transfer::FOLDER_NAME
+            notify(tf(
+                "{} dosya iCloud'a yüklendi.\niPhone'da Dosyalar > iCloud Drive > {} klasöründe.",
+                "{} files uploaded to iCloud.\nOn the iPhone: Files > iCloud Drive > {}.",
+                &[&done, &transfer::FOLDER_NAME],
             ));
             return;
         }
         if !warned && start.elapsed() > SLOW {
             warned = true;
-            notify(format!(
-                "iCloud yüklemesi sürüyor ({done}/{}).\nDurumu iCloud uygulamasındaki iCloud Drive satırında görebilirsiniz.",
-                files.len()
+            notify(tf(
+                "iCloud yüklemesi sürüyor ({}/{}).\nDurumu iCloud uygulamasındaki iCloud Drive satırında görebilirsiniz.",
+                "iCloud upload in progress ({}/{}).\nYou can see the status on the iCloud Drive row in the iCloud app.",
+                &[&done, &files.len()],
             ));
         }
         if start.elapsed() > GIVE_UP {
-            notify(format!(
-                "iCloud {} dosyadan {done} tanesini yükledi; kalanlar iCloud uygulaması üzerinden yüklenmeye devam edecek.",
-                files.len()
+            notify(tf(
+                "iCloud {} dosyadan {} tanesini yükledi; kalanlar iCloud uygulaması üzerinden yüklenmeye devam edecek.",
+                "Of {} files, iCloud has uploaded {}; the rest will keep uploading through the iCloud app.",
+                &[&files.len(), &done],
             ));
             return;
         }
@@ -514,17 +551,21 @@ fn watch_upload(files: &[PathBuf], notify: impl Fn(String)) {
 }
 
 fn summary(r: &transfer::Report) -> String {
-    let place = format!("Yüklenince iPhone'da Dosyalar > iCloud Drive > {} klasöründe görünecek.", transfer::FOLDER_NAME);
+    let place = tf(
+        "Yüklenince iPhone'da Dosyalar > iCloud Drive > {} klasöründe görünecek.",
+        "Once uploaded it will appear on the iPhone in Files > iCloud Drive > {}.",
+        &[&transfer::FOLDER_NAME],
+    );
     match (r.copied, r.failed.first()) {
-        (0, None) => "Gönderilecek dosya yoktu (klasör boş).".into(),
-        (n, None) => format!("{n} dosya iCloud'a yükleniyor…\n{place}"),
+        (0, None) => i18n::t("Gönderilecek dosya yoktu (klasör boş).", "There were no files to send (empty folder).").into(),
+        (n, None) => tf("{} dosya iCloud'a yükleniyor…\n{}", "Uploading {} files to iCloud…\n{}", &[&n, &place]),
         (n, Some((path, err))) => {
             let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-            let more = if r.failed.len() > 1 { format!(" (+{} öğe daha)", r.failed.len() - 1) } else { String::new() };
+            let more = if r.failed.len() > 1 { tf(" (+{} öğe daha)", " (+{} more)", &[&(r.failed.len() - 1)]) } else { String::new() };
             if n == 0 {
-                format!("Gönderilemedi: {name}: {err}{more}")
+                tf("Gönderilemedi: {}: {}{}", "Could not send: {}: {}{}", &[&name, &err, &more])
             } else {
-                format!("{n} dosya gönderildi, {} öğe gönderilemedi.\n{name}: {err}{more}", r.failed.len())
+                tf("{} dosya gönderildi, {} öğe gönderilemedi.\n{}: {}{}", "{} files sent, {} items could not be sent.\n{}: {}{}", &[&n, &r.failed.len(), &name, &err, &more])
             }
         }
     }
@@ -533,7 +574,8 @@ fn summary(r: &transfer::Report) -> String {
 unsafe fn ask(hwnd: HWND, text: &str) -> bool {
     DIALOG_OPEN.with(|d| d.set(true));
     let text = HSTRING::from(text);
-    let yes = MessageBoxW(hwnd, &text, w!("iPhone'a dosya gönder"), MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES;
+    let caption = wide(i18n::t("iPhone'a dosya gönder", "Send file to iPhone"));
+    let yes = MessageBoxW(hwnd, &text, PCWSTR(caption.as_ptr()), MB_YESNO | MB_ICONINFORMATION | MB_SETFOREGROUND) == IDYES;
     DIALOG_OPEN.with(|d| d.set(false));
     yes
 }
@@ -597,8 +639,10 @@ pub fn size_percent() -> u32 {
 
 unsafe fn show_menu(hwnd: HWND, pt: POINT) {
     let Ok(menu) = CreatePopupMenu() else { return };
-    let _ = AppendMenuW(menu, MF_STRING, MENU_HIDE, w!("Gizle"));
-    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Çıkış"));
+    let hide = wide(i18n::t("Gizle", "Hide"));
+    let exit = wide(i18n::t("Çıkış", "Exit"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_HIDE, PCWSTR(hide.as_ptr()));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, PCWSTR(exit.as_ptr()));
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
@@ -656,11 +700,14 @@ impl Mirror {
                     _ => return Some(LRESULT(0)),
                 };
                 let note = if !self.ble.connected() {
-                    Some("Tuşlar için iPhone'un Bluetooth ile bağlı olması gerekiyor.")
+                    Some(i18n::t("Tuşlar için iPhone'un Bluetooth ile bağlı olması gerekiyor.", "The iPhone must be connected over Bluetooth for the buttons to work."))
                 } else if !self.ble.consumer_ready() {
-                    Some("iPhone tuşları henüz tanımıyor: Ayarlar > Bluetooth'ta bu bilgisayarı \"Bu Aygıtı Unut\" deyip yeniden eşleyin.")
+                    Some(i18n::t(
+                        "iPhone tuşları henüz tanımıyor: Ayarlar > Bluetooth'ta bu bilgisayarı \"Bu Aygıtı Unut\" deyip yeniden eşleyin.",
+                        "The iPhone does not recognise the buttons yet: in Settings > Bluetooth, tap \"Forget This Device\" for this computer and pair again.",
+                    ))
                 } else if self.ble.typing() {
-                    Some("Yapıştırma sürerken tuşlar kapalı (Esc durdurur).")
+                    Some(i18n::t("Yapıştırma sürerken tuşlar kapalı (Esc durdurur).", "Buttons are off while pasting (Esc stops)."))
                 } else if usage == hid::CONSUMER_POWER {
                     self.power();
                     None
@@ -770,7 +817,11 @@ impl Mirror {
                     self.last_wake = Some(Instant::now());
                     self.ble.key_sequence(vec![(hid::MOD_LEFT_SHIFT, 0, 0)]);
                     after.push(After::Toast(
-                        "iPhone uyandırıldı. Kilidi açıp Denetim Merkezi > Ekran Yansıtma'dan \"Ayna\"yı seçin.".into(),
+                        i18n::t(
+                            "iPhone uyandırıldı. Kilidi açıp Denetim Merkezi > Ekran Yansıtma'dan \"Ayna\"yı seçin.",
+                            "iPhone woken up. Unlock it, then pick \"Ayna\" in Control Center > Screen Mirroring.",
+                        )
+                        .into(),
                     ));
                     return Some(LRESULT(0));
                 }
@@ -909,7 +960,11 @@ impl Mirror {
             util::write_setting(LOCK_VERIFIED_SETTING, 0);
             util::log(&format!("Güç tuşu: {index}. yöntem kilitlemedi, sıradaki {next}."));
             after.push(After::Toast(
-                "iPhone bu yöntemle kilitlenmedi. Güç tuşuna yeniden basın; başka bir yöntem denenecek.".into(),
+                i18n::t(
+                    "iPhone bu yöntemle kilitlenmedi. Güç tuşuna yeniden basın; başka bir yöntem denenecek.",
+                    "The iPhone did not lock with this method. Press the power button again; another method will be tried.",
+                )
+                .into(),
             ));
         }
     }
@@ -964,6 +1019,10 @@ impl Mirror {
             return;
         }
         self.engine.ensure_running();
+        // UxPlay'in (uxplay-windows) bildirim simgesi gizlenir; yerinde uygulamanın kendi simgesi.
+        if let Some(pid) = self.engine.pid() {
+            crate::tray::hide_foreign(pid);
+        }
         self.keep_iphone_awake();
         self.check_lock_probe(after);
 
@@ -1157,24 +1216,28 @@ impl Mirror {
     /// Panodan okunan metni tuş vuruşlarına çevirip yazdırır; kullanıcıya gösterilecek notu döner.
     fn start_paste(&mut self, text: &str) -> String {
         if !self.ble.keyboard_ready() {
-            return "iPhone klavyeyi henüz tanımıyor: iPhone'da Ayarlar > Bluetooth'ta bu bilgisayarı \
-                    \"Bu Aygıtı Unut\" deyip yeniden eşleyin."
-                .into();
+            return i18n::t(
+                "iPhone klavyeyi henüz tanımıyor: iPhone'da Ayarlar > Bluetooth'ta bu bilgisayarı \
+                 \"Bu Aygıtı Unut\" deyip yeniden eşleyin.",
+                "The iPhone does not recognise the keyboard yet: in Settings > Bluetooth on the iPhone, tap \
+                 \"Forget This Device\" for this computer and pair again.",
+            )
+            .into();
         }
         if self.ble.typing() {
-            return "Önceki yapıştırma sürüyor (Esc durdurur).".into();
+            return i18n::t("Önceki yapıştırma sürüyor (Esc durdurur).", "The previous paste is still running (Esc stops).").into();
         }
         let (strokes, skipped) = text_to_strokes(text);
         if strokes.is_empty() {
-            return "Panodaki metin bu klavye düzeniyle yazılamıyor.".into();
+            return i18n::t("Panodaki metin bu klavye düzeniyle yazılamıyor.", "The clipboard text cannot be typed with this keyboard layout.").into();
         }
         let total = text.chars().filter(|&c| c != '\r').count();
-        let mut note = format!("{} karakter iPhone'a yazılıyor… (Esc durdurur)", strokes.len());
+        let mut note = tf("{} karakter iPhone'a yazılıyor… (Esc durdurur)", "Typing {} characters on the iPhone… (Esc stops)", &[&strokes.len()]);
         if skipped > 0 {
-            note.push_str(&format!("\n{skipped} karakter yazılamadı (klavye düzeninde yok)."));
+            note.push_str(&tf("\n{} karakter yazılamadı (klavye düzeninde yok).", "\n{} characters could not be typed (not in the keyboard layout).", &[&skipped]));
         }
         if total > PASTE_LIMIT {
-            note.push_str(&format!("\nYalnız ilk {PASTE_LIMIT} karakter yazılıyor."));
+            note.push_str(&tf("\nYalnız ilk {} karakter yazılıyor.", "\nOnly the first {} characters are typed.", &[&PASTE_LIMIT]));
         }
         // Basılı Ctrl (iPhone'da Cmd) sıfırlanmaz: yazılan her vuruş kendi değiştiricileriyle
         // gider, yazma bitince Ctrl hâlâ basılıysa sonraki tuş yine Cmd ile birleşir.
@@ -1216,18 +1279,22 @@ impl Mirror {
         // Yuvarlak köşelerin içinde kalacak kadar iç boşluk.
         let pad = ((width(client).min(height(client)) as f32 * CORNER_RATIO * 0.6) as i32).max((24.0 * s) as i32);
         let area = RECT { left: pad, top: pad, right: client.right - pad, bottom: client.bottom - pad };
-        let pc = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "bu bilgisayar".into());
+        let pc = std::env::var("COMPUTERNAME").unwrap_or_else(|_| i18n::t("bu bilgisayar", "this computer").into());
 
         let problem = self.engine.problem();
-        let title = if problem.is_none() { "iPhone ekranı bekleniyor" } else { "Yansıtma başlatılamıyor" };
+        let title = if problem.is_none() {
+            i18n::t("iPhone ekranı bekleniyor", "Waiting for the iPhone screen")
+        } else {
+            i18n::t("Yansıtma başlatılamıyor", "Cannot start mirroring")
+        };
         let mut body = if let Some(p) = problem {
             p
         } else {
-            format!(
+            tf(
                 "iPhone'da Denetim Merkezi'ni açın, Ekran Yansıtma'ya dokunun ve listeden \"{}\" seçin. \
                  iPhone ile bu bilgisayar aynı Wi-Fi ağında olmalı.\n\n\
                  Fareyle kontrol (bir kez yapılır):\n\
-                 1. iPhone Ayarlar > Bluetooth'tan \"{pc}\" cihazını eşleyin. Önceden eşlediyseniz \
+                 1. iPhone Ayarlar > Bluetooth'tan \"{}\" cihazını eşleyin. Önceden eşlediyseniz \
                  önce \"Bu Aygıtı Unut\" deyip yeniden eşleyin.\n\
                  2. Ayarlar > Erişilebilirlik > Büyütme'yi açın. Ekran büyürse üç parmakla çift \
                  dokunarak normale döndürün; Büyütme açık kalmalı.\n\n\
@@ -1238,7 +1305,21 @@ impl Mirror {
                  yenilenmesi için Ayarlar > Erişilebilirlik > Büyütme > Klavye Kısayolları'nı açın.\n\
                  Kısayollar: orta tık ana ekran, sağ tık uzun basma, Ctrl + tekerlek pencere boyu, \
                  Esc gizler.",
-                uxplay::RECEIVER_NAME
+                "On the iPhone, open Control Center, tap Screen Mirroring and pick \"{}\". \
+                 The iPhone and this computer must be on the same Wi-Fi network.\n\n\
+                 Mouse control (one-time setup):\n\
+                 1. In iPhone Settings > Bluetooth, pair \"{}\". If you paired before, \
+                 tap \"Forget This Device\" first and pair again.\n\
+                 2. Turn on Settings > Accessibility > Zoom. If the screen zooms in, double-tap with \
+                 three fingers to return to normal; Zoom must stay on.\n\n\
+                 To send files, drag and drop them onto this window or the phone icon in the \
+                 taskbar (through iCloud Drive).\n\n\
+                 Keyboard: what you type goes to the iPhone; Ctrl+V types the text on the Windows clipboard.\n\
+                 If the iPhone is asleep, clicking this window wakes it. To refresh Zoom automatically on every \
+                 connection, turn on Settings > Accessibility > Zoom > Keyboard Shortcuts.\n\
+                 Shortcuts: middle click is Home, right click is long press, Ctrl + wheel resizes the window, \
+                 Esc hides it.",
+                &[&uxplay::RECEIVER_NAME, &pc],
             )
         };
         body.push_str(&format!("\n\nBluetooth: {}", status_text(self.ble.status())));
@@ -1273,10 +1354,10 @@ impl Mirror {
 
 fn status_text(s: Status) -> &'static str {
     match s {
-        Status::Starting => "başlatılıyor",
-        Status::Advertising => "eşleşme bekleniyor",
-        Status::Connected => "bağlı",
-        Status::Failed => "kullanılamıyor",
+        Status::Starting => i18n::t("başlatılıyor", "starting"),
+        Status::Advertising => i18n::t("eşleşme bekleniyor", "waiting to pair"),
+        Status::Connected => i18n::t("bağlı", "connected"),
+        Status::Failed => i18n::t("kullanılamıyor", "unavailable"),
     }
 }
 
