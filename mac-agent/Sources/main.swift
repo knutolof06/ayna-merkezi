@@ -297,8 +297,9 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         return dead
     }
 
-    /// Ana ekran yakalamasında imleç çizilsin mi (Windows imleci kendisi çiziyorsa hayır).
-    private let cursor: Bool
+    /// Yalnız `queue` üzerinde: ana ekran yakalamasında imleç çizilsin mi (Windows imleci kendisi
+    /// çiziyorsa hayır). Akış başlamadan gelen istek de burada saklanır, kaybolmaz.
+    private var cursorWanted: Bool
     /// Yalnız `queue` üzerinde: çalışan akışın yapılandırması (imleç sonradan değiştirilebilir).
     private var config: SCStreamConfiguration?
 
@@ -306,7 +307,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
          onFrame: @escaping (Data, Bool) -> Void, onSize: @escaping (Int, Int) -> Void, onError: @escaping (String) -> Void) {
         self.region = region
         self.paused = paused
-        self.cursor = cursor
+        self.cursorWanted = cursor
         self.onFrame = onFrame
         self.onSize = onSize
         self.onError = onError
@@ -333,7 +334,8 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 pw = mode.pixelWidth
                 ph = mode.pixelHeight
             }
-            self.begin(filter: SCContentFilter(display: display, excludingWindows: []), pixels: (pw, ph), cursor: self.cursor)
+            self.begin(filter: SCContentFilter(display: display, excludingWindows: []), pixels: (pw, ph),
+                       cursor: self.queue.sync { self.cursorWanted })
         }
     }
 
@@ -357,11 +359,16 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
+        // Akış bu imleç ayarıyla kuruldu. Kurulurken ya da başlarken imleç isteği değişirse
+        // (Windows "imleci ben çiziyorum" dedi) akış başlayınca yeni ayar uygulanır; yoksa Mac
+        // imleci görüntüye çizilir ve iki imleç görünür.
+        let createdWith = cursor
         let proceed: Bool = self.queue.sync {
             guard !self.stopped else { return false }
             self.makeEncoder(width: w, height: h)
             self.scStream = stream
             self.config = config
+            if source == nil { config.showsCursor = self.cursorWanted }
             return true
         }
         guard proceed else { return }
@@ -371,9 +378,14 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.onError(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
                 return
             }
-            // Başlarken durdurulduysa hemen kapat.
             self.queue.async {
-                if self.stopped { stream.stopCapture(completionHandler: nil) }
+                // Başlarken durdurulduysa hemen kapat.
+                if self.stopped {
+                    stream.stopCapture(completionHandler: nil)
+                } else if source == nil, let config = self.config {
+                    config.showsCursor = self.cursorWanted
+                    if config.showsCursor != createdWith { stream.updateConfiguration(config) { _ in } }
+                }
             }
         }
         if !isDead { self.onSize(w, h) }
@@ -468,6 +480,8 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
     /// İmleci görüntüye çizmeyi açar/kapatır (akış yeniden başlamaz).
     func setCursorShown(_ shown: Bool) {
         queue.async {
+            guard self.region == nil else { return }
+            self.cursorWanted = shown
             guard let stream = self.scStream, let config = self.config, config.showsCursor != shown else { return }
             config.showsCursor = shown
             stream.updateConfiguration(config) { _ in }
@@ -1368,6 +1382,8 @@ final class Session {
     private var diagMaxStall: TimeInterval = 0
     private var diagWindowStart = Date()
     private var cursorUnreadable = false
+    /// Mac imleci kaç ardışık denetimde (0,05 sn) gizli göründü: tek bir okuma Windows imlecini gizlemez.
+    private var hiddenTicks = 0
     /// Mac imlecinin şeklini Windows'a taşır (görüntüde imleç yok).
     private var cursorTimer: Timer?
     private var lastCursor = Data()
@@ -1721,9 +1737,16 @@ final class Session {
         guard stage == .streaming else { return }
         updatePointerLock()
         var message = Data([0x06, 0, 0, 0, 0, 0, 0, 0, 0])
-        let current = phone == nil ? NSCursor.currentSystem : nil
-        cursorUnreadable = phone == nil && current == nil
-        if let cursor = current {
+        // Bir uygulama imleci gizlediyse (oyun kendi imlecini ya da nişangahını çizer, video
+        // oynatıcı gizler) Windows imleci de görünmesin: saydam 2×2 imleç gönderilir. Eski Windows
+        // sürümleri de bunu olağan bir imleç resmi olarak işler.
+        hiddenTicks = phone == nil && systemCursorHidden() ? hiddenTicks + 1 : 0
+        let hidden = hiddenTicks >= 3
+        let current = phone == nil && !hidden ? NSCursor.currentSystem : nil
+        cursorUnreadable = phone == nil && !hidden && current == nil
+        if hidden {
+            message = Data([0x06, 0, 0, 0, 0, 0, 2, 0, 2] + [UInt8](repeating: 0, count: 2 * 2 * 4))
+        } else if let cursor = current {
             // Sabit ölçek: Windows imleci pencere boyutundan bağımsız, olağan imleç boyutunda gösterir.
             let scale: CGFloat = 2
             let size = cursor.image.size
