@@ -68,7 +68,11 @@ const MSG_LOCAL_CURSOR: u8 = 0x1A;
 /// Mac → Windows: tanı [ana iş parçacığında en uzun bekleme ms][bayraklar: 1 = imleç okunamadı].
 const MSG_DIAG: u8 = 0x07;
 /// Fare hareketleri en çok bu sıklıkta gönderilir (Mac her olayı ayrı işler; boğulmasın).
-const MOVE_INTERVAL: Duration = Duration::from_millis(8);
+const MOVE_INTERVAL: Duration = Duration::from_millis(5);
+/// Mac → Windows: bir uygulama (oyun) fareyi kilitledi [açık].
+const MSG_POINTER_LOCK: u8 = 0x08;
+/// Windows → Mac: göreli fare hareketi [dx i16][dy i16] (fare kilitliyken).
+const MSG_REL_MOVE: u8 = 0x1B;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -100,6 +104,8 @@ const MSG_PUT_DONE: u8 = 0x35;
 pub const WM_APP_FILES: u32 = WM_APP + 28;
 /// Mac imlecinin şekli değişti.
 pub const WM_APP_CURSOR: u32 = WM_APP + 29;
+/// Mac'te fare kilidi açıldı/kapandı.
+pub const WM_APP_LOCK: u32 = WM_APP + 30;
 /// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
 pub const FILES_LISTED: usize = 1;
 /// Mac'ten sürüklenen dosyaların hepsi geldi.
@@ -178,6 +184,8 @@ struct Shared {
     drag_asked: AtomicBool,
     /// Mac imlecinin şekli (görüntü pikseli ölçeğinde); yoksa olağan ok.
     cursor: Mutex<Option<CursorImage>>,
+    /// Mac'te bir uygulama fareyi kilitledi (göreli hareket istenir).
+    pointer_lock: AtomicBool,
     /// iPhone kipi istendi (Mac'teki iPhone Mirroring gösterilir); ağ kopup yeniden bağlanınca da sürer.
     phone: AtomicBool,
     /// Kip istendi, Mac henüz yanıt vermedi (eski Ayna Ajan isteği tanımaz, hiç yanıt gelmez).
@@ -256,6 +264,7 @@ impl Mac {
                 incoming: Mutex::new(None),
                 drag_asked: AtomicBool::new(false),
                 cursor: Mutex::new(None),
+                pointer_lock: AtomicBool::new(false),
                 phone: AtomicBool::new(false),
                 phone_asked: Mutex::new(None),
                 phone_quiet: AtomicBool::new(false),
@@ -321,6 +330,19 @@ impl Mac {
 
     pub fn drag_hover_end(&self) {
         self.send(vec![MSG_HOVER_END]);
+    }
+
+    pub fn pointer_lock(&self) -> bool {
+        self.shared.pointer_lock.load(Ordering::SeqCst)
+    }
+
+    /// Göreli fare hareketi (fare kilitliyken; ham fare verisi).
+    pub fn rel_move(&self, dx: i32, dy: i32) {
+        let clamp = |v: i32| (v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_be_bytes();
+        let mut m = vec![MSG_REL_MOVE];
+        m.extend_from_slice(&clamp(dx));
+        m.extend_from_slice(&clamp(dy));
+        self.send(m);
     }
 
     pub fn cursor(&self) -> Option<CursorImage> {
@@ -467,6 +489,10 @@ impl Mac {
         let (shared, notify, code) = (self.shared.clone(), self.notify.0 as isize, code.to_string());
         std::thread::spawn(move || {
             let result = session(&code, &shared, attempt, notify);
+            // Oturum bitti: Mac'teki fare kilidi de biter (imleç Windows'ta hapis kalmasın).
+            if shared.pointer_lock.swap(false, Ordering::SeqCst) {
+                post_lock(notify);
+            }
             let applied = shared.publish(attempt, |inner| {
                 inner.tx = None;
                 inner.socket = None;
@@ -831,6 +857,8 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     }
     util::log(&format!("Mac oturumu açıldı: {}", peer.name));
     *shared.cursor.lock().unwrap() = None;
+    shared.pointer_lock.store(false, Ordering::SeqCst);
+    post_lock(notify);
     let saved = format!("{}:{} {}", peer.ip, peer.port, peer.name);
     let _ = util::write_text_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()), &saved);
     post(notify);
@@ -892,6 +920,12 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
             }
             MSG_BYE => return Ok(true),
+            MSG_POINTER_LOCK if plain.len() >= 2 => {
+                let on = plain[1] == 1;
+                util::log(if on { "Mac'te fare kilitlendi (oyun)." } else { "Mac'te fare kilidi kalktı." });
+                shared.pointer_lock.store(on, Ordering::SeqCst);
+                post_lock(notify);
+            }
             MSG_DIAG if plain.len() >= 4 => {
                 // Yalnız dikkat çekici durumlar günlüğe yazılır (her 10 sn'de bir satır olmasın).
                 let stall = u16::from_be_bytes([plain[1], plain[2]]);
@@ -1101,6 +1135,12 @@ fn be64(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_be_bytes(b.get(at..at + 8)?.try_into().ok()?))
 }
 
+fn post_lock(notify: isize) {
+    unsafe {
+        let _ = PostMessageW(HWND(notify as _), WM_APP_LOCK, WPARAM(0), LPARAM(0));
+    }
+}
+
 fn post_files(notify: isize, what: usize) {
     unsafe {
         let _ = PostMessageW(HWND(notify as _), WM_APP_FILES, WPARAM(what), LPARAM(0));
@@ -1255,7 +1295,7 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
             Err(RecvTimeoutError::Disconnected) => return,
         }
         // Fare hareketi çok sık geliyorsa (1000 Hz fareler) kısa beklenir; arada gelenler birleşir.
-        if batch.first().and_then(|m| m.first()) == Some(&MSG_MOUSE_MOVE) {
+        if matches!(batch.first().and_then(|m| m.first()), Some(&MSG_MOUSE_MOVE) | Some(&MSG_REL_MOVE)) {
             let since = last_move.elapsed();
             if since < MOVE_INTERVAL {
                 std::thread::sleep(MOVE_INTERVAL - since);
@@ -1263,8 +1303,20 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
         }
         // Birikmiş fare hareketlerinden yalnız sonuncusu gönderilir.
         while let Ok(m) = out.try_recv() {
-            if m.first() == Some(&MSG_MOUSE_MOVE) && batch.last().and_then(|l: &Vec<u8>| l.first()) == Some(&MSG_MOUSE_MOVE) {
+            let last = batch.last().and_then(|l: &Vec<u8>| l.first()).copied();
+            if m.first() == Some(&MSG_MOUSE_MOVE) && last == Some(MSG_MOUSE_MOVE) {
                 batch.pop();
+            }
+            // Art arda göreli hareketler toplanır (hiçbiri kaybolmaz).
+            if m.first() == Some(&MSG_REL_MOVE) && last == Some(MSG_REL_MOVE) && m.len() >= 5 {
+                if let Some(prev) = batch.last_mut().filter(|p| p.len() >= 5) {
+                    let get = |b: &[u8], i: usize| i16::from_be_bytes([b[i], b[i + 1]]) as i32;
+                    let dx = (get(prev, 1) + get(&m, 1)).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    let dy = (get(prev, 3) + get(&m, 3)).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    prev[1..3].copy_from_slice(&dx.to_be_bytes());
+                    prev[3..5].copy_from_slice(&dy.to_be_bytes());
+                    continue;
+                }
             }
             batch.push(m);
         }
@@ -1283,7 +1335,7 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
         if writer.write_all(&bytes).is_err() {
             return;
         }
-        if batch.iter().any(|m| m.first() == Some(&MSG_MOUSE_MOVE)) {
+        if batch.iter().any(|m| matches!(m.first(), Some(&MSG_MOUSE_MOVE) | Some(&MSG_REL_MOVE))) {
             last_move = Instant::now();
         }
         let sent: usize = batch.iter().filter(|m| m.first() == Some(&MSG_PUT_DATA)).map(|m| m.len()).sum();

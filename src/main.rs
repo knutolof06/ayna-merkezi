@@ -76,5 +76,7 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Mac penceresi fareyi hapsetmişse çıkışta kesin bırakılır.
+        let _ = ClipCursor(None);
     }
 }

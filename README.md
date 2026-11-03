@@ -135,6 +135,11 @@ dosyalar inene dek simgesi ve adı Windows'ta imleci izler, sonra Windows'un sü
 **Tek imleç:** Mac imleci görüntüye çizilmez; Windows imleci gecikmesiz kalır ama Mac'teki şeklini alır
 (yazı imleci, el, boyutlandırma okları).
 
+**Oyunlarda fare (fare kilidi):** Mac'te bir oyun imleci gizleyip fareyi kilitleyince Windows imleci Mac
+penceresine hapsedilir ve gizlenir; farenin ham hareketi Mac'e göreli gider, kamera serbestçe döner. Fareyi
+bırakmak için **Ctrl+Alt**; yeniden kilitlemek için pencereye tıklayın. Pencereden çıkınca (Alt+Tab) kilit
+kendiliğinden açılır.
+
 **Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı), "iPhone'u Mac üzerinden göster" ve "Bağlantıyı kes".
 
 **iPhone'u Mac üzerinden (deneme):** Mac'teki iPhone Mirroring'i Windows'tan kullanır; Mac penceresinde Mac

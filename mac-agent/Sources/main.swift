@@ -26,6 +26,9 @@
 //   görüntüye çizilmez ve Mac → Windows 0x06 CURSOR [sıcak x][sıcak y][gen][yük][BGRA önceden
 //   çarpılmış, görüntü pikseli ölçeğinde] gider; gen 0 = Windows kendi okunu göstersin. Bunu
 //   bildirmeyen eski Windows için imleç görüntüde kalır.
+// - Fare kilidi (oyunlar): Mac → Windows 0x08 LOCK [açık]: bir uygulama imleci gizleyip fareyi
+//   kilitledi. Windows imleci pencereye hapseder ve ham hareketi 0x1B REL [dx i16][dy i16] olarak
+//   gönderir; Mac bunu delta alanlarıyla işler (kamera döndürme). Her harekette delta alanı dolar.
 // - Tanı: Mac → Windows 0x07 DIAG [ana iş parçacığında en uzun bekleme ms u16][bayraklar] her 10 sn;
 //   bayrak 1 = sistem imleci okunamadı. Windows günlüğe yazar (takılmaların nedeni görülsün).
 // - Sürükleme önizlemesi: Windows → Mac 0x25 HOVER [x][y][sayı][klasör mü][ad uz.][ad], 0x26 HOVER_END:
@@ -539,6 +542,45 @@ final class Injector {
     var leftDown: Bool { buttons.contains(0) }
     /// iPhone kipi: koordinatlar bu alana (iPhone Mirroring penceresi, genel koordinat) eşlenir.
     var area: (() -> CGRect?)?
+    /// Oyun fareyi kilitledi: tıklamalar imlecin bulunduğu yerde (Windows'un imleç yeri değil).
+    var relative = false
+    /// Son gönderilen imleç yeri ve zamanı: imleç olaya uymuyorsa bir uygulama fareyi kilitlemiştir.
+    private var lastPoint: CGPoint?
+    private var lastMoveTime = Date.distantPast
+
+    /// Son 0,15 sn'de fare olayı gönderildi mi.
+    var movedRecently: Bool { Date().timeIntervalSince(lastMoveTime) < 0.15 }
+
+    /// Fare olayları imleci taşımıyor (uygulama imleci fareden ayırmış ya da sürekli ortaya çekiyor).
+    func cursorDetached() -> Bool {
+        let age = Date().timeIntervalSince(lastMoveTime)
+        guard let target = lastPoint, age > 0.02, age < 0.15, let current = CGEvent(source: nil)?.location else { return false }
+        // Geniş eşik: yoğun anlarda imlecin hedefin biraz gerisinde kalması kilit sayılmasın.
+        return hypot(current.x - target.x, current.y - target.y) > 100
+    }
+
+    private func moveTypes() -> (CGEventType, CGMouseButton) {
+        if buttons.contains(0) { return (.leftMouseDragged, .left) }
+        if buttons.contains(1) { return (.rightMouseDragged, .right) }
+        if buttons.contains(2) { return (.otherMouseDragged, .center) }
+        return (.mouseMoved, .left)
+    }
+
+    /// Göreli hareket (fare kilitliyken): imleç yeri + delta; delta alanları oyunlar için dolu.
+    func relMove(_ dx: Int16, _ dy: Int16) {
+        let current = CGEvent(source: nil)?.location ?? lastPoint ?? .zero
+        let b = CGDisplayBounds(CGMainDisplayID())
+        let p = CGPoint(x: min(max(current.x + CGFloat(dx), b.minX), b.maxX - 1),
+                        y: min(max(current.y + CGFloat(dy), b.minY), b.maxY - 1))
+        let (type, button) = moveTypes()
+        let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button)
+        e?.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
+        e?.setIntegerValueField(.mouseEventDeltaY, value: Int64(dy))
+        e?.flags = flags
+        e?.post(tap: .cghidEventTap)
+        lastPoint = p
+        lastMoveTime = Date()
+    }
 
     /// Basılı değiştirici tuşlardan (sol/sağ ayrı) bayraklar.
     private var flags: CGEventFlags {
@@ -561,20 +603,26 @@ final class Injector {
     }
 
     func move(_ x: UInt16, _ y: UInt16) {
-        let type: CGEventType, button: CGMouseButton
-        if buttons.contains(0) { (type, button) = (.leftMouseDragged, .left) }
-        else if buttons.contains(1) { (type, button) = (.rightMouseDragged, .right) }
-        else if buttons.contains(2) { (type, button) = (.otherMouseDragged, .center) }
-        else { (type, button) = (.mouseMoved, .left) }
+        let (type, button) = moveTypes()
         guard let p = point(x, y) else { return }
         let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: button)
+        // Delta alanları: hareket miktarını okuyan uygulamalar (oyunlar) için. Uzun aradan sonraki ilk
+        // olayda delta yok (kamera sıçramasın).
+        if let last = lastPoint, Date().timeIntervalSince(lastMoveTime) < 0.3 {
+            e?.setIntegerValueField(.mouseEventDeltaX, value: Int64((p.x - last.x).rounded()))
+            e?.setIntegerValueField(.mouseEventDeltaY, value: Int64((p.y - last.y).rounded()))
+        }
         e?.flags = flags
         e?.post(tap: .cghidEventTap)
+        lastPoint = p
+        lastMoveTime = Date()
     }
 
     func button(_ b: UInt8, down: Bool, _ x: UInt16, _ y: UInt16) {
         // Bırakış hiç düşürülmez (düğme basılı kalmasın): yer bilinmiyorsa imlecin olduğu yerde.
-        guard let p = point(x, y) ?? (down ? nil : CGEvent(source: nil)?.location) else { return }
+        // Fare kilitliyken imlecin bulunduğu yerde (oyunun imleci ortada tutmasını bozmasın).
+        let here = CGEvent(source: nil)?.location
+        guard let p = relative ? here : point(x, y) ?? (down ? nil : here) else { return }
         let (downType, upType, mb): (CGEventType, CGEventType, CGMouseButton) = switch b {
         case 0: (.leftMouseDown, .leftMouseUp, .left)
         case 1: (.rightMouseDown, .rightMouseUp, .right)
@@ -1292,6 +1340,11 @@ final class Session {
     private var phoneAnnounced = false
     /// Windows imleci kendisi çiziyor: Mac imleci görüntüye çizilmez, şekli 0x06 ile gider.
     private var localCursor = false
+    /// Bir uygulama (oyun) fareyi kilitledi; işaretin sürdüğü an (kısa titreşimler sayılmaz).
+    private var pointerLocked = false
+    private var lockSignalSince: Date?
+    /// Art arda kaç ölçümde fare olayları imleci taşımadı.
+    private var detachedTicks = 0
     /// Tanı: ana iş parçacığının en uzun gecikmesi (10 sn'lik pencerede) ve imleç okunamadı mı.
     private var diagTimer: Timer?
     private var diagLastTick = Date()
@@ -1616,8 +1669,40 @@ final class Session {
     }
 
     /// Mac imlecinin şekli değiştiyse resmini (nokta başına 2 piksel) Windows'a gönderir.
+    /// Fare kilidi: imleç gizliyken fare oynuyorsa ya da fare olayları imleci taşımıyorsa bir
+    /// uygulama fareyi kilitlemiştir (yazarken gizlenen imleç fare oynayınca görünür, sayılmaz).
+    private func updatePointerLock() {
+        let signal: Bool
+        if phone != nil {
+            signal = false
+            detachedTicks = 0
+        } else {
+            let hidden = CGCursorIsVisible() == 0
+            detachedTicks = injector.cursorDetached() ? detachedTicks + 1 : 0
+            if pointerLocked {
+                // Kilit, ancak fare olağan biçimde kullanılırken kalkar (imleç görünür ve olayları
+                // izliyor); fare dururken kilit sürer (açılıp kapanıp durmasın).
+                signal = !(injector.movedRecently && !hidden && detachedTicks == 0)
+            } else {
+                signal = (hidden && injector.movedRecently) || detachedTicks >= 3
+            }
+        }
+        guard signal != pointerLocked else {
+            lockSignalSince = nil
+            return
+        }
+        let since = lockSignalSince ?? Date()
+        lockSignalSince = since
+        guard Date().timeIntervalSince(since) >= (signal ? 0.25 : 0.4) else { return }
+        lockSignalSince = nil
+        pointerLocked = signal
+        injector.relative = signal
+        send(Data([0x08, signal ? 1 : 0]))
+    }
+
     private func sendCursor() {
         guard stage == .streaming else { return }
+        updatePointerLock()
         var message = Data([0x06, 0, 0, 0, 0, 0, 0, 0, 0])
         let current = phone == nil ? NSCursor.currentSystem : nil
         cursorUnreadable = phone == nil && current == nil
@@ -1696,6 +1781,11 @@ final class Session {
             // Yinelenen istek de yanıtlanır (Windows yanıt bekler).
             sendState(mode: on ? 1 : 0, ok: true, "")
             return
+        }
+        if on && pointerLocked {
+            pointerLocked = false
+            injector.relative = false
+            send(Data([0x08, 0]))
         }
         if on {
             let p = PhoneMirror(
@@ -1802,6 +1892,8 @@ final class Session {
             preview.show(at: point, name: name, count: count, folder: folder)
         case 0x26:
             dragPreview?.hide()
+        case 0x1B where b.count >= 5:
+            injector.relMove(Int16(bitPattern: readBE16(m, 1)), Int16(bitPattern: readBE16(m, 3)))
         case 0x1A:
             // Windows imleci kendisi çiziyor: Mac imleci görüntüden çıkar, şekli ayrıca gönderilir.
             guard !localCursor else { break }

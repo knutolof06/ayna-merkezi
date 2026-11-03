@@ -17,6 +17,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS,
+    RAWINPUTHEADER, RIDEV_REMOVE, RID_INPUT, RIM_TYPEMOUSE,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dragout;
@@ -37,6 +41,8 @@ pub const WM_APP_SIZER: u32 = WM_APP + 25;
 /// Kod alanında Enter.
 const WM_APP_GO: u32 = WM_APP + 26;
 const TIMER_TICK: usize = 1;
+/// WM_APP_LOCK wParam: kilit ipucunu göster.
+const LOCK_HINT: usize = 1;
 const EDIT_ID: usize = 100;
 
 const ENABLED_SETTING: PCWSTR = w!("MacAcik");
@@ -96,6 +102,12 @@ struct View {
     /// Mac'e "sürükleniyor mu" soruldu ama yanıt gelmeden fare Mac penceresinde bırakıldı (dosya
     /// Mac'te bırakıldı): gelen liste yok sayılır.
     released_inside: bool,
+    /// Fare kilidi devrede: imleç pencereye hapsedilip gizlendi, ham hareket göreli gider.
+    lock_on: bool,
+    /// Kullanıcı kilidi Ctrl+Alt ile bıraktı: pencereye tıklayana dek yeniden kilitlenmez.
+    lock_override: bool,
+    /// Kilit ipucu bu oturumda gösterildi.
+    lock_hint_shown: bool,
 }
 
 thread_local! {
@@ -123,6 +135,7 @@ pub fn set_enabled(on: bool) {
     util::write_setting(ENABLED_SETTING, u32::from(on));
     taskbar::set_enabled(Device::Mac, on);
     if !on {
+        with(|v| v.unlock_pointer());
         disconnect();
         unsafe {
             let _ = ShowWindow(main_hwnd(), SW_HIDE);
@@ -301,6 +314,9 @@ pub fn create() -> Option<HWND> {
             last_hover: None,
             drag_cancelled: false,
             released_inside: false,
+            lock_on: false,
+            lock_override: false,
+            lock_hint_shown: false,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
@@ -544,9 +560,59 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with(|v| v.rebuild_cursor());
             return LRESULT(0);
         }
+        mac::WM_APP_LOCK => {
+            if wp.0 == LOCK_HINT {
+                toast::show(hwnd, "Oyun fareyi kilitledi. Bırakmak için sol Ctrl + sol Alt.");
+                return LRESULT(0);
+            }
+            with(|v| {
+                if !v.mac.pointer_lock() {
+                    v.lock_override = false;
+                }
+                v.update_lock();
+            });
+            return LRESULT(0);
+        }
+        WM_MOVE => {
+            // Hapis bölgesi pencereyle birlikte taşınır.
+            with(|v| v.reclip());
+            return LRESULT(0);
+        }
+        WM_DESTROY | WM_ENDSESSION => {
+            with(|v| v.unlock_pointer());
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        WM_INPUT => {
+            // Fare kilitliyken ham hareket (ivmesiz, pencere kenarında durmayan) Mac'e göreli gider.
+            let mut raw = RAWINPUT::default();
+            let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+            let got = GetRawInputData(
+                HRAWINPUT(lp.0 as _),
+                RID_INPUT,
+                Some(&mut raw as *mut _ as *mut _),
+                &mut size,
+                std::mem::size_of::<RAWINPUTHEADER>() as u32,
+            );
+            if got != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 {
+                let mouse = raw.data.mouse;
+                if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 == 0 && (mouse.lLastX != 0 || mouse.lLastY != 0) {
+                    with(|v| {
+                        if v.lock_on {
+                            v.mac.rel_move(mouse.lLastX, mouse.lLastY);
+                        }
+                    });
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         WM_SETCURSOR => {
             // Görüntünün üstünde Windows imleci Mac imlecinin şeklini alır (çift imleç olmasın).
             let hit = (lp.0 & 0xFFFF) as u16;
+            if (hit == HTCLIENT as u16 || hit == HTERROR as u16) && with(|v| v.lock_on).unwrap_or(false) {
+                // Fare kilitliyken imleç gizli (oyun kendi nişangahını çizer).
+                SetCursor(HCURSOR::default());
+                return LRESULT(1);
+            }
             if hit == HTCLIENT as u16 || hit == HTERROR as u16 {
                 if let Some(c) = with(|v| v.mac.connected().then_some(v.mac_cursor)).flatten().filter(|c| !c.is_invalid()) {
                     SetCursor(c);
@@ -557,6 +623,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SIZE => {
             layout(hwnd);
+            with(|v| v.reclip());
             After::Paint
         }
         WM_DPICHANGED => {
@@ -573,6 +640,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DISPLAYCHANGE => After::Place,
         WM_CLOSE => After::Hide,
         WM_ACTIVATE => {
+            if wp.0 & 0xFFFF != 0 {
+                with(|v| v.update_lock());
+            }
             if wp.0 & 0xFFFF == 0 {
                 with(|v| v.release_input());
             } else if with(|v| matches!(v.mac.state(), State::Idle | State::Failed(_))).unwrap_or(false) {
@@ -639,6 +709,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+            // Sol Ctrl + sol Alt: fare kilidinden çık (sanal makinelerdeki gibi). Yalnız bu iki tuşun
+            // kendisine basılınca; AltGr (sağ Alt) yazarken bırakmasın.
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+            if down
+                && (wp.0 == 0x11 || wp.0 == 0x12)
+                && GetKeyState(0xA2) < 0
+                && GetKeyState(0xA4) < 0
+                && GetKeyState(0xA5) >= 0
+            {
+                let released = with(|v| {
+                    if !v.lock_on {
+                        return false;
+                    }
+                    v.lock_override = true;
+                    v.unlock_pointer();
+                    true
+                })
+                .unwrap_or(false);
+                if released {
+                    toast::show(hwnd, "Fare serbest. Yeniden kilitlemek için pencereye tıklayın.");
+                }
+            }
             let scan = ((lp.0 >> 16) & 0xFF) as u16 | if (lp.0 >> 24) & 1 == 1 { 0xE000 } else { 0 };
             let sent = with(|v| v.key(scan, down)).unwrap_or(false);
             if sent {
@@ -672,6 +764,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         After::Mode => {
+            // Bağlantı durumu değişti: fare kilidi de güncellenir (koptuysa hapis kalkar).
+            with(|v| v.update_lock());
             // Ekran boyutu gelmiş olabilir (oran).
             if IsWindowVisible(hwnd).as_bool() {
                 place(hwnd);
@@ -800,6 +894,7 @@ impl View {
 
     fn release_input(&mut self) {
         self.fake_ctrl = false;
+        self.unlock_pointer();
         self.drag_queried = false;
         self.drag_cancelled = false;
         self.released_inside = false;
@@ -821,6 +916,85 @@ impl View {
             }
         }
         self.buttons = 0;
+    }
+
+    /// Mac'teki uygulama fareyi kilitlediyse (oyun) ve pencere öndeyse, imleç pencerenin içindeyse:
+    /// imleç pencereye hapsedilir, gizlenir, ham fare hareketi göreli gönderilir.
+    fn update_lock(&mut self) {
+        let want = unsafe {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut c = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut c);
+            let _ = ScreenToClient(self.hwnd, &mut pt);
+            self.mac.connected()
+                && self.mac.pointer_lock()
+                && !self.mac.phone()
+                && !self.lock_override
+                && !self.dragging_out
+                && IsWindowVisible(self.hwnd).as_bool()
+                && GetForegroundWindow() == self.hwnd
+                && util::contains(&c, pt.x, pt.y)
+        };
+        if want && !self.lock_on {
+            self.lock_pointer();
+        } else if !want && self.lock_on {
+            self.unlock_pointer();
+        }
+    }
+
+    fn lock_pointer(&mut self) {
+        unsafe {
+            let device = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RAWINPUTDEVICE_FLAGS(0), hwndTarget: self.hwnd };
+            if RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_err() {
+                return;
+            }
+            let mut c = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut c);
+            let mut tl = POINT { x: c.left, y: c.top };
+            let mut br = POINT { x: c.right, y: c.bottom };
+            let _ = ClientToScreen(self.hwnd, &mut tl);
+            let _ = ClientToScreen(self.hwnd, &mut br);
+            let clip = RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y };
+            let _ = ClipCursor(Some(&clip));
+            SetCursor(HCURSOR::default());
+        }
+        self.lock_on = true;
+        if !self.lock_hint_shown {
+            self.lock_hint_shown = true;
+            // İpucu bu ödünç almanın dışında gösterilir.
+            unsafe {
+                let _ = PostMessageW(self.hwnd, mac::WM_APP_LOCK, WPARAM(LOCK_HINT), LPARAM(0));
+            }
+        }
+    }
+
+    /// Pencere taşındı ya da boyutu değişti: hapis bölgesi yeni yere.
+    fn reclip(&mut self) {
+        if !self.lock_on {
+            return;
+        }
+        unsafe {
+            let mut c = RECT::default();
+            let _ = GetClientRect(self.hwnd, &mut c);
+            let mut tl = POINT { x: c.left, y: c.top };
+            let mut br = POINT { x: c.right, y: c.bottom };
+            let _ = ClientToScreen(self.hwnd, &mut tl);
+            let _ = ClientToScreen(self.hwnd, &mut br);
+            let _ = ClipCursor(Some(&RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y }));
+        }
+    }
+
+    fn unlock_pointer(&mut self) {
+        if !std::mem::take(&mut self.lock_on) {
+            return;
+        }
+        unsafe {
+            let device = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: RIDEV_REMOVE, hwndTarget: HWND::default() };
+            let _ = RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32);
+            let _ = ClipCursor(None);
+            SetCursor(if self.mac_cursor.is_invalid() { LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default() } else { self.mac_cursor });
+        }
     }
 
     /// Mac imlecinin resmini penceredeki görüntü ölçeğine getirip Windows imleci yapar.
@@ -875,6 +1049,15 @@ impl View {
                 ghost::follow();
                 return After::None;
             }
+            if self.lock_on {
+                return After::None;
+            }
+            if self.mac.pointer_lock() && !self.lock_override {
+                self.update_lock();
+                if self.lock_on {
+                    return After::None;
+                }
+            }
             // Basılı fareyle pencerenin dışına çıkıldı: Mac'te dosya sürükleniyorsa Windows'a alınır.
             let mut c = RECT::default();
             unsafe {
@@ -902,6 +1085,10 @@ impl View {
             if button == 0 && down {
                 self.drag_queried = false;
                 self.released_inside = false;
+                if self.lock_override && self.mac.pointer_lock() {
+                    self.lock_override = false;
+                    self.update_lock();
+                }
             }
             if button == 0 && !down {
                 let mut c = RECT::default();
@@ -1374,6 +1561,7 @@ fn toggle_phone() {
     let on = with(|v| {
         let on = !v.mac.phone();
         v.mac.set_phone(on);
+        v.update_lock();
         on
     })
     .unwrap_or(false);
