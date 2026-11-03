@@ -525,6 +525,18 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
 // MARK: - Fare ve klavye
 
+/// `CGCursorIsVisible` Swift'te kullanılamaz ilan edildi ama CoreGraphics'te durur: çalışma anında
+/// adıyla bulunur. Bulunamazsa gizli sayılmaz (kilit yalnız "olaylar imleci taşımıyor" işaretiyle).
+private let cursorIsVisibleFunction: (@convention(c) () -> Int32)? = {
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGCursorIsVisible") else { return nil }
+    return unsafeBitCast(symbol, to: (@convention(c) () -> Int32).self)
+}()
+
+func systemCursorHidden() -> Bool {
+    guard let isVisible = cursorIsVisibleFunction else { return false }
+    return isVisible() == 0
+}
+
 final class Injector {
     private let source = CGEventSource(stateID: .hidSystemState)
     private var capsLock = false
@@ -1677,7 +1689,7 @@ final class Session {
             signal = false
             detachedTicks = 0
         } else {
-            let hidden = CGCursorIsVisible() == 0
+            let hidden = systemCursorHidden()
             detachedTicks = injector.cursorDetached() ? detachedTicks + 1 : 0
             if pointerLocked {
                 // Kilit, ancak fare olağan biçimde kullanılırken kalkar (imleç görünür ve olayları
