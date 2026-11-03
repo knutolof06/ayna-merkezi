@@ -91,6 +91,11 @@ struct View {
     mac_cursor: HCURSOR,
     /// Mac'e en son bildirilen sürükleme önizleme yeri (aynısı yinelenmez).
     last_hover: Option<(u16, u16)>,
+    /// Mac'ten çıkarılan dosya yeniden Mac penceresine bırakıldı: inen dosyalar kaydedilmez.
+    drag_cancelled: bool,
+    /// Mac'e "sürükleniyor mu" soruldu ama yanıt gelmeden fare Mac penceresinde bırakıldı (dosya
+    /// Mac'te bırakıldı): gelen liste yok sayılır.
+    released_inside: bool,
 }
 
 thread_local! {
@@ -294,6 +299,8 @@ pub fn create() -> Option<HWND> {
             dragging_out: false,
             mac_cursor: HCURSOR::default(),
             last_hover: None,
+            drag_cancelled: false,
+            released_inside: false,
         };
         STATE.with(|c| *c.borrow_mut() = Some(view));
         HWND_CELL.with(|c| c.set(hwnd.0 as isize));
@@ -550,7 +557,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_SIZE => {
             layout(hwnd);
-            with(|v| v.rebuild_cursor());
             After::Paint
         }
         WM_DPICHANGED => {
@@ -559,6 +565,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 v.fonts.delete();
                 v.fonts = Fonts::new(v.scale);
                 SendMessageW(v.edit, WM_SETFONT, WPARAM(v.fonts.code.0 as usize), LPARAM(1));
+                // İmleç DPI'a göre boyutlanır.
+                v.rebuild_cursor();
             });
             After::Place
         }
@@ -793,6 +801,8 @@ impl View {
     fn release_input(&mut self) {
         self.fake_ctrl = false;
         self.drag_queried = false;
+        self.drag_cancelled = false;
+        self.released_inside = false;
         if std::mem::take(&mut self.dragging_out) {
             ghost::hide();
         }
@@ -816,13 +826,10 @@ impl View {
     /// Mac imlecinin resmini penceredeki görüntü ölçeğine getirip Windows imleci yapar.
     fn rebuild_cursor(&mut self) {
         let image = self.mac.cursor();
-        let mut c = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.hwnd, &mut c);
-        }
-        let new = match (image, self.mac.screen()) {
-            (Some(img), Some((vw, _))) if vw > 0 => make_cursor(&img, width(&c) as f32 / vw as f32),
-            _ => HCURSOR::default(),
+        // Mac imleci nokta başına 2 piksel gelir; Windows'ta olağan imleç boyutunda (DPI'a göre).
+        let new = match image {
+            Some(img) => make_cursor(&img, util::scale(self.hwnd) / 2.0),
+            None => HCURSOR::default(),
         };
         let old = std::mem::replace(&mut self.mac_cursor, new);
         unsafe {
@@ -894,13 +901,28 @@ impl View {
         if self.mac.connected() {
             if button == 0 && down {
                 self.drag_queried = false;
+                self.released_inside = false;
             }
             if button == 0 && !down {
+                let mut c = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(self.hwnd, &mut c);
+                }
+                self.released_inside = self.drag_queried && !self.dragging_out && util::contains(&c, pt.0, pt.1);
                 self.drag_queried = false;
                 if std::mem::take(&mut self.dragging_out) {
                     ghost::hide();
                     unsafe {
                         let _ = ReleaseCapture();
+                    }
+                    // Mac penceresine geri getirilip bırakıldı: vazgeçildi (Windows'a kaydedilmez).
+                    let mut c = RECT::default();
+                    unsafe {
+                        let _ = GetClientRect(self.hwnd, &mut c);
+                    }
+                    if util::contains(&c, pt.0, pt.1) {
+                        self.drag_cancelled = true;
+                        toast::show(self.hwnd, "Sürükleme iptal edildi.");
                     }
                     return After::None;
                 }
@@ -1226,6 +1248,25 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
             // Mac'teki sürükleme iptal edilir (Esc, sonra fare bırakılır): dosya orada bir yere
             // düşmesin. Windows'ta fare hâlâ basılı; dosyalar gelince sürükleme burada sürer.
             // Fare Windows'ta zaten bırakıldıysa (dosyalar Masaüstü'ne kaydedilir) iptal gerekmez.
+            // İmleç bu arada Mac penceresine geri döndüyse Mac'teki sürükleme sürer: liste unutulur.
+            let back_inside = with(|v| {
+                let mut pt = POINT::default();
+                let mut c = RECT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(v.hwnd, &mut pt);
+                let _ = GetClientRect(v.hwnd, &mut c);
+                let inside = (v.buttons & 1 != 0 && util::contains(&c, pt.x, pt.y)) || std::mem::take(&mut v.released_inside);
+                if inside {
+                    v.drag_queried = false;
+                    let _ = v.mac.take_dragged();
+                }
+                inside
+            })
+            .unwrap_or(false);
+            if back_inside {
+                return;
+            }
+            with(|v| v.drag_cancelled = false);
             let count = with(|v| {
                 if v.buttons & 1 != 0 {
                     v.dragging_out = true;
@@ -1247,16 +1288,23 @@ unsafe fn files_event(hwnd: HWND, what: usize) {
             }
         }
         mac::FILES_READY => {
-            let Some(items) = with(|v| {
+            let Some((items, cancelled)) = with(|v| {
                 // OLE sürüklemesi fare bırakışını pencereye ulaştırmaz: bayraklar burada sıfırlanır.
                 v.dragging_out = false;
                 v.drag_queried = false;
-                v.mac.take_dragged()
+                (v.mac.take_dragged(), std::mem::take(&mut v.drag_cancelled))
             }) else {
                 return;
             };
             let _ = ReleaseCapture();
             ghost::hide();
+            if cancelled {
+                // Kabuk bunları kopyalamadı: geçici klasör hemen silinir.
+                if let Some(dir) = items.first().and_then(|p| p.parent()) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return;
+            }
             if items.is_empty() {
                 toast::show(hwnd, "Mac'ten dosyalar alınamadı.");
                 return;

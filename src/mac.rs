@@ -65,6 +65,10 @@ const MSG_STATE: u8 = 0x05;
 const MSG_CURSOR: u8 = 0x06;
 /// Windows → Mac: imleci Windows çizer; Mac imlecini görüntüden çıkarıp şeklini göndersin.
 const MSG_LOCAL_CURSOR: u8 = 0x1A;
+/// Mac → Windows: tanı [ana iş parçacığında en uzun bekleme ms][bayraklar: 1 = imleç okunamadı].
+const MSG_DIAG: u8 = 0x07;
+/// Fare hareketleri en çok bu sıklıkta gönderilir (Mac her olayı ayrı işler; boğulmasın).
+const MOVE_INTERVAL: Duration = Duration::from_millis(8);
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -852,6 +856,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     });
 
     let mut stats = Stats::new();
+    let mut cursor_logged = false;
     let mut last_data = Instant::now();
     loop {
         let mut len = [0u8; 4];
@@ -887,11 +892,24 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.rtt(epoch.elapsed().as_millis() as u64 - sent.min(epoch.elapsed().as_millis() as u64));
             }
             MSG_BYE => return Ok(true),
+            MSG_DIAG if plain.len() >= 4 => {
+                // Yalnız dikkat çekici durumlar günlüğe yazılır (her 10 sn'de bir satır olmasın).
+                let stall = u16::from_be_bytes([plain[1], plain[2]]);
+                let unreadable = plain[3] & 1 != 0;
+                if stall >= 50 || unreadable {
+                    let note = if unreadable { ", sistem imleci okunamıyor" } else { "" };
+                    util::log(&format!("Mac tanı: ana iş parçacığında en uzun bekleme {stall} ms{note}"));
+                }
+            }
             MSG_CURSOR if plain.len() >= 9 => {
                 let be = |i: usize| u16::from_be_bytes([plain[i], plain[i + 1]]);
                 let (width, height) = (be(5) as usize, be(7) as usize);
                 let image = (width > 0 && height > 0 && width <= 256 && height <= 256 && plain.len() == 9 + width * height * 4)
                     .then(|| CursorImage { hot: (be(1), be(3)), width, height, bgra: plain[9..].to_vec() });
+                if !cursor_logged {
+                    cursor_logged = true;
+                    util::log(&format!("Mac imleci alınıyor ({width}×{height})."));
+                }
                 *shared.cursor.lock().unwrap() = image;
                 unsafe {
                     let _ = PostMessageW(HWND(notify as _), WM_APP_CURSOR, WPARAM(0), LPARAM(0));
@@ -1228,12 +1246,20 @@ impl Stats {
 /// Giden mesajları şifreleyip yazar; arada bir canlılık yoklaması gönderir.
 fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, started: Instant, queued: &AtomicUsize) {
     let mut last_ping = Instant::now();
+    let mut last_move = Instant::now();
     loop {
         let mut batch = Vec::new();
         match out.recv_timeout(PING_EVERY) {
             Ok(m) => batch.push(m),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
+        }
+        // Fare hareketi çok sık geliyorsa (1000 Hz fareler) kısa beklenir; arada gelenler birleşir.
+        if batch.first().and_then(|m| m.first()) == Some(&MSG_MOUSE_MOVE) {
+            let since = last_move.elapsed();
+            if since < MOVE_INTERVAL {
+                std::thread::sleep(MOVE_INTERVAL - since);
+            }
         }
         // Birikmiş fare hareketlerinden yalnız sonuncusu gönderilir.
         while let Ok(m) = out.try_recv() {
@@ -1256,6 +1282,9 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
         }
         if writer.write_all(&bytes).is_err() {
             return;
+        }
+        if batch.iter().any(|m| m.first() == Some(&MSG_MOUSE_MOVE)) {
+            last_move = Instant::now();
         }
         let sent: usize = batch.iter().filter(|m| m.first() == Some(&MSG_PUT_DATA)).map(|m| m.len()).sum();
         if sent > 0 {

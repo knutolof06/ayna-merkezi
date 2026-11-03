@@ -26,6 +26,8 @@
 //   görüntüye çizilmez ve Mac → Windows 0x06 CURSOR [sıcak x][sıcak y][gen][yük][BGRA önceden
 //   çarpılmış, görüntü pikseli ölçeğinde] gider; gen 0 = Windows kendi okunu göstersin. Bunu
 //   bildirmeyen eski Windows için imleç görüntüde kalır.
+// - Tanı: Mac → Windows 0x07 DIAG [ana iş parçacığında en uzun bekleme ms u16][bayraklar] her 10 sn;
+//   bayrak 1 = sistem imleci okunamadı. Windows günlüğe yazar (takılmaların nedeni görülsün).
 // - Sürükleme önizlemesi: Windows → Mac 0x25 HOVER [x][y][sayı][klasör mü][ad uz.][ad], 0x26 HOVER_END:
 //   Windows'tan sürüklenen dosyanın simgesi ve adı Mac'te imlecin altında görünür.
 // - iPhone kipi: Windows → Mac 0x18 MODE [0 Mac ekranı | 1 iPhone]; Mac → Windows 0x05 STATE
@@ -1290,11 +1292,15 @@ final class Session {
     private var phoneAnnounced = false
     /// Windows imleci kendisi çiziyor: Mac imleci görüntüye çizilmez, şekli 0x06 ile gider.
     private var localCursor = false
+    /// Tanı: ana iş parçacığının en uzun gecikmesi (10 sn'lik pencerede) ve imleç okunamadı mı.
+    private var diagTimer: Timer?
+    private var diagLastTick = Date()
+    private var diagMaxStall: TimeInterval = 0
+    private var diagWindowStart = Date()
+    private var cursorUnreadable = false
     /// Mac imlecinin şeklini Windows'a taşır (görüntüde imleç yok).
     private var cursorTimer: Timer?
     private var lastCursor = Data()
-    /// Görüntü pikseli / ekran noktası (görüntü en uzun kenar sınırına küçültülür).
-    private var videoScale: CGFloat = 1
     private var dragPreview: DragPreview?
     /// Windows penceresi gizli: görüntü durur (yeni yakalayıcıya da geçer).
     private var videoPaused = false
@@ -1400,15 +1406,25 @@ final class Session {
             case .approval:
                 return
             case .streaming:
-                guard buffer.count >= 4 else { return }
-                let b = [UInt8](buffer.prefix(4))
-                let n = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
-                guard n >= 17, n <= 65_536 else { close(); return }
-                guard buffer.count >= 4 + n else { return }
-                _ = take(4)
-                let sealed = take(n)
-                guard let plain = open(sealed) else { close(); return }
-                handle(plain)
+                // Gelen tüm tam çerçeveler çözülür; art arda fare hareketlerinden yalnız sonuncusu
+                // uygulanır (her biri sisteme ayrı olay olarak işlenip ana iş parçacığını tıkamasın).
+                var messages: [Data] = []
+                while buffer.count >= 4 {
+                    let b = [UInt8](buffer.prefix(4))
+                    let n = Int(b[0]) << 24 | Int(b[1]) << 16 | Int(b[2]) << 8 | Int(b[3])
+                    guard n >= 17, n <= 65_536 else { close(); return }
+                    guard buffer.count >= 4 + n else { break }
+                    _ = take(4)
+                    let sealed = take(n)
+                    guard let plain = open(sealed) else { close(); return }
+                    messages.append(plain)
+                }
+                for (i, message) in messages.enumerated() {
+                    if message.first == 0x10, i + 1 < messages.count, messages[i + 1].first == 0x10 { continue }
+                    handle(message)
+                    if stage == .closed { return }
+                }
+                return
             case .closed:
                 return
             }
@@ -1574,16 +1590,42 @@ final class Session {
         lastData = Date()
         app?.sessionStarted(self)
         startCapture(region: nil)
+        diagLastTick = Date()
+        diagWindowStart = Date()
+        // Ortak kip: menü açıkken de ölçülsün (yoksa menü süresi takılma sanılır).
+        let diag = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.diagTick() }
+        diag.tolerance = 0
+        RunLoop.main.add(diag, forMode: .common)
+        diagTimer = diag
         process()
     }
 
-    /// Mac imlecinin şekli değiştiyse resmini (görüntü ölçeğinde) Windows'a gönderir.
+    /// 0,1 sn'lik zamanlayıcının gecikmesi ana iş parçacığının ne kadar meşgul kaldığını gösterir.
+    private func diagTick() {
+        let now = Date()
+        diagMaxStall = max(diagMaxStall, now.timeIntervalSince(diagLastTick) - 0.1)
+        diagLastTick = now
+        guard now.timeIntervalSince(diagWindowStart) >= 10 else { return }
+        let ms = UInt16(clamping: Int(max(0, diagMaxStall) * 1000))
+        var report: [UInt8] = [0x07]
+        report += be16(ms)
+        report.append(cursorUnreadable ? 1 : 0)
+        send(Data(report))
+        diagMaxStall = 0
+        diagWindowStart = now
+    }
+
+    /// Mac imlecinin şekli değiştiyse resmini (nokta başına 2 piksel) Windows'a gönderir.
     private func sendCursor() {
         guard stage == .streaming else { return }
         var message = Data([0x06, 0, 0, 0, 0, 0, 0, 0, 0])
-        if phone == nil, let cursor = NSCursor.currentSystem {
+        let current = phone == nil ? NSCursor.currentSystem : nil
+        cursorUnreadable = phone == nil && current == nil
+        if let cursor = current {
+            // Sabit ölçek: Windows imleci pencere boyutundan bağımsız, olağan imleç boyutunda gösterir.
+            let scale: CGFloat = 2
             let size = cursor.image.size
-            let w = Int((size.width * videoScale).rounded()), h = Int((size.height * videoScale).rounded())
+            let w = Int((size.width * scale).rounded()), h = Int((size.height * scale).rounded())
             if (1...256).contains(w), (1...256).contains(h) {
                 var pixels = [UInt8](repeating: 0, count: w * h * 4)
                 let drawn: Bool = pixels.withUnsafeMutableBytes { raw in
@@ -1605,8 +1647,8 @@ final class Session {
                 }
                 if drawn {
                     let hot = cursor.hotSpot
-                    let hx = UInt16(clamping: Int(hot.x * videoScale))
-                    let hy = UInt16(clamping: Int(hot.y * videoScale))
+                    let hx = UInt16(clamping: Int(hot.x * scale))
+                    let hy = UInt16(clamping: Int(hot.y * scale))
                     var head: [UInt8] = [0x06]
                     head += be16(hx)
                     head += be16(hy)
@@ -1632,13 +1674,8 @@ final class Session {
             onFrame: { [weak self] data, key in self?.sendVideo(data, key: key) },
             onSize: { [weak self] w, h in
                 self?.send(Data([0x02] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
-                if region == nil {
-                    let points = CGDisplayBounds(CGMainDisplayID()).width
-                    DispatchQueue.main.async {
-                        self?.videoScale = points > 0 ? CGFloat(w) / points : 1
-                        self?.lastCursor = Data()
-                    }
-                }
+                // Yeni boyut iletisinden sonra imleç yeniden gönderilsin.
+                DispatchQueue.main.async { self?.lastCursor = Data() }
             },
             onError: { [weak self] message in
                 DispatchQueue.main.async {
@@ -1925,6 +1962,8 @@ final class Session {
         watchdog?.invalidate()
         cursorTimer?.invalidate()
         cursorTimer = nil
+        diagTimer?.invalidate()
+        diagTimer = nil
         dragPreview?.hide()
         capturer?.stop()
         capturer = nil
