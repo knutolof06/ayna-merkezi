@@ -33,9 +33,11 @@
 //   bayrak 1 = sistem imleci okunamadı. Windows günlüğe yazar (takılmaların nedeni görülsün).
 // - Sürükleme önizlemesi: Windows → Mac 0x25 HOVER [x][y][sayı][klasör mü][ad uz.][ad], 0x26 HOVER_END:
 //   Windows'tan sürüklenen dosyanın simgesi ve adı Mac'te imlecin altında görünür.
-// - iPhone kipi: Windows → Mac 0x18 MODE [0 Mac ekranı | 1 iPhone]; Mac → Windows 0x05 STATE
-//   [kip][başarılı][metin]. iPhone kipinde görüntü ve fare, görünmez bir sanal ekranda açılan
-//   iPhone Mirroring penceresine aittir.
+// - iPhone kipi: Windows → Mac 0x18 MODE [0 kapalı | 2 ayrı pencere] (1 eski kipti, reddedilir);
+//   Mac → Windows 0x05 STATE [kip][başarılı][metin]. Görünmez bir sanal ekrandaki iPhone Mirroring,
+//   Mac görüntüsüyle aynı anda 0x09 PHONE_VIDEO [bayraklar][Annex-B] ve 0x0A PHONE_SCREEN [gen][yük]
+//   ile gider; anahtar kare için 0x1C. 0x19 TARGET [fare][klavye] (0 Mac, 1 iPhone) hangi pencerenin
+//   kullanıldığını bildirir.
 // - Dosyalar (Windows → Mac): 0x20 PUT_BEGIN [toplu][no][boy u64][x][y][ad uz.][göreli ad],
 //   0x21 PUT_DATA [no][veri], 0x22 PUT_END [no]; Mac her dosyadan sonra 0x35 PUT_DONE
 //   [toplu][biten sayısı][hedef klasör]. Hedef, bırakılan noktadaki Finder penceresi ya da Masaüstü.
@@ -284,8 +286,8 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
     let onFrame: (Data, Bool) -> Void
     let onSize: (Int, Int) -> Void
     let onError: (String) -> Void
-    /// Verilirse ana ekran yerine bu ekranın bu bölümü (nokta, ekrana göre) yakalanır: iPhone kipinde
-    /// görünmez ekrandaki iPhone Mirroring penceresi.
+    /// Verilirse ana ekran yerine bu ekranın bu bölümü (nokta, ekrana göre) yakalanır: görünmez
+    /// ekrandaki iPhone Mirroring penceresi (ikinci yakalayıcı).
     let region: (display: SCDisplay, rect: CGRect, scale: CGFloat)?
     /// Durdurulduktan sonra (kodlayıcıda kalan kareler dahil) hiçbir şey dışarı verilmez: yeni
     /// yakalayıcının boyut iletisinden sonra eski boyutta kare gitmesin.
@@ -571,7 +573,7 @@ final class Injector {
     private var finderCut: Int?
 
     var leftDown: Bool { buttons.contains(0) }
-    /// iPhone kipi: koordinatlar bu alana (iPhone Mirroring penceresi, genel koordinat) eşlenir.
+    /// Fare iPhone penceresindeyken koordinatlar bu alana (iPhone Mirroring, genel koordinat) eşlenir.
     var area: (() -> CGRect?)?
     /// Oyun fareyi kilitledi: tıklamalar imlecin bulunduğu yerde (Windows'un imleç yeri değil).
     var relative = false
@@ -1369,6 +1371,15 @@ final class Session {
     /// iPhone kipindeyken görünmez ekrandaki iPhone Mirroring.
     private var phone: PhoneMirror?
     private var phoneAnnounced = false
+    /// iPhone Mirroring'i yakalayan ikinci yakalayıcı; Mac ekranının yakalaması onunla birlikte sürer.
+    private var phoneCapturer: Capturer?
+    private var needPhoneKey = false
+    /// Fare Windows'taki iPhone penceresinin üstünde: fare olayları iPhone Mirroring'e eşlenir.
+    private var phoneMouse = false
+    /// Windows'ta iPhone penceresi etkin: klavye iPhone Mirroring'e gider.
+    private var phoneKeyboard = false
+    /// iPhone Mirroring öne alınmadan önce öndeki uygulama (Mac penceresine dönülünce geri gelir).
+    private var previousApp: NSRunningApplication?
     /// Windows imleci kendisi çiziyor: Mac imleci görüntüye çizilmez, şekli 0x06 ile gider.
     private var localCursor = false
     /// Bir uygulama (oyun) fareyi kilitledi; işaretin sürdüğü an (kısa titreşimler sayılmaz).
@@ -1558,24 +1569,26 @@ final class Session {
     }
 
     /// Ağ yavaşsa kareler biriktirilmez: bekleyen veri çoksa kare atlanır, sonra anahtar kareyle sürer.
-    private func sendVideo(_ data: Data, key: Bool) {
+    private func sendVideo(_ data: Data, key: Bool, phone: Bool = false) {
         sendQueue.async { [weak self] in
             guard let self else { return }
             // Gönderilmeyi bekleyen veri az tutulur (~0,3 sn): birikirse gecikme büyür.
             // Dosya aktarımı kendi sınırıyla bekler; görüntü sınırı yalnız görüntü verisine bakar.
             let pending = self.inFlight - self.fileInFlight
             if pending > 512_000 {
-                self.needKey = true
+                if phone { self.needPhoneKey = true } else { self.needKey = true }
                 return
             }
-            if self.needKey && !key {
+            if (phone ? self.needPhoneKey : self.needKey) && !key {
                 if pending < 128_000 {
-                    DispatchQueue.main.async { self.capturer?.requestKeyframe() }
+                    DispatchQueue.main.async { (phone ? self.phoneCapturer : self.capturer)?.requestKeyframe() }
                 }
                 return
             }
-            if key { self.needKey = false }
-            self.sendNow(Data([0x01, key ? 1 : 0]) + data)
+            if key {
+                if phone { self.needPhoneKey = false } else { self.needKey = false }
+            }
+            self.sendNow(Data([phone ? 0x09 : 0x01, key ? 1 : 0]) + data)
         }
     }
 
@@ -1675,7 +1688,7 @@ final class Session {
         stage = .streaming
         lastData = Date()
         app?.sessionStarted(self)
-        startCapture(region: nil)
+        startCapture()
         diagLastTick = Date()
         diagWindowStart = Date()
         // Ortak kip: menü açıkken de ölçülsün (yoksa menü süresi takılma sanılır).
@@ -1706,7 +1719,7 @@ final class Session {
     /// uygulama fareyi kilitlemiştir (yazarken gizlenen imleç fare oynayınca görünür, sayılmaz).
     private func updatePointerLock() {
         let signal: Bool
-        if phone != nil {
+        if phoneMouse {
             signal = false
             detachedTicks = 0
         } else {
@@ -1736,14 +1749,16 @@ final class Session {
     private func sendCursor() {
         guard stage == .streaming else { return }
         updatePointerLock()
+        // Fare iPhone penceresindeyken imleç görünmez ekrandadır; Mac penceresinin imleci değişmesin.
+        guard !phoneMouse else { return }
         var message = Data([0x06, 0, 0, 0, 0, 0, 0, 0, 0])
         // Bir uygulama imleci gizlediyse (oyun kendi imlecini ya da nişangahını çizer, video
         // oynatıcı gizler) Windows imleci de görünmesin: saydam 2×2 imleç gönderilir. Eski Windows
         // sürümleri de bunu olağan bir imleç resmi olarak işler.
-        hiddenTicks = phone == nil && systemCursorHidden() ? hiddenTicks + 1 : 0
+        hiddenTicks = systemCursorHidden() ? hiddenTicks + 1 : 0
         let hidden = hiddenTicks >= 3
-        let current = phone == nil && !hidden ? NSCursor.currentSystem : nil
-        cursorUnreadable = phone == nil && !hidden && current == nil
+        let current = hidden ? nil : NSCursor.currentSystem
+        cursorUnreadable = !hidden && current == nil
         if hidden {
             message = Data([0x06, 0, 0, 0, 0, 0, 2, 0, 2] + [UInt8](repeating: 0, count: 2 * 2 * 4))
         } else if let cursor = current {
@@ -1789,11 +1804,10 @@ final class Session {
         send(message)
     }
 
-    /// Ana ekranı (ya da iPhone kipinde görünmez ekrandaki iPhone Mirroring penceresini) yakalamaya başlar.
-    private func startCapture(region: (display: SCDisplay, rect: CGRect, scale: CGFloat)?) {
+    /// Ana ekranı yakalamaya başlar.
+    private func startCapture() {
         capturer?.stop()
         let cap = Capturer(
-            region: region,
             paused: videoPaused,
             cursor: !localCursor,
             onFrame: { [weak self] data, key in self?.sendVideo(data, key: key) },
@@ -1803,14 +1817,28 @@ final class Session {
                 DispatchQueue.main.async { self?.lastCursor = Data() }
             },
             onError: { [weak self] message in
-                DispatchQueue.main.async {
-                    // iPhone kipinde pencere kapanması zaten iPhone Mirroring izlenerek bildirilir; Mac
-                    // ekranında uyarı açılmaz.
-                    guard let self, self.phone == nil else { return }
-                    self.app?.show(error: message)
-                }
+                DispatchQueue.main.async { self?.app?.show(error: message) }
             })
         capturer = cap
+        cap.start()
+    }
+
+    /// Görünmez ekrandaki iPhone Mirroring penceresini yakalamaya başlar (pencere yer ya da boyut
+    /// değiştirdiyse yeniden).
+    private func startPhoneCapture(_ display: SCDisplay, _ rect: CGRect, _ scale: CGFloat) {
+        phoneCapturer?.stop()
+        let cap = Capturer(
+            region: (display, rect, scale),
+            cursor: false,
+            onFrame: { [weak self] data, key in self?.sendVideo(data, key: key, phone: true) },
+            onSize: { [weak self] w, h in
+                self?.send(Data([0x0A] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
+            },
+            onError: { [weak self] message in
+                // Mac ekranında uyarı açılmaz; Windows'ta bildirim olarak görünür.
+                DispatchQueue.main.async { self?.sendState(mode: 2, ok: true, message) }
+            })
+        phoneCapturer = cap
         cap.start()
     }
 
@@ -1819,13 +1847,8 @@ final class Session {
     private func setPhoneMode(_ on: Bool) {
         guard on != (phone != nil) else {
             // Yinelenen istek de yanıtlanır (Windows yanıt bekler).
-            sendState(mode: on ? 1 : 0, ok: true, "")
+            sendState(mode: on ? 2 : 0, ok: true, "")
             return
-        }
-        if on && pointerLocked {
-            pointerLocked = false
-            injector.relative = false
-            send(Data([0x08, 0]))
         }
         if on {
             let p = PhoneMirror(
@@ -1833,35 +1856,87 @@ final class Session {
                 onError: { [weak self] message in self?.phoneFailed(message) })
             phone = p
             phoneAnnounced = false
-            injector.area = { [weak p] in p?.frame }
-            sendState(mode: 1, ok: true, L("iPhone Mirroring açılıyor…", "Opening iPhone Mirroring…"))
+            rememberFront()
+            sendState(mode: 2, ok: true, L("iPhone Mirroring açılıyor…", "Opening iPhone Mirroring…"))
             p.start()
         } else {
-            phone?.stop()
-            phone = nil
-            injector.area = nil
-            startCapture(region: nil)
+            endPhone()
             sendState(mode: 0, ok: true, "")
         }
     }
 
+    private func endPhone() {
+        setPhoneTarget(mouse: false, keyboard: false)
+        phoneCapturer?.stop()
+        phoneCapturer = nil
+        phone?.stop()
+        phone = nil
+    }
+
     private func phoneReady(_ display: SCDisplay, _ rect: CGRect, _ scale: CGFloat) {
-        guard let phone, stage == .streaming else { return }
-        startCapture(region: (display, rect, scale))
-        _ = phone.focus()
+        guard phone != nil, stage == .streaming else { return }
+        startPhoneCapture(display, rect, scale)
+        if phoneKeyboard { _ = focusPhone() }
         if !phoneAnnounced {
             phoneAnnounced = true
-            sendState(mode: 1, ok: true, L("iPhone hazır", "iPhone is ready"))
+            sendState(mode: 2, ok: true, L("iPhone hazır", "iPhone is ready"))
         }
     }
 
     private func phoneFailed(_ message: String) {
         guard phone != nil else { return }
-        phone?.stop()
-        phone = nil
-        injector.area = nil
-        if stage == .streaming { startCapture(region: nil) }
+        endPhone()
         sendState(mode: 0, ok: false, message)
+    }
+
+    /// Windows hangi pencerenin kullanıldığını bildirdi. Fare imlecin üstünde durduğu pencereyi,
+    /// klavye etkin pencereyi izler: fare Mac penceresinden geçerken öndeki uygulama değişmez.
+    private func setPhoneTarget(mouse: Bool, keyboard: Bool) {
+        let mouse = mouse && phone != nil
+        let keyboard = keyboard && phone != nil
+        if mouse != phoneMouse {
+            phoneMouse = mouse
+            if mouse {
+                if pointerLocked {
+                    pointerLocked = false
+                    injector.relative = false
+                    send(Data([0x08, 0]))
+                }
+                let p = phone
+                injector.area = { [weak p] in p?.frame }
+            } else {
+                injector.area = nil
+            }
+        }
+        if keyboard != phoneKeyboard {
+            phoneKeyboard = keyboard
+            if keyboard { _ = focusPhone() } else { restoreFront() }
+        }
+    }
+
+    /// iPhone Mirroring'i öne alır; öndeyse true. Öndeki uygulama geri getirilmek üzere hatırlanır.
+    private func focusPhone() -> Bool {
+        guard let phone else { return false }
+        rememberFront()
+        return phone.focus()
+    }
+
+    private func rememberFront() {
+        if let front = NSWorkspace.shared.frontmostApplication, front.bundleIdentifier != PhoneMirror.bundleID {
+            previousApp = front
+        }
+    }
+
+    /// Klavye Mac'e döndü. Önceki uygulama bilinmiyorsa (iPhone Mirroring baştan öndeydi) Finder öne
+    /// gelir; yoksa tuşlar görünmez ekrandaki iPhone Mirroring'e gitmeyi sürdürürdü.
+    private func restoreFront() {
+        let front = NSWorkspace.shared.frontmostApplication
+        let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first
+        let target = previousApp ?? (front?.bundleIdentifier == PhoneMirror.bundleID ? finder : nil)
+        previousApp = nil
+        guard let app = target, !app.isTerminated else { return }
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), kAXFrontmostAttribute as CFString,
+                                     kCFBooleanTrue)
     }
 
     private func sendState(mode: UInt8, ok: Bool, _ text: String) {
@@ -1886,9 +1961,9 @@ final class Session {
         case 0x12 where b.count >= 5:
             injector.scroll(dx: Int16(bitPattern: readBE16(m, 1)), dy: Int16(bitPattern: readBE16(m, 3)))
         case 0x13 where b.count >= 4:
-            // iPhone kipinde tuş basışı yalnız iPhone Mirroring öndeyken gider (yoksa öne alınır, basış
-            // düşer); bırakış her zaman gider (tuş basılı kalmasın).
-            if b[3] == 1, let phone, !phone.focus() { return }
+            // iPhone penceresindeyken tuş basışı yalnız iPhone Mirroring öndeyken gider (yoksa öne
+            // alınır, basış düşer); bırakış her zaman gider (tuş basılı kalmasın).
+            if b[3] == 1, phoneKeyboard, !focusPhone() { return }
             injector.key(readBE16(m, 1), down: b[3] == 1)
         case 0x14:
             capturer?.requestKeyframe()
@@ -1900,7 +1975,17 @@ final class Session {
         case 0x17:
             close()
         case 0x18 where b.count >= 2:
-            setPhoneMode(b[1] == 1)
+            switch b[1] {
+            case 0: setPhoneMode(false)
+            case 2: setPhoneMode(true)
+            default:
+                // Eski Windows sürümü iPhone'u Mac penceresinde bekler; yeni görüntü iletisini tanımaz.
+                sendState(mode: 0, ok: false, L("Windows'taki Ayna Merkezi'ni güncelleyin.", "Update Ayna Merkezi on Windows."))
+            }
+        case 0x19 where b.count >= 3:
+            setPhoneTarget(mouse: b[1] == 1, keyboard: b[2] == 1)
+        case 0x1C:
+            phoneCapturer?.requestKeyframe()
         case 0x20 where b.count >= 23:
             putBegin(b)
         case 0x21 where b.count >= 5:
@@ -1922,7 +2007,7 @@ final class Session {
             let (x, y) = (readBE16(m, 1), readBE16(m, 3))
             let count = Int(readBE16(m, 5)), folder = b[7] == 1
             let len = Int(UInt16(b[8]) << 8 | UInt16(b[9]))
-            guard phone == nil, b.count >= 10 + len else { break }
+            guard b.count >= 10 + len else { break }
             let name = String(decoding: b[10..<(10 + len)], as: UTF8.self)
             injector.move(x, y)
             let screen = CGDisplayBounds(CGMainDisplayID())
@@ -1938,7 +2023,7 @@ final class Session {
             // Windows imleci kendisi çiziyor: Mac imleci görüntüden çıkar, şekli ayrıca gönderilir.
             guard !localCursor else { break }
             localCursor = true
-            if phone == nil { capturer?.setCursorShown(false) }
+            capturer?.setCursorShown(false)
             cursorTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.sendCursor() }
         default:
             break
@@ -2099,9 +2184,7 @@ final class Session {
         dragPreview?.hide()
         capturer?.stop()
         capturer = nil
-        phone?.stop()
-        phone = nil
-        injector.area = nil
+        endPhone()
         injector.releaseAll()
         sendQueue.async { [self] in filesCancelled = true }
         fileQueue.async { [self] in

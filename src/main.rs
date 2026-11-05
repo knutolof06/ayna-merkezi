@@ -15,6 +15,7 @@ mod hub;
 mod mac;
 mod macview;
 mod mirror;
+mod phoneview;
 mod taskbar;
 mod toast;
 mod transfer;

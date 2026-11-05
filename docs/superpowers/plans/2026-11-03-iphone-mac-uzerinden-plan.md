@@ -23,6 +23,19 @@ ekranında iPhone görüntüsü sürekli açık durmasın.
    çalışıyor mu, kapanışta pencere ana ekrana düşüyor mu.
 2. iPhone ikonuna taşıma: iPhone penceresi Mac yolunu kullanır (BLE/AirPlay yerine ya da yedek olarak).
 
+## Aşama 2: iPhone ayrı pencerede (2026-11-05, kullanıcı onayladı, kod yazıldı: src/phoneview.rs + Session)
+Değişen: TARGET iki baytlı [fare][klavye]; fare imlecin üstündeki pencereyi, klavye etkin pencereyi izler.
+Kullanıcı kipi gerçek Mac'te açtı, iPhone görüntüsü geldi. Şikâyet: görüntü Mac penceresinin yerini alıyor,
+Mac kullanılamıyor. Öneri:
+- Mac ajanı iki yakalayıcıyı aynı anda çalıştırır: ana ekran (0x01/0x02) + iPhone bölgesi. Yeni iletiler:
+  Mac → Windows 0x09 PHONE_VIDEO, 0x0A PHONE_SCREEN; Windows → Mac 0x19 TARGET [0 Mac | 1 iPhone],
+  0x1C PHONE_KEYFRAME; 0x18 MODE [2] = ayrı pencere (eski ajan 2'yi kapalı sayar, Windows uyarır).
+- Windows: ikinci GStreamer oynatıcılı yeni pencere (src/phoneview.rs). Fare hangi pencerenin üstündeyse
+  TARGET ona çevrilir; injector.area buna göre iPhone penceresi ya da ana ekran olur.
+- Klavye iPhone penceresindeyken iPhone Mirroring öne alınır; Mac penceresine dönünce önceki uygulama öne gelir.
+Sınırlar: Mac'te tek imleç ve tek ön plan uygulaması var, ikisi aynı anda değil sırayla kullanılır. Doğrulanmamış:
+iPhone Mirroring öne alınmamışken görüntü üretmeye devam ediyor mu.
+
 ## Riskler
 - `CGVirtualDisplay` belgelenmemiş API: macOS sürümünde değişebilir; açılamazsa mod hata verir, Mac
   ekranı kipine dönülür.

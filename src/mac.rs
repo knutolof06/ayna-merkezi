@@ -74,6 +74,14 @@ const MOVE_INTERVAL: Duration = Duration::from_millis(5);
 const MSG_POINTER_LOCK: u8 = 0x08;
 /// Windows → Mac: göreli fare hareketi [dx i16][dy i16] (fare kilitliyken).
 const MSG_REL_MOVE: u8 = 0x1B;
+/// Mac → Windows: iPhone görüntüsü [bayraklar][Annex-B] (Mac görüntüsüyle aynı anda).
+const MSG_PHONE_VIDEO: u8 = 0x09;
+/// Mac → Windows: iPhone görüntüsünün boyutu [gen][yük].
+const MSG_PHONE_SCREEN: u8 = 0x0A;
+/// Windows → Mac: kullanılan pencere [fare][klavye]; 0 Mac, 1 iPhone.
+const MSG_TARGET: u8 = 0x19;
+/// Windows → Mac: iPhone görüntüsü için anahtar kare.
+const MSG_PHONE_KEYFRAME: u8 = 0x1C;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -83,8 +91,10 @@ const MSG_KEYFRAME: u8 = 0x14;
 const MSG_PING: u8 = 0x15;
 const MSG_PAUSE: u8 = 0x16;
 const MSG_LEAVE: u8 = 0x17;
-/// Windows → Mac: [0 Mac ekranı | 1 iPhone (Mac'teki iPhone Mirroring)].
+/// Windows → Mac: [0 kapalı | 2 iPhone ayrı pencerede (Mac'teki iPhone Mirroring)]. 1 eski kipti:
+/// görüntü Mac penceresinin yerini alıyordu.
 const MSG_MODE: u8 = 0x18;
+const MODE_PHONE: u8 = 2;
 const MSG_PUT_BEGIN: u8 = 0x20;
 const MSG_PUT_DATA: u8 = 0x21;
 const MSG_PUT_END: u8 = 0x22;
@@ -107,6 +117,8 @@ pub const WM_APP_FILES: u32 = WM_APP + 28;
 pub const WM_APP_CURSOR: u32 = WM_APP + 29;
 /// Mac'te fare kilidi açıldı/kapandı.
 pub const WM_APP_LOCK: u32 = WM_APP + 30;
+/// iPhone kipinin durumu ya da görüntü boyutu değişti.
+pub const WM_APP_PHONE: u32 = WM_APP + 31;
 /// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
 pub const FILES_LISTED: usize = 1;
 /// Mac'ten sürüklenen dosyaların hepsi geldi.
@@ -187,8 +199,16 @@ struct Shared {
     cursor: Mutex<Option<CursorImage>>,
     /// Mac'te bir uygulama fareyi kilitledi (göreli hareket istenir).
     pointer_lock: AtomicBool,
-    /// iPhone kipi istendi (Mac'teki iPhone Mirroring gösterilir); ağ kopup yeniden bağlanınca da sürer.
+    /// iPhone kipi istendi (Mac'teki iPhone Mirroring ayrı pencerede); ağ kopup yeniden bağlanınca da sürer.
     phone: AtomicBool,
+    /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
+    phone_player: Mutex<Option<Player>>,
+    phone_screen: Mutex<Option<(u16, u16)>>,
+    /// Yanıtı henüz gelmemiş "kipi kapat" istekleri: hızlı kapat-aç'ta eski yanıt yeni kipi kapatmasın.
+    phone_offs: AtomicU32,
+    /// Fare ve klavye iPhone penceresinde mi (Mac'e en son bildirilen).
+    target_mouse: AtomicBool,
+    target_keyboard: AtomicBool,
     /// Kip istendi, Mac henüz yanıt vermedi (eski Ayna Ajan isteği tanımaz, hiç yanıt gelmez).
     phone_asked: Mutex<Option<Instant>>,
     /// Yeniden bağlanınca kendiliğinden yinelenen istek: yalnız hata bildirilir (bildirim yağmuru olmasın).
@@ -226,6 +246,13 @@ static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(0);
 static NEXT_DRAG_DIR: AtomicU32 = AtomicU32::new(0);
 
 impl Shared {
+    /// iPhone penceresinin görüntü boyutu ve hedefi unutulur (kip kapandı ya da yeniden açılıyor).
+    fn reset_phone_view(&self) {
+        *self.phone_screen.lock().unwrap() = None;
+        self.target_mouse.store(false, Ordering::SeqCst);
+        self.target_keyboard.store(false, Ordering::SeqCst);
+    }
+
     fn publish(&self, attempt: u32, f: impl FnOnce(&mut Inner)) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if inner.attempt != attempt {
@@ -266,6 +293,11 @@ impl Mac {
                 drag_asked: AtomicBool::new(false),
                 cursor: Mutex::new(None),
                 pointer_lock: AtomicBool::new(false),
+                phone_player: Mutex::new(None),
+                phone_screen: Mutex::new(None),
+                phone_offs: AtomicU32::new(0),
+                target_mouse: AtomicBool::new(false),
+                target_keyboard: AtomicBool::new(false),
                 phone: AtomicBool::new(false),
                 phone_asked: Mutex::new(None),
                 phone_quiet: AtomicBool::new(false),
@@ -399,18 +431,61 @@ impl Mac {
         top
     }
 
-    /// iPhone kipi: Mac penceresinde Mac ekranı yerine Mac'teki iPhone Mirroring görünür.
+    /// iPhone kipi: Mac'teki iPhone Mirroring ayrı pencerede görünür, Mac penceresi Mac'i göstermeyi sürdürür.
     pub fn set_phone(&self, on: bool) {
         self.shared.phone.store(on, Ordering::SeqCst);
         self.shared.phone_quiet.store(false, Ordering::SeqCst);
         *self.shared.phone_asked.lock().unwrap() = on.then(Instant::now);
-        self.send(vec![MSG_MODE, u8::from(on)]);
+        self.shared.reset_phone_view();
+        if !on && self.connected() {
+            self.shared.phone_offs.fetch_add(1, Ordering::SeqCst);
+        }
+        self.send(vec![MSG_MODE, if on { MODE_PHONE } else { 0 }]);
     }
 
-    /// Kullanıcı bağlantıyı kesti: bir sonraki bağlanış Mac ekranıyla başlar.
+    /// Kullanıcı bağlantıyı kesti: bir sonraki bağlanış iPhone kipi olmadan başlar.
     pub fn clear_phone(&self) {
         self.shared.phone.store(false, Ordering::SeqCst);
         *self.shared.phone_asked.lock().unwrap() = None;
+        self.shared.reset_phone_view();
+    }
+
+    /// Kullanılan pencereyi Mac'e bildirir (değiştiyse): fare imlecin üstünde olduğu, klavye etkin
+    /// olan pencereyi izler. `true` iPhone penceresi.
+    pub fn set_target(&self, mouse: Option<bool>, keyboard: Option<bool>) {
+        if !self.phone() {
+            return;
+        }
+        let s = &self.shared;
+        let m = mouse.unwrap_or_else(|| s.target_mouse.load(Ordering::SeqCst));
+        let k = keyboard.unwrap_or_else(|| s.target_keyboard.load(Ordering::SeqCst));
+        let moved = s.target_mouse.swap(m, Ordering::SeqCst) != m;
+        let switched = s.target_keyboard.swap(k, Ordering::SeqCst) != k;
+        if moved || switched {
+            self.send(vec![MSG_TARGET, u8::from(m), u8::from(k)]);
+        }
+    }
+
+    /// iPhone görüntüsünün boyutu (Mac bildirmediyse yok).
+    pub fn phone_screen(&self) -> Option<(u16, u16)> {
+        *self.shared.phone_screen.lock().unwrap()
+    }
+
+    pub fn has_phone_player(&self) -> bool {
+        self.shared.phone_player.lock().unwrap().is_some()
+    }
+
+    /// iPhone görüntüsünün çizileceği oynatıcı.
+    pub fn set_phone_player(&self, player: Option<Player>) {
+        let fresh = player.is_some();
+        let old = std::mem::replace(&mut *self.shared.phone_player.lock().unwrap(), player);
+        // Eski hat kilit dışında ve ayrı iş parçacığında kapatılır (kapanırken ağ ve arayüz beklemesin).
+        if let Some(old) = old {
+            std::thread::spawn(move || drop(old));
+        }
+        if fresh {
+            self.send(vec![MSG_PHONE_KEYFRAME]);
+        }
     }
 
     /// Zamanlayıcıdan: istek birkaç saniyede yanıtlanmadıysa Mac'teki ajan bu kipi bilmiyordur.
@@ -870,6 +945,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     util::log(&format!("Mac oturumu açıldı: {}", peer.name));
     *shared.cursor.lock().unwrap() = None;
     shared.pointer_lock.store(false, Ordering::SeqCst);
+    shared.phone_offs.store(0, Ordering::SeqCst);
     post_lock(notify);
     let saved = format!("{}:{} {}", peer.ip, peer.port, peer.name);
     let _ = util::write_text_setting(PCWSTR(util::wide(&address_setting(code)).as_ptr()), &saved);
@@ -881,7 +957,9 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     if shared.phone.load(Ordering::SeqCst) {
         shared.phone_quiet.store(true, Ordering::SeqCst);
         *shared.phone_asked.lock().unwrap() = Some(Instant::now());
-        let _ = tx.send(vec![MSG_MODE, 1]);
+        let _ = tx.send(vec![MSG_MODE, MODE_PHONE]);
+        let (m, k) = (shared.target_mouse.load(Ordering::SeqCst), shared.target_keyboard.load(Ordering::SeqCst));
+        let _ = tx.send(vec![MSG_TARGET, u8::from(m), u8::from(k)]);
     }
     drop(tx);
     // Ortak zaman başlangıcı: yoklama (ping) zaman damgası yanıtla (pong) geri gelir, gidiş-dönüş
@@ -918,6 +996,18 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.frame(plain.len(), plain[1] & 1 == 1);
                 if let Some(p) = shared.player.lock().unwrap().as_ref() {
                     p.push(&plain[2..]);
+                }
+            }
+            MSG_PHONE_VIDEO if plain.len() > 2 => {
+                if let Some(p) = shared.phone_player.lock().unwrap().as_ref() {
+                    p.push(&plain[2..]);
+                }
+            }
+            MSG_PHONE_SCREEN if plain.len() >= 5 => {
+                let size = (u16::from_be_bytes([plain[1], plain[2]]), u16::from_be_bytes([plain[3], plain[4]]));
+                if size.0 > 0 && size.1 > 0 {
+                    *shared.phone_screen.lock().unwrap() = Some(size);
+                    post_phone(notify);
                 }
             }
             MSG_SCREEN if plain.len() >= 5 => {
@@ -963,13 +1053,24 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
             }
             MSG_STATE if plain.len() >= 3 => {
                 let (mode, ok) = (plain[1], plain[2] == 1);
-                *shared.phone_asked.lock().unwrap() = None;
+                // Kapatma isteğinin yanıtı: kip o sırada yeniden açılmış olabilir, hiçbir şey değişmez.
+                if ok && mode == 0 && shared.phone_offs.load(Ordering::SeqCst) > 0 {
+                    shared.phone_offs.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+                let asked = shared.phone_asked.lock().unwrap().take().is_some();
                 // Mac iPhone kipini açamadıysa ya da kipten çıktıysa istek düşer.
                 if !ok || mode == 0 {
                     shared.phone.store(false, Ordering::SeqCst);
+                    shared.reset_phone_view();
                 }
-                let text: String = String::from_utf8_lossy(&plain[3..]).chars().take(200).collect();
-                let quiet = ok && shared.phone_quiet.load(Ordering::SeqCst);
+                post_phone(notify);
+                let mut text: String = String::from_utf8_lossy(&plain[3..]).chars().take(200).collect();
+                // Eski Ayna Ajan ayrı pencere isteğini "kapat" sayar; kipi açmadan yanıtlar.
+                if asked && ok && mode == 0 {
+                    text = i18n::t("Mac'teki Ayna Ajan bu özelliği bilmiyor: Mac'te menüden \"Güncellemeleri denetle\".", "Ayna Ajan on the Mac does not support this yet: choose \"Check for updates\" in its menu.").into();
+                }
+                let quiet = ok && mode != 0 && shared.phone_quiet.load(Ordering::SeqCst);
                 if !text.is_empty() && !quiet {
                     util::log(&format!("Mac iPhone kipi: {text}"));
                     *shared.note.lock().unwrap() = Some(text);
@@ -1145,6 +1246,12 @@ fn be32(b: &[u8], at: usize) -> Option<u32> {
 
 fn be64(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_be_bytes(b.get(at..at + 8)?.try_into().ok()?))
+}
+
+fn post_phone(notify: isize) {
+    unsafe {
+        let _ = PostMessageW(HWND(notify as _), WM_APP_PHONE, WPARAM(0), LPARAM(0));
+    }
 }
 
 fn post_lock(notify: isize) {

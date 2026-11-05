@@ -32,11 +32,12 @@ use crate::toast;
 use crate::hub::{self, card_bg, card_bg_alpha, colorref, hit, palette, point, slider, text, to_rect, Fonts};
 use crate::mac::{self, Mac, State};
 use crate::mirror::{WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
+use crate::phoneview;
 use crate::taskbar::{self, draw_mac, Canvas, Device, WM_APP_DISCONNECT};
 use crate::util::{self, height, width};
 
 pub const CLASS: PCWSTR = w!("iPhoneAyna.Mac");
-const VIDEO_CLASS: PCWSTR = w!("iPhoneAyna.MacGoruntu");
+pub const VIDEO_CLASS: PCWSTR = w!("iPhoneAyna.MacGoruntu");
 const SIZER_CLASS: PCWSTR = w!("iPhoneAyna.MacBoyut");
 /// Mac ikonuna sağ tık: boyut penceresi.
 pub const WM_APP_SIZER: u32 = WM_APP + 25;
@@ -129,6 +130,19 @@ thread_local! {
 
 fn with<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
     STATE.with(|c| c.try_borrow_mut().ok().and_then(|mut o| o.as_mut().map(f)))
+}
+
+/// Bağlantıya erişim (iPhone penceresi için).
+pub fn with_mac<R>(f: impl FnOnce(&Mac) -> R) -> Option<R> {
+    with(|v| f(&v.mac))
+}
+
+/// iPhone penceresi kapatıldı: kip de kapanır.
+pub fn stop_phone() {
+    // Basılı düğmeler Mac iPhone penceresini unutmadan önce bırakılır (yanlış yere düşmesin).
+    phoneview::release_input();
+    with(|v| v.mac.set_phone(false));
+    phoneview::sync();
 }
 
 fn main_hwnd() -> HWND {
@@ -498,7 +512,7 @@ unsafe fn update_mode(hwnd: HWND) {
     hub::invalidate(hwnd);
 }
 
-unsafe fn disable_children(parent: HWND) {
+pub unsafe fn disable_children(parent: HWND) {
     unsafe extern "system" fn each(child: HWND, _: LPARAM) -> BOOL {
         if IsWindowEnabled(child).as_bool() {
             let _ = EnableWindow(child, false);
@@ -560,7 +574,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             countdown::hide();
             return LRESULT(0);
         }
-        WM_TIMER => with(|v| v.tick()).unwrap_or(After::None),
+        WM_TIMER => {
+            let after = with(|v| v.tick()).unwrap_or(After::None);
+            phoneview::sync();
+            after
+        }
+        mac::WM_APP_PHONE => {
+            phoneview::sync();
+            return LRESULT(0);
+        }
         mac::WM_APP_MAC => After::Mode,
         WM_APP_TOGGLE => After::Toggle,
         WM_APP_SHOW => After::Show,
@@ -660,7 +682,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_CLOSE => After::Hide,
         WM_ACTIVATE => {
             if wp.0 & 0xFFFF != 0 {
-                with(|v| v.update_lock());
+                with(|v| {
+                    // Klavye yeniden Mac'e: iPhone Mirroring'den önceki uygulama öne gelir.
+                    v.mac.set_target(None, Some(false));
+                    v.update_lock();
+                });
             }
             if wp.0 & 0xFFFF == 0 {
                 with(|v| v.release_input());
@@ -784,6 +810,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         After::Mode => {
             // Bağlantı durumu değişti: fare kilidi de güncellenir (koptuysa hapis kalkar).
             with(|v| v.update_lock());
+            phoneview::sync();
             // Ekran boyutu gelmiş olabilir (oran).
             if IsWindowVisible(hwnd).as_bool() {
                 place(hwnd);
@@ -947,7 +974,6 @@ impl View {
             let _ = ScreenToClient(self.hwnd, &mut pt);
             self.mac.connected()
                 && self.mac.pointer_lock()
-                && !self.mac.phone()
                 && !self.lock_override
                 && !self.dragging_out
                 && IsWindowVisible(self.hwnd).as_bool()
@@ -1090,6 +1116,8 @@ impl View {
             }
             let (x, y) = self.normalized(pt);
             self.last_pos = (x, y);
+            // Fare iPhone penceresinden döndüyse olaylar yeniden Mac ekranına eşlensin.
+            self.mac.set_target(Some(false), None);
             self.mac.send(mac::mouse_move(x, y));
             return After::None;
         }
@@ -1137,6 +1165,7 @@ impl View {
             }
             let (x, y) = self.normalized(pt);
             self.last_pos = (x, y);
+            self.mac.set_target(Some(false), None);
             unsafe {
                 if down {
                     SetCapture(self.hwnd);
@@ -1388,9 +1417,11 @@ unsafe fn hold_tick(hwnd: HWND) {
 /// `enter`: yeni sürükleme (önceki konum unutulur).
 pub fn drop_hover(x: i32, y: i32, count: usize, folder: bool, name: &str, enter: bool) -> bool {
     let accepted = with(|v| {
-        if !v.mac.connected() || v.mac.phone() {
+        if !v.mac.connected() {
             return false;
         }
+        // OLE sürüklemesi fare iletisi üretmez: fare iPhone penceresinden geldiyse burada Mac'e dönülür.
+        v.mac.set_target(Some(false), None);
         if enter {
             v.last_hover = None;
         }
@@ -1427,6 +1458,7 @@ pub fn drop_files(x: i32, y: i32, paths: Vec<std::path::PathBuf>) -> bool {
             let _ = ScreenToClient(v.hwnd, &mut pt);
         }
         let (nx, ny) = v.normalized((pt.x, pt.y));
+        v.mac.set_target(Some(false), None);
         v.mac.send_files(paths, nx, ny)
     })
     .unwrap_or(false);
@@ -1651,6 +1683,7 @@ fn toggle_phone() {
         open();
         return;
     }
+    phoneview::release_input();
     let on = with(|v| {
         let on = !v.mac.phone();
         v.mac.set_phone(on);
@@ -1659,7 +1692,13 @@ fn toggle_phone() {
     })
     .unwrap_or(false);
     if on {
-        open();
+        // Bağlı değilse Mac penceresi bağlanır; kip bağlanınca uygulanır.
+        if !connected() {
+            open();
+        }
+        phoneview::show();
+    } else {
+        phoneview::sync();
     }
 }
 
@@ -1861,7 +1900,7 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
         let (fill_color, label, text_color) = match kind {
             SizerButton::Phone => (
                 p.field,
-                if phone_on { t("Mac ekranına dön", "Back to Mac screen") } else { t("iPhone'u Mac üzerinden göster", "Show iPhone via Mac") },
+                if phone_on { t("iPhone penceresini kapat", "Close iPhone window") } else { t("iPhone'u Mac üzerinden göster", "Show iPhone via Mac") },
                 p.text,
             ),
             SizerButton::Connection => (

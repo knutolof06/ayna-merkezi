@@ -80,9 +80,13 @@ devices prove their identity with a pairing key and connect automatically.
   **hold Ctrl for 10 seconds** (a countdown appears; nothing is sent to the game besides Ctrl). Click the window
   to capture again; Alt+Tab also releases it.
 - **Mac icon right-click:** Mac screen size, *Show iPhone via Mac*, *Disconnect*, *Settings*, *Quit*.
-- **iPhone via Mac (experimental):** uses the Mac's iPhone Mirroring from Windows. The Mac never shows it on its
-  own screen: Ayna Ajan opens it on a hidden virtual display. Requires macOS 15 on Apple silicon, iOS 18, the
-  same Apple Account, and iPhone Mirroring set to authenticate automatically.
+- **iPhone via Mac (experimental):** uses the Mac's iPhone Mirroring from Windows, in its own window next to the
+  Mac window; the iPhone stays locked with its screen off. The mouse follows the window under the pointer, the
+  keyboard follows the active window. The Mac has one pointer and one frontmost app, so the two are used in turn:
+  typing on the iPhone moves the Mac's current app to the background until you return to the Mac window. Closing
+  the iPhone window ends it. The Mac never shows it on its own screen: Ayna Ajan opens it on a hidden virtual
+  display. Requires macOS 15 on Apple silicon, iOS 18, the same Apple Account, and iPhone Mirroring set to
+  authenticate automatically.
 
 **Security:** each session uses ephemeral ECDH P-256, HKDF-SHA256 and AES-256-GCM per direction; pairing needs
 confirmation on both screens. Protocol details are at the top of `src/mac.rs` and
