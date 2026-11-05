@@ -169,6 +169,8 @@ unsafe fn place(hwnd: HWND) {
 pub fn show() {
     let hwnd = with(|p| p.hwnd).or_else(create);
     let Some(hwnd) = hwnd else { return };
+    // Aynı yerdeki AirPlay penceresi açıksa bunun altında kalmasın.
+    mirror::hide_for_mac();
     unsafe {
         place(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);

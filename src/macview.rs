@@ -1697,14 +1697,21 @@ fn toggle_phone() {
     })
     .unwrap_or(false);
     if on {
-        // Yeni pencere açılmaz: görüntü iPhone ikonundan açılır. iPhone penceresi zaten açıksa aynı
-        // yerde Mac üzerinden sürer; iPhone ikonu kapalıysa görüntü başka türlü açılamaz.
-        let was_open = mirror::hide_for_mac();
-        // Bağlı değilse Mac penceresi bağlanır; kip bağlanınca uygulanır.
-        if !connected() {
-            open();
+        // Hiçbir pencere açılmaz, yalnız Mac'te uygulama çalışır: görüntü iPhone ikonundan açılır.
+        // Bağlı değilse arka planda bağlanılır; kip bağlanınca uygulanır.
+        if !enabled() {
+            set_enabled(true);
         }
-        if was_open || !mirror::enabled() {
+        with(|v| {
+            if matches!(v.mac.state(), State::Idle | State::Failed(_)) && !v.mac.dropped() {
+                if let Some(code) = saved_code() {
+                    v.user_closed = false;
+                    v.mac.connect(&code);
+                }
+            }
+        });
+        // iPhone ikonu kapalıysa görüntü başka türlü açılamaz.
+        if !mirror::enabled() {
             phoneview::show();
         }
     } else {

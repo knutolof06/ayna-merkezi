@@ -329,10 +329,14 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [weak self] content, _ in
             guard let self else { return }
-            guard let content,
-                  let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
-            else {
+            guard let content, !content.displays.isEmpty else {
                 self.report(L("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).", "Screen Recording permission is required (System Settings > Privacy & Security > Screen Recording)."))
+                return
+            }
+            // Yalnız ana ekran: ekran düzeni değişirken liste geride kalabilir; başka bir ekrana (görünmez
+            // ekrana) geçilmez, yeniden denenir.
+            guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
+                self.report(L("Ana ekran bulunamadı.", "The main display was not found."))
                 return
             }
             // Gerçek piksel boyutu (Retina), en uzun kenar sınırına ölçeklenir; kodlayıcı çift sayı ister.
@@ -1056,6 +1060,15 @@ final class PhoneMirror {
     /// Uygulamanın kapanmasını bekleyen sanal ekranlar.
     private static var parked: [CGVirtualDisplay] = []
     private var display: CGVirtualDisplay?
+    /// Monitörsüz Mac: macOS'un kendi sahte ekranı, ilk sanal ekran eklenince kalkar ve masaüstü o sanal
+    /// ekrana geçer. Görünmez ekran masaüstü olmasın diye önce özgün boyutta bu yedek ekran açılır;
+    /// monitörlü Mac'te özgün ekran kalkmaz, yedek hemen kapatılır.
+    private var standIn: CGVirtualDisplay?
+    private var original: CGDirectDisplayID = 0
+    private var standInSince = Date()
+    private var standInStarted = false
+    private var mainChecked = false
+    private var appURL: URL?
     private var timer: Timer?
     private let started = Date()
     /// Açılış isteği sonuçlandı (o zamana dek uygulama listede görünmeyebilir).
@@ -1089,7 +1102,47 @@ final class PhoneMirror {
             fail(L("Bu Mac'te iPhone Mirroring yok (macOS 15 Sequoia ve Apple çipli Mac gerekir).", "iPhone Mirroring is not available on this Mac (requires macOS 15 Sequoia and an Apple silicon Mac)."))
             return
         }
-        guard let d = Self.makeDisplay() else {
+        appURL = url
+        // Ortak kip: Mac'te bir uyarı penceresi açıkken de işler (yoksa kip "açılıyor"da kalır).
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    /// Yedek ekranı açar. Yerleşik ekranı olan Mac'te gerekmez.
+    private func beginStandIn() {
+        standInStarted = true
+        original = CGMainDisplayID()
+        standInSince = Date()
+        guard CGDisplayIsBuiltin(original) == 0 else { return }
+        let mode = CGDisplayCopyDisplayMode(original)
+        let size = (mode?.width ?? 1920, mode?.height ?? 1080)
+        // 96 dpi: bir piksel yaklaşık 0,26 mm.
+        standIn = Self.makeDisplay(name: "Ayna Mac", product: 2, pixels: size, hiDPI: false,
+                                   millimeters: CGSize(width: Double(size.0) * 0.26, height: Double(size.1) * 0.26))
+    }
+
+    /// Yedek ekranın sonucu belli oldu mu? Özgün ekran kalktıysa (monitörsüz Mac) yedek kalır; 2 sn'de
+    /// kalkmadıysa yedek gereksizdir ve kapatılır.
+    private func settleStandIn() -> Bool {
+        guard let standIn else { return true }
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        _ = CGGetActiveDisplayList(16, &ids, &count)
+        let waited = Date().timeIntervalSince(standInSince)
+        if !ids.prefix(Int(count)).contains(original) {
+            return CGDisplayIsActive(standIn.displayID) != 0 || waited > 5
+        }
+        guard waited > 2 else { return false }
+        self.standIn = nil
+        return true
+    }
+
+    /// Görünmez ekranı açar ve iPhone Mirroring'i başlatır.
+    private func openHidden() {
+        guard let url = appURL else { return }
+        guard let d = Self.makeDisplay(name: "Ayna iPhone", product: 1, pixels: (1800, 2000), hiDPI: true,
+                                       millimeters: CGSize(width: 300, height: 333)) else {
             fail(L("Görünmez ekran açılamadı.", "The hidden display could not be created."))
             return
         }
@@ -1105,10 +1158,18 @@ final class PhoneMirror {
                 if let error { self?.fail(L("iPhone Mirroring açılamadı: ", "iPhone Mirroring could not be opened: ") + error.localizedDescription) }
             }
         }
-        // Ortak kip: Mac'te bir uyarı penceresi açıkken de işler (yoksa kip "açılıyor"da kalır).
-        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+    }
+
+    /// Ana ekran yedek ekran kalsın (masaüstü ve Dock görünmez ekrana geçmesin).
+    private func keepStandInMain(hidden: CGDirectDisplayID) {
+        guard !mainChecked, let standIn else { return }
+        mainChecked = true
+        guard CGMainDisplayID() != standIn.displayID else { return }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return }
+        _ = CGConfigureDisplayOrigin(config, standIn.displayID, 0, 0)
+        _ = CGConfigureDisplayOrigin(config, hidden, Int32(CGDisplayBounds(standIn.displayID).width), 0)
+        _ = CGCompleteDisplayConfiguration(config, .forSession)
     }
 
     /// Uygulamayı kapatır; sanal ekran uygulama kapanınca kaldırılır.
@@ -1118,9 +1179,15 @@ final class PhoneMirror {
         frame = nil
         timer?.invalidate()
         timer = nil
-        guard let d = display else { return }
+        // iPhone Mirroring henüz açılmadıysa kapatılacak bir şey yok (kullanıcının kendi açtığına dokunulmaz).
+        guard display != nil else {
+            standIn = nil
+            return
+        }
+        let displays = [display, standIn].compactMap { $0 }
         display = nil
-        Self.parked.append(d)
+        standIn = nil
+        Self.parked += displays
         let begun = Date()
         let openFinished = { [weak self] in self?.openFinished ?? true }
         func check() {
@@ -1129,7 +1196,7 @@ final class PhoneMirror {
             for app in apps { _ = waited > 3 ? app.forceTerminate() : app.terminate() }
             // Açılış isteği sonuçlanmadıysa uygulama birazdan belirebilir: o da kapatılana dek beklenir.
             if (apps.isEmpty && (openFinished() || waited > 8)) || waited > 20 {
-                PhoneMirror.parked.removeAll { $0 === d }
+                PhoneMirror.parked.removeAll { p in displays.contains { $0 === p } }
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { check() }
@@ -1172,7 +1239,16 @@ final class PhoneMirror {
     }
 
     private func tick() {
-        guard let display, !finished else { return }
+        guard !finished else { return }
+        guard let display else {
+            if !standInStarted {
+                // Önceki kipin ekranları kalkmadan başlanmaz: özgün ekran yanlış belirlenirdi.
+                if Self.parked.isEmpty { beginStandIn() }
+            } else if settleStandIn() {
+                openHidden()
+            }
+            return
+        }
         let id = display.displayID
         let elapsed = Date().timeIntervalSince(started)
         if windowID == nil && elapsed > 45 {
@@ -1182,9 +1258,10 @@ final class PhoneMirror {
         let bounds = CGDisplayBounds(id)
         // Sanal ekran hazır olmadan taşınırsa pencere ana ekranda bir yere gider.
         guard CGDisplayIsActive(id) != 0, bounds.width >= 300, bounds.height >= 300 else {
-            if elapsed > 10 { fail(L("Görünmez ekran hazır olmadı.", "The hidden display did not become ready.")) }
+            if elapsed > 15 { fail(L("Görünmez ekran hazır olmadı.", "The hidden display did not become ready.")) }
             return
         }
+        keepStandInMain(hidden: id)
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first(where: { !$0.isTerminated })
         else {
             if seenRunning { fail(L("iPhone Mirroring kapandı.", "iPhone Mirroring quit.")) } else if elapsed > 20 { fail(L("iPhone Mirroring açılmadı.", "iPhone Mirroring did not open.")) }
@@ -1266,7 +1343,8 @@ final class PhoneMirror {
     }
 
     /// 900×1000 noktalık Retina sanal ekran (iPhone penceresine yeter).
-    private static func makeDisplay() -> CGVirtualDisplay? {
+    private static func makeDisplay(name: String, product: UInt32, pixels: (Int, Int), hiDPI: Bool,
+                                    millimeters: CGSize) -> CGVirtualDisplay? {
         guard NSClassFromString("CGVirtualDisplay") != nil else { return nil }
         let descriptor = CGVirtualDisplayDescriptor()
         if descriptor.responds(to: NSSelectorFromString("setDispatchQueue:")) {
@@ -1276,17 +1354,17 @@ final class PhoneMirror {
         } else {
             return nil
         }
-        descriptor.name = "Ayna iPhone"
-        descriptor.maxPixelsWide = 1800
-        descriptor.maxPixelsHigh = 2000
-        descriptor.sizeInMillimeters = CGSize(width: 300, height: 333)
+        descriptor.name = name
+        descriptor.maxPixelsWide = UInt32(pixels.0)
+        descriptor.maxPixelsHigh = UInt32(pixels.1)
+        descriptor.sizeInMillimeters = millimeters
         descriptor.vendorID = 0x4159
-        descriptor.productID = 0x0001
-        descriptor.serialNum = 0x0001
+        descriptor.productID = product
+        descriptor.serialNum = product
         guard let display = CGVirtualDisplay(descriptor: descriptor) else { return nil }
         let settings = CGVirtualDisplaySettings()
-        settings.hiDPI = 1
-        settings.modes = [CGVirtualDisplayMode(width: 1800, height: 2000, refreshRate: 60)]
+        settings.hiDPI = hiDPI ? 1 : 0
+        settings.modes = [CGVirtualDisplayMode(width: UInt32(pixels.0), height: UInt32(pixels.1), refreshRate: 60)]
         guard display.apply(settings), display.displayID != 0 else { return nil }
         return display
     }
@@ -1390,7 +1468,7 @@ final class Session {
     /// Ekran düzeni değişince yakalama yeniden başlatılır (görünmez ekran eklenince akış durur).
     private var screenObserver: NSObjectProtocol?
     private var lastLayout = ""
-    private var restartPending = false
+    private var restartWork: DispatchWorkItem?
     /// Son yeniden başlatmalar: üst üste başarısız olursa kullanıcıya bildirilir.
     private var captureRestarts: [Date] = []
     private var phoneRestarts: [Date] = []
@@ -1902,14 +1980,15 @@ final class Session {
         return false
     }
 
+    /// Son değişiklikten 1 sn sonra başlar: ekran düzeni oturmadan başlatılan akış yanlış ekrana gitmesin.
     private func restartCapture() {
-        guard !restartPending else { return }
-        restartPending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            guard let self else { return }
-            self.restartPending = false
-            if self.stage == .streaming { self.startCapture() }
+        restartWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.stage == .streaming else { return }
+            self.startCapture()
         }
+        restartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
     /// Görünmez ekrandaki iPhone Mirroring penceresini yakalamaya başlar (pencere yer ya da boyut

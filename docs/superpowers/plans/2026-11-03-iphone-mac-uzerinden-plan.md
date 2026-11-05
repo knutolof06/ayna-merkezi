@@ -27,7 +27,11 @@ ekranında iPhone görüntüsü sürekli açık durmasın.
 Değişen: TARGET iki baytlı [fare][klavye]; fare imlecin üstündeki pencereyi, klavye etkin pencereyi izler.
 2026-11-05 (v21 sonrası, kullanıcı): yeni pencere istemiyor. Menü yalnız Mac'te uygulamayı başlatır; görüntü
 iPhone ikonuyla aynı yerde/boyutta açılır (phoneview artık çerçevesiz, mirror::frame), gizliyken 0x1D ile durur.
-Açık: Mac penceresinin küçülmesi kodda açıklanamadı; günlükte "Mac ekranı: G×Y" satırına bakılacak.
+v22 günlüğü (23:30:40): iPhone hazır olunca "Mac ekranı: 900×1000" = ana yakalama görünmez ekrana geçti (normali
+1920×1080). Mac penceresinin küçülmesi ve "siyah kare" bundan. Olası neden: Mac mini monitörsüz, macOS'un sahte
+1920×1080 ekranı sanal ekran eklenince kalkıyor, sanal ekran ana ekran oluyor. Kullanıcı doğruladı: monitör yok.
+Çözüm: önce özgün boyutta yedek sanal ekran (PhoneMirror.standIn), özgün ekran kalkarsa kalır, kalkmazsa 2 sn'de
+kapanır; sonra görünmez ekran. Doğrulanacak: günlükte kip açılınca "Mac ekranı: 900×1000" görünmemeli.
 Kullanıcı kipi gerçek Mac'te açtı, iPhone görüntüsü geldi. Şikâyet: görüntü Mac penceresinin yerini alıyor,
 Mac kullanılamıyor. Öneri:
 - Mac ajanı iki yakalayıcıyı aynı anda çalıştırır: ana ekran (0x01/0x02) + iPhone bölgesi. Yeni iletiler:
