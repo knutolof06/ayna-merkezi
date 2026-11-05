@@ -315,6 +315,11 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         self.onError = onError
     }
 
+    /// Durdurulmuş yakalayıcının hatası yok sayılır: yerine başlatılan sağlam akışı etkilemesin.
+    private func report(_ message: String) {
+        if !isDead { onError(message) }
+    }
+
     func start() {
         if let region {
             let pixels = (Int(region.rect.width * region.scale), Int(region.rect.height * region.scale))
@@ -327,7 +332,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let content,
                   let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first
             else {
-                self.onError(L("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).", "Screen Recording permission is required (System Settings > Privacy & Security > Screen Recording)."))
+                self.report(L("Ekran Kaydı izni gerekli (Sistem Ayarları > Gizlilik ve Güvenlik > Ekran Kaydı).", "Screen Recording permission is required (System Settings > Privacy & Security > Screen Recording)."))
                 return
             }
             // Gerçek piksel boyutu (Retina), en uzun kenar sınırına ölçeklenir; kodlayıcı çift sayı ister.
@@ -357,7 +362,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
         } catch {
-            self.onError(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
+            self.report(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
             return
         }
         // Oturum bu arada kapandıysa yakalama hiç başlamaz (sahipsiz yakalama kalmasın).
@@ -377,7 +382,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         stream.startCapture { [weak self] error in
             guard let self else { return }
             if let error {
-                self.onError(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
+                self.report(L("Ekran yakalanamadı: ", "Screen capture failed: ") + error.localizedDescription)
                 return
             }
             self.queue.async {
@@ -425,7 +430,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let lowLatency = create(lowLatency: true)
         guard let s = lowLatency ?? create(lowLatency: false) else {
-            onError(L("Görüntü kodlayıcı açılamadı.", "The video encoder could not be started."))
+            report(L("Görüntü kodlayıcı açılamadı.", "The video encoder could not be started."))
             return
         }
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -452,7 +457,7 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         guard !isDead else { return }
-        onError("Ekran yakalama durdu: \(error.localizedDescription)")
+        report("Ekran yakalama durdu: \(error.localizedDescription)")
     }
 
     /// Kuyrukta çağrılır.
@@ -1100,7 +1105,10 @@ final class PhoneMirror {
                 if let error { self?.fail(L("iPhone Mirroring açılamadı: ", "iPhone Mirroring could not be opened: ") + error.localizedDescription) }
             }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        // Ortak kip: Mac'te bir uyarı penceresi açıkken de işler (yoksa kip "açılıyor"da kalır).
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     /// Uygulamayı kapatır; sanal ekran uygulama kapanınca kaldırılır.
@@ -1142,6 +1150,13 @@ final class PhoneMirror {
         NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).forEach { $0.forceTerminate() }
     }
 
+    /// Görüntü yeniden kurulsun: pencere bir sonraki ölçümde yeniden bildirilir (ekran düzeni değişti
+    /// ya da yakalama durdu).
+    func refresh() {
+        reported = .null
+        candidate = .null
+    }
+
     /// Klavye iPhone Mirroring'e gitsin. Öndeyse true; değilse Erişilebilirlikle öne alınır (false).
     func focus() -> Bool {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first else { return false }
@@ -1160,6 +1175,10 @@ final class PhoneMirror {
         guard let display, !finished else { return }
         let id = display.displayID
         let elapsed = Date().timeIntervalSince(started)
+        if windowID == nil && elapsed > 45 {
+            fail(L("iPhone Mirroring hazır olmadı. Mac'te açılıp iPhone'a bağlanabildiğini denetleyin.", "iPhone Mirroring did not get ready. Check that it opens and connects to the iPhone on the Mac."))
+            return
+        }
         let bounds = CGDisplayBounds(id)
         // Sanal ekran hazır olmadan taşınırsa pencere ana ekranda bir yere gider.
         guard CGDisplayIsActive(id) != 0, bounds.width >= 300, bounds.height >= 300 else {
@@ -1368,6 +1387,13 @@ final class Session {
     private var inFlight = 0
     private var needKey = false
     private var capturer: Capturer?
+    /// Ekran düzeni değişince yakalama yeniden başlatılır (görünmez ekran eklenince akış durur).
+    private var screenObserver: NSObjectProtocol?
+    private var lastLayout = ""
+    private var restartPending = false
+    /// Son yeniden başlatmalar: üst üste başarısız olursa kullanıcıya bildirilir.
+    private var captureRestarts: [Date] = []
+    private var phoneRestarts: [Date] = []
     /// iPhone kipindeyken görünmez ekrandaki iPhone Mirroring.
     private var phone: PhoneMirror?
     private var phoneAnnounced = false
@@ -1689,6 +1715,10 @@ final class Session {
         lastData = Date()
         app?.sessionStarted(self)
         startCapture()
+        lastLayout = displayLayout()
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.screensChanged() }
         diagLastTick = Date()
         diagWindowStart = Date()
         // Ortak kip: menü açıkken de ölçülsün (yoksa menü süresi takılma sanılır).
@@ -1817,10 +1847,67 @@ final class Session {
                 DispatchQueue.main.async { self?.lastCursor = Data() }
             },
             onError: { [weak self] message in
-                DispatchQueue.main.async { self?.app?.show(error: message) }
+                DispatchQueue.main.async { self?.captureFailed(message) }
             })
         capturer = cap
         cap.start()
+    }
+
+    private func displayLayout() -> String {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        _ = CGGetActiveDisplayList(16, &ids, &count)
+        let main = CGMainDisplayID()
+        return "\(ids.prefix(Int(count))) \(CGDisplayBounds(main)) \(CGDisplayCopyDisplayMode(main)?.pixelWidth ?? 0)"
+    }
+
+    /// Ekran eklendi, kalktı ya da boyutu değişti (Dock gibi küçük değişiklikler sayılmaz).
+    private func screensChanged() {
+        let layout = displayLayout()
+        guard layout != lastLayout else { return }
+        lastLayout = layout
+        restartCapture()
+        phone?.refresh()
+    }
+
+    /// Yakalama durdu. Ekran düzeni değişince macOS akışı durdurabilir: uyarı açılmaz, yeniden başlatılır.
+    /// Uyarı yalnız üst üste başarısız olursa açılır (örneğin Ekran Kaydı izni yoksa).
+    private func captureFailed(_ message: String) {
+        guard stage == .streaming else { return }
+        guard allowRestart(&captureRestarts) else {
+            app?.show(error: message)
+            return
+        }
+        restartCapture()
+    }
+
+    /// iPhone görüntüsü durdu: yeniden kurulur; olmazsa Mac ekranında uyarı açılmaz, Windows'ta bildirim çıkar.
+    private func phoneCaptureFailed(_ message: String) {
+        guard stage == .streaming, phone != nil else { return }
+        guard allowRestart(&phoneRestarts) else {
+            sendState(mode: 2, ok: true, message)
+            return
+        }
+        phone?.refresh()
+    }
+
+    /// Son 30 sn'de en çok 5 yeniden başlatma: sürekli başarısız olan yakalama döngüye girmesin.
+    private func allowRestart(_ history: inout [Date]) -> Bool {
+        let now = Date()
+        history = history.filter { now.timeIntervalSince($0) < 30 } + [now]
+        guard history.count > 5 else { return true }
+        history = []
+        return false
+    }
+
+    private func restartCapture() {
+        guard !restartPending else { return }
+        restartPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            self.restartPending = false
+            if self.stage == .streaming { self.startCapture() }
+        }
     }
 
     /// Görünmez ekrandaki iPhone Mirroring penceresini yakalamaya başlar (pencere yer ya da boyut
@@ -1835,8 +1922,7 @@ final class Session {
                 self?.send(Data([0x0A] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
             },
             onError: { [weak self] message in
-                // Mac ekranında uyarı açılmaz; Windows'ta bildirim olarak görünür.
-                DispatchQueue.main.async { self?.sendState(mode: 2, ok: true, message) }
+                DispatchQueue.main.async { self?.phoneCaptureFailed(message) }
             })
         phoneCapturer = cap
         cap.start()
@@ -2024,7 +2110,9 @@ final class Session {
             guard !localCursor else { break }
             localCursor = true
             capturer?.setCursorShown(false)
-            cursorTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.sendCursor() }
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.sendCursor() }
+            RunLoop.main.add(timer, forMode: .common)
+            cursorTimer = timer
         default:
             break
         }
@@ -2181,6 +2269,8 @@ final class Session {
         cursorTimer = nil
         diagTimer?.invalidate()
         diagTimer = nil
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        screenObserver = nil
         dragPreview?.hide()
         capturer?.stop()
         capturer = nil
@@ -2404,7 +2494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard pendingUpdate == nil else { return }
         Updater.check(completion: { [weak self] version, app in
             self?.pendingUpdate = (version, app)
-            self?.updateNote = L("Sürüm \(version) hazır; bağlantı yokken kurulacak.", "Version \(version) is ready; it installs when no one is connected.")
+            self?.updateNote = L("Sürüm \(version) hazır", "Version \(version) is ready")
             self?.installIfIdle()
         }, failed: { [weak self] message in
             DispatchQueue.main.async { self?.updateNote = message }
@@ -2413,6 +2503,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installIfIdle() {
         guard let update = pendingUpdate, active == nil, pending.isEmpty else { return }
+        install(update)
+    }
+
+    private func install(_ update: (Int, URL)) {
         let (version, app) = update
         pendingUpdate = nil
         if Updater.install(app) {
@@ -2422,7 +2516,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Menüdeki "Yükle": bağlantı varsa da hemen kurulur; Windows yeni sürüme kendiliğinden yeniden bağlanır.
+    @objc private func installNow() {
+        guard let update = pendingUpdate else { return }
+        pendingUpdate = nil
+        active?.close()
+        // Veda iletisi gitsin diye kısa bir bekleme.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.install(update) }
+    }
+
     @objc private func checkNow() {
+        guard pendingUpdate == nil else { return }
         updateNote = L("Güncelleme denetleniyor…", "Checking for updates…")
         checkForUpdate()
     }
@@ -2636,7 +2740,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item(inputAllowed ? L("Erişilebilirlik izni: verildi", "Accessibility: allowed") : L("Erişilebilirlik izni ver…", "Allow Accessibility…"), #selector(openInputPrivacy)))
         let version = Updater.build > 0 ? L("Sürüm ", "Version ") + "\(Updater.build)" : L("Geliştirme sürümü", "Development build")
         menu.addItem(item(updateNote.map { "\(version) · \($0)" } ?? version, nil))
-        menu.addItem(item(L("Güncellemeleri denetle", "Check for Updates"), #selector(checkNow)))
+        if let update = pendingUpdate {
+            menu.addItem(item(L("Sürüm \(update.0) yükle", "Install Version \(update.0)"), #selector(installNow)))
+        } else {
+            menu.addItem(item(L("Güncellemeleri denetle", "Check for Updates"), #selector(checkNow)))
+        }
         let login = item(L("Oturum açınca başlat", "Open at Login"), #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)

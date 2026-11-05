@@ -96,7 +96,8 @@ confirmation on both screens. Protocol details are at the top of `src/mac.rs` an
 
 Every push to `main` builds a signed release (`vN`). Windows and the Mac helper check for updates on their own
 (or **Check for updates** / **Install**), verify the RSA-signed manifest and file hashes, and replace
-themselves. Windows installs while no window is open; the Mac helper installs while nobody is connected.
+themselves. Windows installs while no window is open; the Mac helper installs while nobody is connected,
+or right away with **Install Version N** in its menu (Windows reconnects by itself).
 
 ## Language
 

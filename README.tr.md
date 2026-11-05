@@ -158,7 +158,8 @@ yeniden kilitlemek için pencereye tıklayın. Pencereden çıkınca (Alt+Tab) k
 Çık). UxPlay'in (uxplay-windows) simgesi oradan kaldırılır.
 
 **Dil ve güncelleme:** Ayna Merkezi'nde Dil (Türkçe / English) ve "Güncelleme · Denetle / Yükle". Mac'teki
-Ayna Ajan, Mac'in diline göre Türkçe ya da İngilizce.
+Ayna Ajan, Mac'in diline göre Türkçe ya da İngilizce. Ayna Ajan kendini kimse bağlı değilken günceller; menüdeki
+**Sürüm N yükle** ile hemen de kurulabilir (Windows kendiliğinden yeniden bağlanır).
 
 **iPhone'u Mac üzerinden (deneme):** Mac'teki iPhone Mirroring'i Windows'tan kullanır. Telefon, Mac penceresinin
 yanında kendi penceresinde görünür; iPhone kilitli ve ekranı kapalı kalır. Fare imlecin üstünde olduğu pencereye,
