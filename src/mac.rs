@@ -82,6 +82,8 @@ const MSG_PHONE_SCREEN: u8 = 0x0A;
 const MSG_TARGET: u8 = 0x19;
 /// Windows → Mac: iPhone görüntüsü için anahtar kare.
 const MSG_PHONE_KEYFRAME: u8 = 0x1C;
+/// Windows → Mac: iPhone penceresi gizli, görüntü dursun [açık].
+const MSG_PHONE_PAUSE: u8 = 0x1D;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -204,6 +206,8 @@ struct Shared {
     /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
     phone_player: Mutex<Option<Player>>,
     phone_screen: Mutex<Option<(u16, u16)>>,
+    /// iPhone penceresi gizli: Mac iPhone görüntüsünü göndermez.
+    phone_paused: AtomicBool,
     /// Yanıtı henüz gelmemiş "kipi kapat" istekleri: hızlı kapat-aç'ta eski yanıt yeni kipi kapatmasın.
     phone_offs: AtomicU32,
     /// Fare ve klavye iPhone penceresinde mi (Mac'e en son bildirilen).
@@ -295,6 +299,7 @@ impl Mac {
                 pointer_lock: AtomicBool::new(false),
                 phone_player: Mutex::new(None),
                 phone_screen: Mutex::new(None),
+                phone_paused: AtomicBool::new(true),
                 phone_offs: AtomicU32::new(0),
                 target_mouse: AtomicBool::new(false),
                 target_keyboard: AtomicBool::new(false),
@@ -441,6 +446,21 @@ impl Mac {
             self.shared.phone_offs.fetch_add(1, Ordering::SeqCst);
         }
         self.send(vec![MSG_MODE, if on { MODE_PHONE } else { 0 }]);
+        if on {
+            self.send(vec![MSG_PHONE_PAUSE, u8::from(self.shared.phone_paused.load(Ordering::SeqCst))]);
+        }
+    }
+
+    pub fn phone_paused(&self) -> bool {
+        self.shared.phone_paused.load(Ordering::SeqCst)
+    }
+
+    /// iPhone penceresi gizlendi ya da açıldı.
+    pub fn set_phone_paused(&self, paused: bool) {
+        self.shared.phone_paused.store(paused, Ordering::SeqCst);
+        if self.phone() {
+            self.send(vec![MSG_PHONE_PAUSE, u8::from(paused)]);
+        }
     }
 
     /// Kullanıcı bağlantıyı kesti: bir sonraki bağlanış iPhone kipi olmadan başlar.
@@ -960,6 +980,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         let _ = tx.send(vec![MSG_MODE, MODE_PHONE]);
         let (m, k) = (shared.target_mouse.load(Ordering::SeqCst), shared.target_keyboard.load(Ordering::SeqCst));
         let _ = tx.send(vec![MSG_TARGET, u8::from(m), u8::from(k)]);
+        let _ = tx.send(vec![MSG_PHONE_PAUSE, u8::from(shared.phone_paused.load(Ordering::SeqCst))]);
     }
     drop(tx);
     // Ortak zaman başlangıcı: yoklama (ping) zaman damgası yanıtla (pong) geri gelir, gidiş-dönüş
@@ -1013,6 +1034,9 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
             MSG_SCREEN if plain.len() >= 5 => {
                 let size = (u16::from_be_bytes([plain[1], plain[2]]), u16::from_be_bytes([plain[3], plain[4]]));
                 if size.0 > 0 && size.1 > 0 {
+                    if shared.inner.lock().unwrap().screen != Some(size) {
+                        util::log(&format!("Mac ekranı: {}×{}", size.0, size.1));
+                    }
                     shared.publish(attempt, |i| i.screen = Some(size));
                     post(notify);
                 }

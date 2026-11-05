@@ -31,7 +31,7 @@ use crate::gst::{self, Player};
 use crate::toast;
 use crate::hub::{self, card_bg, card_bg_alpha, colorref, hit, palette, point, slider, text, to_rect, Fonts};
 use crate::mac::{self, Mac, State};
-use crate::mirror::{WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
+use crate::mirror::{self, WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
 use crate::phoneview;
 use crate::taskbar::{self, draw_mac, Canvas, Device, WM_APP_DISCONNECT};
 use crate::util::{self, height, width};
@@ -137,7 +137,12 @@ pub fn with_mac<R>(f: impl FnOnce(&Mac) -> R) -> Option<R> {
     with(|v| f(&v.mac))
 }
 
-/// iPhone penceresi kapatıldı: kip de kapanır.
+/// iPhone görüntüsü Mac üzerinden mi geliyor.
+pub fn phone_on() -> bool {
+    with(|v| v.mac.phone()).unwrap_or(false)
+}
+
+/// Mac üzerinden kip kapatılır (iPhone ikonundaki "Bağlantıyı kes").
 pub fn stop_phone() {
     // Basılı düğmeler Mac iPhone penceresini unutmadan önce bırakılır (yanlış yere düşmesin).
     phoneview::release_input();
@@ -1692,11 +1697,16 @@ fn toggle_phone() {
     })
     .unwrap_or(false);
     if on {
+        // Yeni pencere açılmaz: görüntü iPhone ikonundan açılır. iPhone penceresi zaten açıksa aynı
+        // yerde Mac üzerinden sürer; iPhone ikonu kapalıysa görüntü başka türlü açılamaz.
+        let was_open = mirror::hide_for_mac();
         // Bağlı değilse Mac penceresi bağlanır; kip bağlanınca uygulanır.
         if !connected() {
             open();
         }
-        phoneview::show();
+        if was_open || !mirror::enabled() {
+            phoneview::show();
+        }
     } else {
         phoneview::sync();
     }
@@ -1900,7 +1910,7 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
         let (fill_color, label, text_color) = match kind {
             SizerButton::Phone => (
                 p.field,
-                if phone_on { t("iPhone penceresini kapat", "Close iPhone window") } else { t("iPhone'u Mac üzerinden göster", "Show iPhone via Mac") },
+                if phone_on { t("iPhone'u Mac üzerinden kapat", "Stop iPhone via Mac") } else { t("iPhone'u Mac üzerinden göster", "Show iPhone via Mac") },
                 p.text,
             ),
             SizerButton::Connection => (

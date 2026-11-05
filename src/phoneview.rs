@@ -1,13 +1,13 @@
-//! Mac üzerinden gösterilen iPhone'un penceresi. Görüntü Mac'in görünmez ekranındaki iPhone
-//! Mirroring'den gelir; Mac penceresi bu sırada Mac'i göstermeyi sürdürür. Fare hangi pencerenin
-//! üstündeyse, klavye hangi pencere etkinse Mac'e o bildirilir (`Mac::set_target`).
-//! Pencereyi kapatmak kipi de kapatır.
+//! Mac üzerinden gösterilen iPhone'un penceresi. Kullanıcı için iPhone penceresinin kendisidir:
+//! görev çubuğundaki iPhone ikonu kip açıkken bunu açar; yeri, boyutu ve köşeleri aynıdır. Görüntü
+//! Mac'in görünmez ekranındaki iPhone Mirroring'den gelir; Mac penceresi Mac'i göstermeyi sürdürür.
+//! Fare hangi pencerenin üstündeyse, klavye hangi pencere etkinse Mac'e o bildirilir
+//! (`Mac::set_target`). Pencere gizliyken görüntü durur, iPhone Mirroring Mac'te açık kalır.
 
 use std::cell::RefCell;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -15,16 +15,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::gst::{self, Player};
 use crate::i18n::t;
-use crate::{mac, macview, taskbar, util};
+use crate::taskbar::{self, Device};
+use crate::{mac, macview, mirror, util};
 
 const CLASS: PCWSTR = w!("iPhoneAyna.MacIphone");
 /// Görüntü boyutu gelene dek kullanılan oran (iPhone dikey).
 const DEFAULT_ASPECT: f32 = 9.0 / 19.5;
-/// Açılış yüksekliği: çalışma alanının bu kadarı.
-const START_HEIGHT: f32 = 0.75;
-const STYLE: WINDOW_STYLE = WINDOW_STYLE(
-    WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_THICKFRAME.0 | WS_CLIPCHILDREN.0,
-);
 
 struct Phone {
     hwnd: HWND,
@@ -88,23 +84,37 @@ fn create() -> Option<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
+        // Sahipli pencerenin görev çubuğu düğmesi olmaz: giriş Başlat'ın yanındaki iPhone ikonu.
+        let owner = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            CLASS,
-            w!("iPhone"),
-            STYLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            360,
-            760,
+            w!("STATIC"),
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
             HWND::default(),
             HMENU::default(),
             instance,
             None,
         )
+        .unwrap_or_default();
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            CLASS,
+            w!("iPhone"),
+            WS_POPUP | WS_CLIPCHILDREN,
+            0,
+            0,
+            360,
+            760,
+            owner,
+            HMENU::default(),
+            instance,
+            None,
+        )
         .ok()?;
-        let dark = BOOL::from(true);
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         // Görüntü bu çocuk pencereye çizilir. Devre dışı: fare iletileri ana pencereye gelir.
         let video = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -140,42 +150,78 @@ fn create() -> Option<HWND> {
     }
 }
 
-/// Pencereyi fare hangi monitördeyse ona, görüntü oranında ortalar.
-unsafe fn place(hwnd: HWND, aspect: f32) {
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-    if !GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
-        return;
+/// Pencereyi iPhone penceresinin yerine (görev çubuğundaki iPhone ikonunun üstü) koyar.
+unsafe fn place(hwnd: HWND) {
+    let screen = with(|p| p.screen).flatten();
+    let aspect = screen.map_or(DEFAULT_ASPECT, |s| s.0 as f32 / s.1.max(1) as f32);
+    let Some((rect, radius)) = mirror::frame(hwnd, aspect) else { return };
+    let (w, h) = (util::width(&rect), util::height(&rect));
+    let _ = SetWindowPos(hwnd, HWND_TOP, rect.left, rect.top, w, h, SWP_NOACTIVATE);
+    let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+    // Başarılı olursa bölgenin sahibi sistemdir; başarısızsa biz sileriz.
+    if SetWindowRgn(hwnd, rgn, true) == 0 {
+        let _ = DeleteObject(rgn);
     }
-    let work = info.rcWork;
-    let h = (util::height(&work) as f32 * START_HEIGHT) as i32;
-    let outer = outer_size((h as f32 * aspect).round() as i32, h);
-    let x = work.left + (util::width(&work) - outer.0) / 2;
-    let y = work.top + (util::height(&work) - outer.1) / 2;
-    let _ = SetWindowPos(hwnd, HWND::default(), x, y, outer.0, outer.1, SWP_NOZORDER | SWP_NOACTIVATE);
+    layout(hwnd);
 }
 
-/// İstemci alanı `w`×`h` olan pencerenin dış boyutu.
-unsafe fn outer_size(w: i32, h: i32) -> (i32, i32) {
-    let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
-    let _ = AdjustWindowRectEx(&mut r, STYLE, false, WINDOW_EX_STYLE::default());
-    (util::width(&r), util::height(&r))
-}
-
-/// Kip açıldı: pencere gösterilir.
+/// iPhone ikonuna tıklandı: pencere açılır, Mac iPhone görüntüsünü göndermeye başlar.
 pub fn show() {
     let hwnd = with(|p| p.hwnd).or_else(create);
     let Some(hwnd) = hwnd else { return };
     unsafe {
-        if !IsWindowVisible(hwnd).as_bool() {
-            let screen = with(|p| p.screen).flatten();
-            place(hwnd, screen.map_or(DEFAULT_ASPECT, |s| s.0 as f32 / s.1.max(1) as f32));
-        }
+        place(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
+    taskbar::set_view(Device::IPhone, hwnd);
+    macview::with_mac(|m| m.set_phone_paused(false));
     sync();
+    taskbar::refresh();
+}
+
+/// Pencere gizlenir: iPhone Mirroring Mac'te açık kalır, görüntü durur, klavye Mac'e döner.
+pub fn hide() {
+    let Some(hwnd) = with(|p| p.hwnd) else { return };
+    release_input();
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+    taskbar::set_view(Device::IPhone, HWND::default());
+    macview::with_mac(|m| {
+        m.set_target(Some(false), Some(false));
+        m.set_phone_paused(true);
+    });
+    taskbar::refresh();
+}
+
+/// Esc ya da Alt+F4. iPhone ikonu kapalıysa pencere bir daha açılamaz: kip de kapanır.
+fn dismiss() {
+    if mirror::enabled() {
+        hide();
+    } else {
+        macview::stop_phone();
+    }
+}
+
+pub fn toggle() {
+    let open = with(|p| p.hwnd).is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() && GetForegroundWindow() == h });
+    if open {
+        hide();
+    } else {
+        show();
+    }
+}
+
+/// Pencere boyu ayarı değişti.
+pub fn replace() {
+    if let Some(hwnd) = with(|p| p.hwnd) {
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() {
+                place(hwnd);
+            }
+        }
+    }
 }
 
 /// Pencereyi kipin durumuna getirir: kip kapandıysa kapatır; görüntü boyutu geldiyse ölçülendirir
@@ -183,16 +229,16 @@ pub fn show() {
 pub fn sync() {
     let Some((hwnd, video, sized)) = with(|p| (p.hwnd, p.video, p.screen)) else { return };
     // Mac penceresi o an meşgulse bu tur atlanır (kip kapalı sayılmaz; zamanlayıcı yeniden çağırır).
-    let Some((on, connected, screen, has_player)) =
-        macview::with_mac(|m| (m.phone(), m.connected(), m.phone_screen(), m.has_phone_player()))
+    let Some((on, connected, screen, has_player, paused)) =
+        macview::with_mac(|m| (m.phone(), m.connected(), m.phone_screen(), m.has_phone_player(), m.phone_paused()))
     else {
         return;
     };
     unsafe {
+        let visible = IsWindowVisible(hwnd).as_bool();
         if !on {
-            if IsWindowVisible(hwnd).as_bool() {
-                release_input();
-                let _ = ShowWindow(hwnd, SW_HIDE);
+            if visible {
+                hide();
                 let _ = ShowWindow(video, SW_HIDE);
             }
             if has_player {
@@ -201,22 +247,15 @@ pub fn sync() {
             with(|p| p.screen = None);
             return;
         }
-        // Simge durumundayken istemci alanı 0×0'dır: boyut pencere geri gelince uygulanır.
-        if screen.is_some() && screen != sized && !IsIconic(hwnd).as_bool() {
+        // Duraklatma isteği kaybolduysa (Mac penceresi o an meşguldü) burada düzelir.
+        if connected && paused == visible {
+            macview::with_mac(|m| m.set_phone_paused(!visible));
+        }
+        if screen.is_some() && screen != sized {
             with(|p| p.screen = screen);
-            if let (Some((sw, sh)), None) = (screen, sized) {
-                // İlk boyut: pencere gerçek oranıyla yeniden ortalanır.
-                place(hwnd, sw as f32 / sh.max(1) as f32);
-            } else if let Some((sw, sh)) = screen {
-                // Yükseklik korunur, genişlik görüntünün oranına gelir.
-                let mut c = RECT::default();
-                let _ = GetClientRect(hwnd, &mut c);
-                let h = util::height(&c).max(1);
-                let w = (h as f32 * sw as f32 / sh.max(1) as f32).round() as i32;
-                let outer = outer_size(w, h);
-                let _ = SetWindowPos(hwnd, HWND::default(), 0, 0, outer.0, outer.1, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            if visible {
+                place(hwnd);
             }
-            layout(hwnd);
         }
         if !connected {
             // Koptu: donmuş son kare yerine bekleme yazısı; yeniden bağlanınca oynatıcı yeniden kurulur.
@@ -227,7 +266,7 @@ pub fn sync() {
                 let _ = ShowWindow(video, SW_HIDE);
                 let _ = InvalidateRect(hwnd, None, true);
             }
-        } else if screen.is_some() {
+        } else if screen.is_some() && visible {
             let _ = ShowWindow(video, SW_SHOWNA);
             if !has_player && gst::available() {
                 let player = Player::new(video);
@@ -379,14 +418,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             layout(hwnd);
             LRESULT(0)
         }
-        WM_GETMINMAXINFO => {
-            let info = &mut *(lp.0 as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT { x: 200, y: 300 };
-            LRESULT(0)
-        }
         WM_CLOSE => {
-            // Pencereyi kapatmak iPhone kipini kapatır.
-            macview::stop_phone();
+            dismiss();
             LRESULT(0)
         }
         WM_SETFOCUS => {
@@ -418,6 +451,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            if msg == WM_MOUSEWHEEL && wp.0 & 0x0008 != 0 {
+                // Ctrl + tekerlek: pencere boyu (MK_CONTROL), iPhone penceresiyle aynı ayar.
+                let step = delta.signum() * 5;
+                mirror::set_size_percent((mirror::size_percent() as i32 + step).max(0) as u32);
+                return LRESULT(0);
+            }
             // Bir tekerlek çentiği (120) ≈ 3 satır.
             let px = (delta * 36 / 120).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             macview::with_mac(|m| {
@@ -428,8 +467,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             LRESULT(0)
         }
-        // Alt+F4 bu pencereyi kapatır (iPhone Mirroring'e gitmez).
-        WM_SYSKEYDOWN if wp.0 == 0x73 => DefWindowProcW(hwnd, msg, wp, lp),
+        // Alt+F4 ve Esc pencereyi gizler (iPhone Mirroring'e gitmez).
+        WM_SYSKEYDOWN if wp.0 == 0x73 => {
+            dismiss();
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wp.0 == 0x1B => {
+            dismiss();
+            LRESULT(0)
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             key(((lp.0 >> 16) & 0xFF) as u16 | if (lp.0 >> 24) & 1 == 1 { 0xE000 } else { 0 }, down);

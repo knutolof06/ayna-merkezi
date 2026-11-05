@@ -36,7 +36,7 @@
 // - iPhone kipi: Windows → Mac 0x18 MODE [0 kapalı | 2 ayrı pencere] (1 eski kipti, reddedilir);
 //   Mac → Windows 0x05 STATE [kip][başarılı][metin]. Görünmez bir sanal ekrandaki iPhone Mirroring,
 //   Mac görüntüsüyle aynı anda 0x09 PHONE_VIDEO [bayraklar][Annex-B] ve 0x0A PHONE_SCREEN [gen][yük]
-//   ile gider; anahtar kare için 0x1C. 0x19 TARGET [fare][klavye] (0 Mac, 1 iPhone) hangi pencerenin
+//   ile gider; anahtar kare için 0x1C, pencere gizliyken 0x1D PAUSE [açık]. 0x19 TARGET [fare][klavye] (0 Mac, 1 iPhone) hangi pencerenin
 //   kullanıldığını bildirir.
 // - Dosyalar (Windows → Mac): 0x20 PUT_BEGIN [toplu][no][boy u64][x][y][ad uz.][göreli ad],
 //   0x21 PUT_DATA [no][veri], 0x22 PUT_END [no]; Mac her dosyadan sonra 0x35 PUT_DONE
@@ -1400,6 +1400,8 @@ final class Session {
     /// iPhone Mirroring'i yakalayan ikinci yakalayıcı; Mac ekranının yakalaması onunla birlikte sürer.
     private var phoneCapturer: Capturer?
     private var needPhoneKey = false
+    /// Windows'taki iPhone penceresi gizli: görüntü gönderilmez, iPhone Mirroring açık kalır.
+    private var phonePaused = false
     /// Fare Windows'taki iPhone penceresinin üstünde: fare olayları iPhone Mirroring'e eşlenir.
     private var phoneMouse = false
     /// Windows'ta iPhone penceresi etkin: klavye iPhone Mirroring'e gider.
@@ -1916,6 +1918,7 @@ final class Session {
         phoneCapturer?.stop()
         let cap = Capturer(
             region: (display, rect, scale),
+            paused: phonePaused,
             cursor: false,
             onFrame: { [weak self] data, key in self?.sendVideo(data, key: key, phone: true) },
             onSize: { [weak self] w, h in
@@ -1965,7 +1968,7 @@ final class Session {
         if phoneKeyboard { _ = focusPhone() }
         if !phoneAnnounced {
             phoneAnnounced = true
-            sendState(mode: 2, ok: true, L("iPhone hazır", "iPhone is ready"))
+            sendState(mode: 2, ok: true, L("iPhone hazır: görev çubuğundaki iPhone simgesine tıklayın.", "iPhone is ready: click the iPhone icon on the taskbar."))
         }
     }
 
@@ -2072,6 +2075,9 @@ final class Session {
             setPhoneTarget(mouse: b[1] == 1, keyboard: b[2] == 1)
         case 0x1C:
             phoneCapturer?.requestKeyframe()
+        case 0x1D where b.count >= 2:
+            phonePaused = b[1] == 1
+            phoneCapturer?.setPaused(phonePaused)
         case 0x20 where b.count >= 23:
             putBegin(b)
         case 0x21 where b.count >= 5:

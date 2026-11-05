@@ -27,6 +27,8 @@ use crate::buttons;
 use crate::corners;
 use crate::hid;
 use crate::i18n::{self, tf};
+use crate::macview;
+use crate::phoneview;
 use crate::taskbar;
 use crate::toast;
 use crate::transfer::{self, Target};
@@ -278,6 +280,20 @@ fn mirror_hwnd() -> HWND {
     HWND(MIRROR.with(|c| c.get()) as _)
 }
 
+/// iPhone görüntüsü bundan sonra Mac üzerinden gelecek: açık pencere gizlenir. Açıktıysa true.
+pub fn hide_for_mac() -> bool {
+    let hwnd = mirror_hwnd();
+    unsafe {
+        let open = IsWindowVisible(hwnd).as_bool();
+        if open {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            corners::hide();
+            buttons::hide();
+        }
+        open
+    }
+}
+
 /// iPhone yansıtmasını keser: pencere gizlenir, alıcı (UxPlay) kapanıp yeniden başlar; iPhone yeniden
 /// bağlanabilir.
 pub fn disconnect() {
@@ -320,6 +336,7 @@ pub fn set_enabled(on: bool) {
 
 pub fn set_size_percent(pct: u32) {
     util::write_setting(SIZE_SETTING, pct.clamp(SIZE_MIN, SIZE_MAX));
+    phoneview::replace();
     let hwnd = mirror_hwnd();
     if unsafe { IsWindowVisible(hwnd).as_bool() } {
         unsafe {
@@ -389,6 +406,9 @@ unsafe fn run_after(hwnd: HWND, a: After) {
         After::EnsureIcon => taskbar::ensure(hwnd),
         After::RecreateIcon => taskbar::recreate(hwnd),
         After::RefreshIcon => taskbar::refresh(),
+        // Mac üzerinden kip açıkken iPhone ikonu görüntüyü oradan gösterir.
+        After::Toggle if macview::phone_on() => phoneview::toggle(),
+        After::Show if macview::phone_on() => phoneview::show(),
         After::Toggle | After::Show if !enabled() => {}
         After::Toggle => {
             if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && GetForegroundWindow() == hwnd {
@@ -590,12 +610,34 @@ unsafe fn open_store(hwnd: HWND) {
 /// yapılan yeniden yerleştirme, başka uygulamada çalışan kullanıcının önüne pencere çıkarmaz.
 unsafe fn place(hwnd: HWND, raise: bool) {
     let Some(aspect) = with(|m| m.aspect) else { return };
+    let Some((rect, radius)) = frame(hwnd, aspect) else { return };
+    let (x, y, w, h) = (rect.left, rect.top, width(&rect), height(&rect));
+    let scale = util::scale(hwnd);
+    let flags = if raise { SWP_NOACTIVATE } else { SWP_NOACTIVATE | SWP_NOZORDER };
+    let _ = SetWindowPos(hwnd, HWND_TOP, x, y, w, h, flags);
+    if REGION_SIZE.with(|r| r.get()) != (w, h) {
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+        // Başarılı olursa bölgenin sahibi sistemdir; başarısızsa biz sileriz.
+        if SetWindowRgn(hwnd, rgn, true) == 0 {
+            let _ = DeleteObject(rgn);
+        } else {
+            REGION_SIZE.with(|r| r.set((w, h)));
+        }
+    }
+    if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+        corners::show(hwnd, rect, radius, scale);
+        buttons::show(hwnd, rect, scale, aspect > 1.0);
+    }
+}
+
+/// iPhone penceresinin yeri ve köşe yarıçapı: ikonun üstünde, ayarlı boyda, verilen oranda.
+pub unsafe fn frame(hwnd: HWND, aspect: f32) -> Option<(RECT, i32)> {
     let anchor = taskbar::icon_rect();
     let probe = anchor.unwrap_or_default();
     let mon = MonitorFromRect(&probe, MONITOR_DEFAULTTOPRIMARY);
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     if !GetMonitorInfoW(mon, &mut info).as_bool() {
-        return;
+        return None;
     }
     let work = info.rcWork;
     let scale = util::scale(hwnd);
@@ -613,24 +655,8 @@ unsafe fn place(hwnd: HWND, raise: bool) {
     let lo = work.left + margin;
     let x = (center - w / 2).clamp(lo, (work.right - margin - w).max(lo));
     let y = work.bottom - margin - h;
-
-    let flags = if raise { SWP_NOACTIVATE } else { SWP_NOACTIVATE | SWP_NOZORDER };
-    let _ = SetWindowPos(hwnd, HWND_TOP, x, y, w, h, flags);
     let radius = ((w.min(h) as f32 * CORNER_RATIO) as i32).max(1);
-    if REGION_SIZE.with(|r| r.get()) != (w, h) {
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
-        // Başarılı olursa bölgenin sahibi sistemdir; başarısızsa biz sileriz.
-        if SetWindowRgn(hwnd, rgn, true) == 0 {
-            let _ = DeleteObject(rgn);
-        } else {
-            REGION_SIZE.with(|r| r.set((w, h)));
-        }
-    }
-    if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
-        let rect = RECT { left: x, top: y, right: x + w, bottom: y + h };
-        corners::show(hwnd, rect, radius, scale);
-        buttons::show(hwnd, rect, scale, aspect > 1.0);
-    }
+    Some((RECT { left: x, top: y, right: x + w, bottom: y + h }, radius))
 }
 
 pub fn size_percent() -> u32 {

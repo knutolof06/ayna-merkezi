@@ -161,11 +161,12 @@ yeniden kilitlemek için pencereye tıklayın. Pencereden çıkınca (Alt+Tab) k
 Ayna Ajan, Mac'in diline göre Türkçe ya da İngilizce. Ayna Ajan kendini kimse bağlı değilken günceller; menüdeki
 **Sürüm N yükle** ile hemen de kurulabilir (Windows kendiliğinden yeniden bağlanır).
 
-**iPhone'u Mac üzerinden (deneme):** Mac'teki iPhone Mirroring'i Windows'tan kullanır. Telefon, Mac penceresinin
-yanında kendi penceresinde görünür; iPhone kilitli ve ekranı kapalı kalır. Fare imlecin üstünde olduğu pencereye,
+**iPhone'u Mac üzerinden (deneme):** "iPhone'u Mac üzerinden göster" pencere açmadan Mac'te iPhone Mirroring'i
+başlatır; görüntü görev çubuğundaki **iPhone simgesiyle** her zamanki iPhone penceresinde, Mac penceresinin
+yanında açılır. iPhone kilitli ve ekranı kapalı kalır. Fare imlecin üstünde olduğu pencereye,
 klavye etkin pencereye gider (Cmd+1 ana ekran, Cmd+2 uygulama değiştirici, Cmd+3 arama; Windows'ta Ctrl+1/2/3).
 Mac'te tek imleç ve tek ön plan uygulaması olduğu için ikisi sırayla kullanılır: iPhone'da yazarken Mac'teki
-uygulama arka plana geçer, Mac penceresine dönünce geri gelir. iPhone penceresini kapatmak kipi kapatır.
+uygulama arka plana geçer, Mac penceresine dönünce geri gelir. "iPhone'u Mac üzerinden kapat" kipi kapatır.
 Mac'in ekranında iPhone görüntüsü durmaz: Ayna Ajan görünmez bir sanal ekran açar, iPhone Mirroring'i oraya
 koyar; kip kapanınca uygulamayı kapatıp sanal ekranı kaldırır.
 Gerekenler: macOS 15 ve Apple çipli Mac, iOS 18, iki cihazda aynı Apple hesabı, iPhone Mac'in yakınında ve

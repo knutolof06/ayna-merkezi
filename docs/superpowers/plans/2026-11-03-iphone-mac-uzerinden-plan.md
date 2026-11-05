@@ -25,6 +25,9 @@ ekranında iPhone görüntüsü sürekli açık durmasın.
 
 ## Aşama 2: iPhone ayrı pencerede (2026-11-05, kullanıcı onayladı, kod yazıldı: src/phoneview.rs + Session)
 Değişen: TARGET iki baytlı [fare][klavye]; fare imlecin üstündeki pencereyi, klavye etkin pencereyi izler.
+2026-11-05 (v21 sonrası, kullanıcı): yeni pencere istemiyor. Menü yalnız Mac'te uygulamayı başlatır; görüntü
+iPhone ikonuyla aynı yerde/boyutta açılır (phoneview artık çerçevesiz, mirror::frame), gizliyken 0x1D ile durur.
+Açık: Mac penceresinin küçülmesi kodda açıklanamadı; günlükte "Mac ekranı: G×Y" satırına bakılacak.
 Kullanıcı kipi gerçek Mac'te açtı, iPhone görüntüsü geldi. Şikâyet: görüntü Mac penceresinin yerini alıyor,
 Mac kullanılamıyor. Öneri:
 - Mac ajanı iki yakalayıcıyı aynı anda çalıştırır: ana ekran (0x01/0x02) + iPhone bölgesi. Yeni iletiler:

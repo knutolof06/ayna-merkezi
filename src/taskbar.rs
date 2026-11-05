@@ -470,6 +470,7 @@ unsafe fn show_menu(hwnd: HWND) {
             Device::Mac => {
                 let _ = PostMessageW(target(device), WM_APP_DISCONNECT, WPARAM(0), LPARAM(0));
             }
+            Device::IPhone if crate::macview::phone_on() => crate::macview::stop_phone(),
             Device::IPhone => mirror::disconnect(),
         },
         MENU_HUB => open_hub(),
