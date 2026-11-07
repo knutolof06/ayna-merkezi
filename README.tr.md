@@ -142,6 +142,10 @@ Gezgin klasörü) oraya kopyalanır; fare dosya gelmeden bırakılırsa Windows 
 sürüklerken dosyanın simgesi ve adı Mac'te (Mac ölçeğinde) imlecin altında görünür; Mac'ten çıkarırken
 dosyalar inene dek simgesi ve adı Windows'ta imleci izler, sonra Windows'un sürükleme görüntüsü devralır.
 
+**Ortak pano:** Bağlıyken bir tarafta kopyalanan metin ve resim öbür tarafta yapıştırılabilir. Kopyalanan
+dosyalar (onlar için sürükle-bırak) ve parola yöneticilerinin gizli işaretlediği içerik paylaşılmaz. Ayarlar ›
+"Mac ile pano paylaşımı" ile kapatılabilir.
+
 **Tek imleç:** Mac imleci görüntüye çizilmez; Windows imleci gecikmesiz kalır ama Mac'teki şeklini alır
 (yazı imleci, el, boyutlandırma okları).
 

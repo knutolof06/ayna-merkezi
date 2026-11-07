@@ -2,6 +2,7 @@
 
 mod ble;
 mod buttons;
+mod clipboard;
 mod corners;
 mod crypto;
 mod countdown;

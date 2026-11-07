@@ -32,7 +32,7 @@ const PAD: f32 = 16.0;
 const TITLE_H: f32 = 56.0;
 const IPHONE_H: f32 = 142.0;
 const MAC_H: f32 = 150.0;
-const GENERAL_H: f32 = 216.0;
+const GENERAL_H: f32 = 270.0;
 const GAP: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,6 +44,7 @@ enum Ctl {
     MacButton,
     AutostartSwitch,
     ZoomSwitch,
+    ClipSwitch,
     Language,
     Update,
 }
@@ -268,6 +269,7 @@ struct Layout {
     general: [f32; 4],
     autostart_switch: [f32; 4],
     zoom_switch: [f32; 4],
+    clip_switch: [f32; 4],
     language: [f32; 4],
     update: [f32; 4],
 }
@@ -290,6 +292,7 @@ fn layout(s: f32) -> Layout {
         general: [x0, gy, x1, gy + GENERAL_H * s],
         autostart_switch: sw(gy + 13.0 * s),
         zoom_switch: sw(gy + 67.0 * s),
+        clip_switch: sw(gy + 229.0 * s),
         language: [x1 - (16.0 + 110.0) * s, gy + 121.0 * s, x1 - 16.0 * s, gy + 149.0 * s],
         update: [x1 - (16.0 + 110.0) * s, gy + 175.0 * s, x1 - 16.0 * s, gy + 203.0 * s],
     }
@@ -313,6 +316,7 @@ enum Action {
     MacButton,
     Autostart,
     Zoom,
+    Clip,
     Language,
     Update,
     Paint,
@@ -435,6 +439,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             util::write_setting(ZOOM_SETTING, u32::from(!on));
             invalidate(hwnd);
         }
+        Action::Clip => {
+            macview::set_clipboard_enabled(!crate::clipboard::enabled());
+            invalidate(hwnd);
+        }
         Action::Language => {
             crate::i18n::set_english(!crate::i18n::english());
             taskbar::refresh();
@@ -539,6 +547,7 @@ impl Hub {
             (Ctl::MacButton, l.mac_button),
             (Ctl::AutostartSwitch, l.autostart_switch),
             (Ctl::ZoomSwitch, l.zoom_switch),
+            (Ctl::ClipSwitch, l.clip_switch),
             (Ctl::Language, l.language),
             (Ctl::Update, if update::build() > 0 { l.update } else { [0.0; 4] }),
         ]
@@ -612,6 +621,7 @@ impl Hub {
             Some(Ctl::MacButton) => Action::MacButton,
             Some(Ctl::AutostartSwitch) => Action::Autostart,
             Some(Ctl::ZoomSwitch) => Action::Zoom,
+            Some(Ctl::ClipSwitch) => Action::Clip,
             Some(Ctl::Language) => Action::Language,
             Some(Ctl::Update) => Action::Update,
             _ => Action::Paint,
@@ -683,6 +693,7 @@ impl Hub {
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 54.0 * s, p.separator, s);
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 108.0 * s, p.separator, s);
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 162.0 * s, p.separator, s);
+            separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 216.0 * s, p.separator, s);
             let mut buttons = vec![(Ctl::Language, l.language)];
             if update::build() > 0 {
                 buttons.push((Ctl::Update, l.update));
@@ -694,6 +705,7 @@ impl Hub {
             }
             switch(&mut c, l.autostart_switch, util::autostart_enabled(), p.accent, p.switch_off, s);
             switch(&mut c, l.zoom_switch, util::read_setting(ZOOM_SETTING) != Some(0), p.accent, p.switch_off, s);
+            switch(&mut c, l.clip_switch, crate::clipboard::enabled(), p.accent, p.switch_off, s);
 
             blit(self.hwnd, w, h, &c, |mem| {
                 // Metinler.
@@ -726,6 +738,7 @@ impl Hub {
 
                 text(mem, f.body, p.text, t("Windows ile başlat", "Start with Windows"), [gb[0] + 16.0 * s, gb[1] + 14.0 * s, gb[2] - 80.0 * s, gb[1] + 40.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, t("Dil", "Language"), [gb[0] + 16.0 * s, gb[1] + 122.0 * s, gb[2] - 140.0 * s, gb[1] + 148.0 * s], DT_LEFT);
+                text(mem, f.body, p.text, t("Mac ile pano paylaşımı", "Share clipboard with Mac"), [gb[0] + 16.0 * s, gb[1] + 230.0 * s, gb[2] - 80.0 * s, gb[1] + 256.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, if crate::i18n::english() { "English" } else { "Türkçe" }, l.language, DT_CENTER);
                 let (update_line, button) = match &update_status {
                     update::Status::Idle if update::build() == 0 => (t("Geliştirme sürümü", "Development build").to_string(), t("Denetle", "Check")),

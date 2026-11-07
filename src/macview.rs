@@ -23,6 +23,7 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::clipboard;
 use crate::countdown;
 use crate::dragout;
 use crate::i18n::{t, tf};
@@ -48,6 +49,8 @@ const TIMER_TICK: usize = 1;
 const TIMER_HOLD: usize = 2;
 /// "Fare serbest" iletisinin kalkması.
 const TIMER_HOLD_DONE: usize = 3;
+/// Pano başka bir uygulamada açıktı: okuma biraz sonra yeniden denenir.
+const TIMER_CLIP: usize = 4;
 const HOLD: Duration = Duration::from_secs(10);
 /// WM_APP_LOCK wParam: kilit ipucunu göster.
 const LOCK_HINT: usize = 1;
@@ -118,6 +121,11 @@ struct View {
     lock_hint_shown: bool,
     /// Fare kilitliyken Ctrl'ye basıldığı an (10 sn basılı kalırsa fare serbest kalır).
     hold_since: Option<Instant>,
+    /// Pano: Mac'ten en son alınan içeriğin özeti (bir pano yöneticisi aynısını yeniden yazarsa geri
+    /// gönderilmez), onu yazdığımız değişikliğin sıra numarası ve meşgul panoda kalan deneme sayısı.
+    clip_digest: u64,
+    clip_written: u32,
+    clip_retries: u8,
 }
 
 thread_local! {
@@ -130,6 +138,71 @@ thread_local! {
 
 fn with<R>(f: impl FnOnce(&mut View) -> R) -> Option<R> {
     STATE.with(|c| c.try_borrow_mut().ok().and_then(|mut o| o.as_mut().map(f)))
+}
+
+/// Windows'ta bir şey kopyalandı: bağlıysa Mac'e gider. Pano okuma mesaj pompalayabilir: durum ödünç
+/// alınmadan yapılır.
+fn clipboard_changed(hwnd: HWND) {
+    if !clipboard::enabled() {
+        return;
+    }
+    let seq = unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    let Some(written) = with(|v| v.mac.connected().then_some(v.clip_written)).flatten() else { return };
+    if seq == written {
+        return;
+    }
+    let clip = match clipboard::read() {
+        clipboard::Read::Clip(clip) => clip,
+        clipboard::Read::Busy => {
+            let retry = with(|v| {
+                let left = v.clip_retries;
+                v.clip_retries = left.saturating_sub(1);
+                left > 0
+            });
+            if retry.unwrap_or(false) {
+                unsafe {
+                    SetTimer(hwnd, TIMER_CLIP, 150, None);
+                }
+            }
+            return;
+        }
+        clipboard::Read::Nothing => return,
+    };
+    let digest = clip.digest();
+    with(|v| {
+        if v.clip_digest == digest || !v.mac.connected() {
+            return;
+        }
+        // Yeni bir şey kopyalandı: sonra Mac'teki içerik yeniden kopyalanırsa o da gönderilebilsin.
+        v.clip_digest = 0;
+        let kind = clip.kind();
+        let data = match clip {
+            clipboard::Clip::Text(s) => s.into_bytes(),
+            clipboard::Clip::Image(b) => b,
+        };
+        v.mac.send_clipboard(kind, data);
+    });
+}
+
+/// Mac'te bir şey kopyalandı: Windows panosuna yazılır.
+fn clipboard_received(hwnd: HWND) {
+    let Some((kind, data)) = with(|v| v.mac.take_clipboard()).flatten() else { return };
+    if !clipboard::enabled() {
+        return;
+    }
+    let Some(clip) = clipboard::Clip::decode(kind, data) else { return };
+    if let Some(seq) = clipboard::write(hwnd, &clip) {
+        with(|v| {
+            v.clip_written = seq;
+            v.clip_digest = clip.digest();
+        });
+    }
+}
+
+/// Ayarlardaki pano paylaşımı anahtarı.
+pub fn set_clipboard_enabled(on: bool) {
+    clipboard::set_enabled(on);
+    with(|v| v.mac.set_clipboard_enabled(on));
 }
 
 /// Bağlantıya erişim (iPhone penceresi için).
@@ -269,6 +342,8 @@ pub fn create() -> Option<HWND> {
         .ok()?;
         let corner = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, 4);
+        // Pano değişince haber gelsin (Mac'e gönderilir).
+        let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
         let dark = BOOL::from(true);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
 
@@ -332,6 +407,9 @@ pub fn create() -> Option<HWND> {
             buttons: 0,
             keys: Vec::new(),
             fake_ctrl: false,
+            clip_digest: 0,
+            clip_written: 0,
+            clip_retries: 0,
             was_connected: false,
             decided: false,
             last_pos: (u16::MAX / 2, u16::MAX / 2),
@@ -570,6 +648,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetBkColor(dc, colorref(p.field));
             return LRESULT(EDIT_BRUSH.with(|b| b.get()));
         }
+        WM_TIMER if wp.0 == TIMER_CLIP => {
+            let _ = KillTimer(hwnd, TIMER_CLIP);
+            clipboard_changed(hwnd);
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TIMER_HOLD => {
             hold_tick(hwnd);
             return LRESULT(0);
@@ -586,6 +669,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         mac::WM_APP_PHONE => {
             phoneview::sync();
+            return LRESULT(0);
+        }
+        WM_CLIPBOARDUPDATE => {
+            with(|v| v.clip_retries = 3);
+            clipboard_changed(hwnd);
+            return LRESULT(0);
+        }
+        mac::WM_APP_CLIP => {
+            clipboard_received(hwnd);
             return LRESULT(0);
         }
         mac::WM_APP_MAC => After::Mode,

@@ -105,6 +105,15 @@ const MSG_GET: u8 = 0x24;
 /// Windows → Mac: sürüklenen dosya Mac penceresinin üstünde [x][y][sayı][klasör][ad uz.][ad].
 const MSG_HOVER: u8 = 0x25;
 const MSG_HOVER_END: u8 = 0x26;
+/// Windows → Mac: pano [tür][bayraklar: 1 ilk, 2 son][parça]. Mac 64 KB'tan büyük ileti almaz: parçalı.
+const MSG_CLIP_OUT: u8 = 0x27;
+/// Mac → Windows: pano [tür][veri] (tek ileti).
+const MSG_CLIP_IN: u8 = 0x36;
+const CLIP_CHUNK: usize = 60_000;
+/// Pano parçaları yazıcı kuyruğunda en çok bu kadar birikir (girdi iletileri arada kalsın).
+const CLIP_QUEUE_LIMIT: usize = 256 << 10;
+/// Windows → Mac: pano paylaşımı açık mı [açık] (kapalıyken Mac panosunu göndermez).
+const MSG_CLIP_ENABLE: u8 = 0x28;
 // Mac → Windows (dosyalar)
 const MSG_DRAG_LIST: u8 = 0x30;
 const MSG_GET_BEGIN: u8 = 0x31;
@@ -121,6 +130,8 @@ pub const WM_APP_CURSOR: u32 = WM_APP + 29;
 pub const WM_APP_LOCK: u32 = WM_APP + 30;
 /// iPhone kipinin durumu ya da görüntü boyutu değişti.
 pub const WM_APP_PHONE: u32 = WM_APP + 31;
+/// Mac'te bir şey kopyalandı (`Mac::take_clipboard`).
+pub const WM_APP_CLIP: u32 = WM_APP + 32;
 /// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
 pub const FILES_LISTED: usize = 1;
 /// Mac'ten sürüklenen dosyaların hepsi geldi.
@@ -203,6 +214,10 @@ struct Shared {
     pointer_lock: AtomicBool,
     /// iPhone kipi istendi (Mac'teki iPhone Mirroring ayrı pencerede); ağ kopup yeniden bağlanınca da sürer.
     phone: AtomicBool,
+    /// Mac'ten gelen, panoya yazılmayı bekleyen içerik [tür][veri].
+    clip_in: Mutex<Option<(u8, Vec<u8>)>>,
+    /// Aynı anda tek pano gönderilir.
+    clip_lock: Mutex<()>,
     /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
     phone_player: Mutex<Option<Player>>,
     phone_screen: Mutex<Option<(u16, u16)>>,
@@ -297,6 +312,8 @@ impl Mac {
                 drag_asked: AtomicBool::new(false),
                 cursor: Mutex::new(None),
                 pointer_lock: AtomicBool::new(false),
+                clip_in: Mutex::new(None),
+                clip_lock: Mutex::new(()),
                 phone_player: Mutex::new(None),
                 phone_screen: Mutex::new(None),
                 phone_paused: AtomicBool::new(true),
@@ -484,6 +501,42 @@ impl Mac {
         if moved || switched {
             self.send(vec![MSG_TARGET, u8::from(m), u8::from(k)]);
         }
+    }
+
+    /// Windows'ta kopyalanan içerik Mac'e. Ayrı iş parçacığında ve kuyruk sınırıyla: büyük bir resim
+    /// fare ve klavyeyi bekletmesin. Bir pano bitmeden sonraki başlamaz (parçalar karışmasın).
+    pub fn send_clipboard(&self, kind: u8, data: Vec<u8>) {
+        let Some(tx) = self.shared.inner.lock().unwrap().tx.clone() else { return };
+        let queued = self.shared.queued.lock().unwrap().clone();
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let _turn = shared.clip_lock.lock().unwrap();
+            let parts: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(CLIP_CHUNK).collect() };
+            let last = parts.len() - 1;
+            for (i, part) in parts.into_iter().enumerate() {
+                while queued.load(Ordering::SeqCst) > CLIP_QUEUE_LIMIT {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let flags = u8::from(i == 0) | (u8::from(i == last) << 1);
+                let mut m = Vec::with_capacity(3 + part.len());
+                m.extend_from_slice(&[MSG_CLIP_OUT, kind, flags]);
+                m.extend_from_slice(part);
+                queued.fetch_add(m.len(), Ordering::SeqCst);
+                if tx.send(m).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Ayarlarda pano paylaşımı açıldı ya da kapandı.
+    pub fn set_clipboard_enabled(&self, on: bool) {
+        self.send(vec![MSG_CLIP_ENABLE, u8::from(on)]);
+    }
+
+    /// Mac'te kopyalanan, panoya yazılmayı bekleyen içerik.
+    pub fn take_clipboard(&self) -> Option<(u8, Vec<u8>)> {
+        self.shared.clip_in.lock().unwrap().take()
     }
 
     /// iPhone görüntüsünün boyutu (Mac bildirmediyse yok).
@@ -974,6 +1027,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         let _ = tx.send(vec![MSG_KEYFRAME]);
     }
     let _ = tx.send(vec![MSG_LOCAL_CURSOR]);
+    let _ = tx.send(vec![MSG_CLIP_ENABLE, u8::from(crate::clipboard::enabled())]);
     if shared.phone.load(Ordering::SeqCst) {
         shared.phone_quiet.store(true, Ordering::SeqCst);
         *shared.phone_asked.lock().unwrap() = Some(Instant::now());
@@ -1017,6 +1071,12 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.frame(plain.len(), plain[1] & 1 == 1);
                 if let Some(p) = shared.player.lock().unwrap().as_ref() {
                     p.push(&plain[2..]);
+                }
+            }
+            MSG_CLIP_IN if plain.len() >= 2 => {
+                *shared.clip_in.lock().unwrap() = Some((plain[1], plain[2..].to_vec()));
+                unsafe {
+                    let _ = PostMessageW(HWND(notify as _), WM_APP_CLIP, WPARAM(0), LPARAM(0));
                 }
             }
             MSG_PHONE_VIDEO if plain.len() > 2 => {
@@ -1481,7 +1541,7 @@ fn write_loop(mut writer: TcpStream, mut aead: Aead, out: Receiver<Vec<u8>>, sta
         if batch.iter().any(|m| matches!(m.first(), Some(&MSG_MOUSE_MOVE) | Some(&MSG_REL_MOVE))) {
             last_move = Instant::now();
         }
-        let sent: usize = batch.iter().filter(|m| m.first() == Some(&MSG_PUT_DATA)).map(|m| m.len()).sum();
+        let sent: usize = batch.iter().filter(|m| matches!(m.first(), Some(&MSG_PUT_DATA) | Some(&MSG_CLIP_OUT))).map(|m| m.len()).sum();
         if sent > 0 {
             queued.fetch_sub(sent.min(queued.load(Ordering::SeqCst)), Ordering::SeqCst);
         }

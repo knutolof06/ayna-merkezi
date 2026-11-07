@@ -73,6 +73,9 @@ devices prove their identity with a pairing key and connect automatically.
 - **Drag and drop files** both ways: drop onto the Mac window to copy into the Finder folder under the pointer
   (or the Desktop); drag a file out of the Mac window to drop it anywhere on Windows. The file icon and name
   follow the pointer on both sides.
+- **Shared clipboard:** text and images copied on either side are available on the other while connected.
+  Copied files are not shared (use drag and drop), nor is content password managers mark as hidden. Turn it
+  off in Settings › *Share clipboard with Mac*.
 - **One pointer:** the Mac cursor isn't drawn into the video; the Windows cursor stays lag-free but takes the
   Mac cursor's shape.
 - **Games (pointer lock):** when a game hides and captures the mouse, the Windows cursor is confined to the Mac
