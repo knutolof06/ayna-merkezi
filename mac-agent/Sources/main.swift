@@ -42,6 +42,7 @@
 //   [y i16])×n — Windows'taki ek monitörler (sıra 1..; birincil monitöre göre yer). Mac her biri için sanal ekran açar; görüntü 0x0B
 //   SCREEN_VIDEO [sıra][bayraklar][veri], boyut 0x0C SCREEN_SIZE [sıra][gen][yük]. 0x1F SCREEN [sıra]
 //   farenin hangi ekranda olduğu (0 ana ekran), 0x29 SCREEN_PAUSE [sıra][açık], 0x2A SCREEN_KEY [sıra].
+//   Mac → Windows 0x0F SCREEN_FAIL [sıra][etkin ekran sayısı]: Mac o ekranı etkinleştiremedi (çipin ekran sınırı).
 // - Tanı: Mac → Windows 0x0D LOG [metin] (Windows günlüğüne yazılır), 0x0E AGENT [sürüm u32] oturum başında.
 // - Pano: Mac → Windows 0x36 CLIP [tür: 1 metin UTF-8 | 2 BMP][veri]; Windows → Mac 0x27 CLIP
 //   [tür][bayraklar: 1 ilk, 2 son][parça] (64 KB sınırı yüzünden parçalı). Kopyalanınca gider;
@@ -1532,6 +1533,8 @@ final class ExtraScreen {
     let height: Int
     var capturer: Capturer?
     var lookingUp = false
+    /// Etkinleşmesi bu andan sayılır.
+    let created = Date()
 
     init(index: UInt8, display: CGVirtualDisplay, width: Int, height: Int) {
         self.index = index
@@ -1580,6 +1583,8 @@ final class Session {
     /// Windows'un istediği ekran (henüz açılmamış olabilir: açılınca uygulanır).
     private var wantedMouse: UInt8 = 0
     private var screenWaitLogged = false
+    /// Etkinleşmediği için bırakılan ek ekranlar (yeni düzene dek yeniden denenmez).
+    private var failedScreens: Set<UInt8> = []
     private var screenWaitSince = Date()
     /// Windows'un birincil monitörünün boyutu (ek ekranların yeri buna göre).
     private var windowsPrimary = (width: 1920, height: 1080)
@@ -2338,6 +2343,7 @@ final class Session {
             wanted.append((b[o], w, h, x, y))
         }
         screenAttempts = [:]
+        failedScreens = []
         remoteLog("Ek ekranlar istendi: \(wanted.map { "\($0.index) \($0.width)×\($0.height) @\($0.x),\($0.y)" }.joined(separator: ", "))")
         screenWaitLogged = false
         wantedScreens = Array(wanted.prefix(8))
@@ -2405,7 +2411,7 @@ final class Session {
             }
             return
         }
-        for want in wantedScreens where screens[want.index] == nil {
+        for want in wantedScreens where screens[want.index] == nil && !failedScreens.contains(want.index) {
             let tries = screenAttempts[want.index, default: 0]
             guard tries < 20 else { continue }
             screenAttempts[want.index] = tries + 1
@@ -2424,20 +2430,27 @@ final class Session {
             screensArranged = false
             if wantedMouse == want.index { updateArea() }
         }
-        let active = screens.values.allSatisfy { CGDisplayIsActive($0.display.displayID) != 0 }
-        guard active else {
-            if !screenWaitLogged && Date().timeIntervalSince(screenWaitSince) > 8 {
-                screenWaitLogged = true
-                let idle = screens.values.filter { CGDisplayIsActive($0.display.displayID) == 0 }.map { "\($0.index)" }
-                remoteLog("Ek ekranlar: etkinleşmeyen ekran(lar) \(idle.joined(separator: ", ")); etkin ekranlar \(MainKeeper.activeDisplays())")
+        // Apple çipleri aynı anda belli sayıda ekran çalıştırır (sanal ekranlar da sayılır): sınırı aşan ekran
+        // açılır ama etkinleşmez. 6 sn'de etkinleşmeyen bırakılır, Windows'a bildirilir; kalanlarla sürülür.
+        let inactive = screens.values.filter { CGDisplayIsActive($0.display.displayID) == 0 }
+        if !inactive.isEmpty {
+            guard inactive.allSatisfy({ Date().timeIntervalSince($0.created) > 6 }) else { return }
+            let activeCount = MainKeeper.activeDisplays().count
+            for s in inactive {
+                remoteLog("Ek ekran \(s.index): etkinleşmedi, bırakıldı (etkin ekranlar \(MainKeeper.activeDisplays()))")
+                send(Data([0x0F, s.index, UInt8(clamping: activeCount)]))
+                failedScreens.insert(s.index)
+                removeScreen(s.index)
             }
-            return
+            screensArranged = false
         }
         if !screensArranged {
             screensArranged = true
             MainKeeper.arrange()
         }
-        var done = wantedScreens.allSatisfy { screens[$0.index] != nil || screenAttempts[$0.index, default: 0] >= 20 }
+        var done = wantedScreens.allSatisfy {
+            screens[$0.index] != nil || failedScreens.contains($0.index) || screenAttempts[$0.index, default: 0] >= 20
+        }
         for s in screens.values where s.capturer == nil {
             done = false
             if !s.lookingUp { startScreenCapture(s) }

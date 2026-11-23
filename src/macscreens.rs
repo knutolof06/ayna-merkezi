@@ -17,6 +17,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -72,6 +73,8 @@ pub struct Monitor {
     pub rect: RECT,
     pub work: RECT,
     pub primary: bool,
+    /// Ölçek (DPI / 96): 4K monitörde %200 ise 2.
+    pub scale: f32,
 }
 
 /// Bağlı monitörler, soldan sağa (sonra yukarıdan aşağı).
@@ -82,11 +85,14 @@ pub fn monitors() -> Vec<Monitor> {
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         if GetMonitorInfoW(mon, &mut info.monitorInfo).as_bool() {
             let n = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let (mut dx, mut dy) = (96u32, 96u32);
+            let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             list.push(Monitor {
                 name: String::from_utf16_lossy(&info.szDevice[..n]),
                 rect: info.monitorInfo.rcMonitor,
                 work: info.monitorInfo.rcWork,
                 primary: info.monitorInfo.dwFlags & 1 != 0,
+                scale: (dx.max(96) as f32 / 96.0).max(1.0),
             });
         }
         TRUE
@@ -131,24 +137,33 @@ fn extras() -> Vec<(u8, Monitor)> {
 }
 
 /// Ayrı ekranlar kipinde Mac'e bildirilecek düzen: [sıra, genişlik, yükseklik, x, y] (birincil
-/// monitörün sol üst köşesine göre).
+/// monitörün sol üst köşesine göre). Boyutlar ölçekli (4K %200 → 1920×1080): Mac ekranı Windows'taki
+/// yazı ve simge boyutunda görünsün, Mac fiziksel 4K kadar çizmesin.
 pub fn layout() -> Vec<(u8, u16, u16, i16, i16)> {
     if mode() != Mode::Extended {
         return Vec::new();
     }
     let Some(primary) = monitors().into_iter().find(|m| m.primary) else { return Vec::new() };
+    let k = primary.scale;
     extras()
         .into_iter()
         .map(|(i, m)| {
             (
                 i,
-                util::width(&m.rect) as u16,
-                util::height(&m.rect) as u16,
-                (m.rect.left - primary.rect.left) as i16,
-                (m.rect.top - primary.rect.top) as i16,
+                (util::width(&m.rect) as f32 / m.scale).round() as u16,
+                (util::height(&m.rect) as f32 / m.scale).round() as u16,
+                ((m.rect.left - primary.rect.left) as f32 / k).round() as i16,
+                ((m.rect.top - primary.rect.top) as f32 / k).round() as i16,
             )
         })
         .collect()
+}
+
+/// Birincil monitörün ölçekli boyutu (Mac ek ekranları buna göre yerleştirir).
+pub fn primary_size() -> (u16, u16) {
+    monitors().into_iter().find(|m| m.primary).map_or((1920, 1080), |m| {
+        ((util::width(&m.rect) as f32 / m.scale).round() as u16, (util::height(&m.rect) as f32 / m.scale).round() as u16)
+    })
 }
 
 /// Kip ya da monitörler değişti: Mac'e yeni düzen gider; artık geçersiz pencereler kapanır.
@@ -158,7 +173,7 @@ pub fn apply() {
     // Pencere ancak numarası hâlâ aynı monitörü gösteriyorsa kalır (monitör takılıp çıkarılınca numaralar kayar).
     let valid: Vec<(u8, String)> =
         if mode == Mode::Single { Vec::new() } else { extras().into_iter().map(|(i, m)| (i, m.name)).collect() };
-    let primary = monitors().into_iter().find(|m| m.primary).map_or((1920, 1080), |m| (util::width(&m.rect) as u16, util::height(&m.rect) as u16));
+    let primary = primary_size();
     macview::with_mac(|m| {
         m.set_mirror(mode == Mode::Mirror);
         m.set_layout(primary, &layout);
@@ -427,6 +442,14 @@ pub fn replace() {
 /// ve Mac'ten ekran boyutu gelince çağrılır.
 pub fn sync() {
     let list: Vec<(u8, HWND, HWND, Option<(u16, u16)>)> = with_all(|v| v.iter().map(|s| (s.index, s.hwnd, s.video, s.size)).collect());
+    // Bekleme ya da hata yazısı güncel kalsın (yalnız görüntü yokken; arka plan silinerek).
+    for &(_, hwnd, video, _) in &list {
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() && !IsWindowVisible(video).as_bool() {
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+        }
+    }
     let connected = macview::with_mac(|m| m.connected()).unwrap_or(false);
     for (index, hwnd, video, sized) in list {
         unsafe {
@@ -572,21 +595,36 @@ fn key(hwnd: HWND, scan: u16, down: bool) {
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let dc = BeginPaint(hwnd, &mut ps);
-    let waiting = with_hwnd(hwnd, |s| !IsWindowVisible(s.video).as_bool()).unwrap_or(false);
+    let (waiting, index) = with_hwnd(hwnd, |s| (!IsWindowVisible(s.video).as_bool(), s.index)).unwrap_or((false, 0));
     if waiting {
         let mut c = RECT::default();
         let _ = GetClientRect(hwnd, &mut c);
         let old_agent = macview::with_mac(|m| m.connected() && m.agent_build() == 0).unwrap_or(false);
+        let failed = macview::with_mac(|m| m.screen_failed(index)).flatten();
         let text = if mode() == Mode::Extended && old_agent {
-            t("Mac'teki Ayna Ajan güncel değil: Mac'te menüden güncelleyin.", "Ayna Ajan on the Mac is out of date: update it from its menu.")
+            t("Mac'teki Ayna Ajan güncel değil: Mac'te menüden güncelleyin.", "Ayna Ajan on the Mac is out of date: update it from its menu.").to_string()
+        } else if let (Some(active), Mode::Extended) = (failed, mode()) {
+            crate::i18n::tf(
+                "Mac bu ekranı açamadı: bu Mac aynı anda en çok {} ekran çalıştırabiliyor. Bu monitörü Mac'ten kaldırın (Mac simgesine sağ tık) ya da \"Aynı ekran\" kipini kullanın.",
+                "The Mac could not open this display: this Mac runs at most {} displays at once. Remove this monitor from the Mac (right-click the Mac icon) or use \"Same screen\".",
+                &[&active],
+            )
         } else {
-            t("Mac ekranı açılıyor…", "Opening the Mac screen…")
+            t("Mac ekranı açılıyor…", "Opening the Mac screen…").to_string()
         };
         let mut label: Vec<u16> = text.encode_utf16().collect();
         let old = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, util::rgb(220, 220, 220));
-        DrawTextW(dc, &mut label, &mut c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        let inset = (24.0 * util::scale(hwnd)) as i32;
+        c.left += inset;
+        c.right -= inset;
+        // Yazı dikey ortada, satırlara bölünerek.
+        let mut measure = c;
+        DrawTextW(dc, &mut label, &mut measure, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+        let h = util::height(&measure);
+        c.top += (util::height(&c) - h) / 2;
+        DrawTextW(dc, &mut label, &mut c, DT_CENTER | DT_WORDBREAK);
         SelectObject(dc, old);
     }
     let _ = EndPaint(hwnd, &ps);

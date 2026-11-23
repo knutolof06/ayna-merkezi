@@ -97,6 +97,8 @@ const MSG_SCREEN_VIDEO: u8 = 0x0B;
 const MSG_SCREEN_SIZE: u8 = 0x0C;
 /// Mac → Windows: günlük satırı [metin]; ajanın sürümü [u32] (oturum başında; eski ajan göndermez).
 const MSG_LOG: u8 = 0x0D;
+/// Mac → Windows: ek ekran etkinleşmedi [sıra][Mac'teki etkin ekran sayısı] (çipin ekran sınırı).
+const MSG_SCREEN_FAIL: u8 = 0x0F;
 const MSG_AGENT: u8 = 0x0E;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -246,6 +248,8 @@ struct Shared {
     screen_target: AtomicU32,
     /// Mac'teki Ayna Ajan'ın sürümü (0: bildirmedi, yani eski).
     agent_build: AtomicU32,
+    /// Mac'in açamadığı ek ekranlar → o an Mac'teki etkin ekran sayısı.
+    screen_failed: Mutex<HashMap<u8, u8>>,
     /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
     phone_player: Mutex<Option<Player>>,
     phone_screen: Mutex<Option<(u16, u16)>>,
@@ -349,6 +353,7 @@ impl Mac {
                 screen_paused: Mutex::new(HashMap::new()),
                 screen_target: AtomicU32::new(0),
                 agent_build: AtomicU32::new(0),
+                screen_failed: Mutex::new(HashMap::new()),
                 phone_player: Mutex::new(None),
                 phone_screen: Mutex::new(None),
                 phone_paused: AtomicBool::new(true),
@@ -592,6 +597,7 @@ impl Mac {
         *layout = m.clone();
         drop(layout);
         util::log(&format!("Mac ek ekran düzeni: {screens:?}"));
+        self.shared.screen_failed.lock().unwrap().clear();
         self.shared.screen_sizes.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
         self.shared.screen_paused.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
         self.send(m);
@@ -600,6 +606,11 @@ impl Mac {
     /// Mac'teki Ayna Ajan'ın sürümü (0: bilinmiyor, eski bir sürüm).
     pub fn agent_build(&self) -> u32 {
         self.shared.agent_build.load(Ordering::SeqCst)
+    }
+
+    /// Mac bu ek ekranı açamadıysa Mac'teki etkin ekran sayısı.
+    pub fn screen_failed(&self, index: u8) -> Option<u8> {
+        self.shared.screen_failed.lock().unwrap().get(&index).copied()
     }
 
     pub fn screen_size(&self, index: u8) -> Option<(u16, u16)> {
@@ -1204,10 +1215,17 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 }
             }
             MSG_SCREEN_VIDEO if plain.len() > 3 => {
+                stats.screen_frame(plain[1]);
                 if !shared.mirror.load(Ordering::SeqCst) {
                     if let Some(p) = shared.screen_players.lock().unwrap().get(&plain[1]) {
                         p.push(&plain[3..]);
                     }
+                }
+            }
+            MSG_SCREEN_FAIL if plain.len() >= 3 => {
+                shared.screen_failed.lock().unwrap().insert(plain[1], plain[2]);
+                unsafe {
+                    let _ = PostMessageW(HWND(notify as _), WM_APP_SCREENS, WPARAM(0), LPARAM(0));
                 }
             }
             MSG_LOG => {
@@ -1610,17 +1628,23 @@ struct Stats {
     keys: u32,
     bytes: usize,
     rtts: Vec<u64>,
+    /// Ek ekran başına gelen kare.
+    screens: std::collections::BTreeMap<u8, u32>,
 }
 
 impl Stats {
     fn new() -> Stats {
-        Stats { since: Instant::now(), frames: 0, keys: 0, bytes: 0, rtts: Vec::new() }
+        Stats { since: Instant::now(), frames: 0, keys: 0, bytes: 0, rtts: Vec::new(), screens: Default::default() }
     }
 
     fn frame(&mut self, len: usize, key: bool) {
         self.frames += 1;
         self.keys += u32::from(key);
         self.bytes += len;
+    }
+
+    fn screen_frame(&mut self, index: u8) {
+        *self.screens.entry(index).or_insert(0) += 1;
     }
 
     fn rtt(&mut self, ms: u64) {
@@ -1640,6 +1664,10 @@ impl Stats {
             self.keys,
             self.bytes as f32 * 8.0 / secs / 1_000_000.0,
         ));
+        if !self.screens.is_empty() {
+            let parts: Vec<String> = self.screens.iter().map(|(i, n)| format!("{i}: {:.0}", *n as f32 / secs)).collect();
+            util::log(&format!("Mac ek ekranlar (kare/sn): {}", parts.join(", ")));
+        }
         *self = Stats::new();
     }
 }
