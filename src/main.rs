@@ -14,6 +14,7 @@ mod gst;
 mod hid;
 mod hub;
 mod mac;
+mod macscreens;
 mod macview;
 mod mirror;
 mod phoneview;
@@ -69,6 +70,8 @@ fn main() {
         let Some(hwnd) = mirror::create(ble, engine) else { return };
         let Some(hub) = hub::create() else { return };
         macview::create();
+        // Çoklu ekran kipi: Mac'e bildirilecek düzen hazırlanır (bağlanınca gider).
+        macscreens::apply();
         taskbar::ensure(hwnd);
         update::start(hub);
         tray::create();

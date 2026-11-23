@@ -33,6 +33,7 @@ use crate::toast;
 use crate::hub::{self, card_bg, card_bg_alpha, colorref, hit, palette, point, slider, text, to_rect, Fonts};
 use crate::mac::{self, Mac, State};
 use crate::mirror::{self, WM_APP_PLACE, WM_APP_SHOW, WM_APP_TOGGLE};
+use crate::macscreens;
 use crate::phoneview;
 use crate::taskbar::{self, draw_mac, Canvas, Device, WM_APP_DISCONNECT};
 use crate::util::{self, height, width};
@@ -44,6 +45,8 @@ const SIZER_CLASS: PCWSTR = w!("iPhoneAyna.MacBoyut");
 pub const WM_APP_SIZER: u32 = WM_APP + 25;
 /// Kod alanında Enter.
 const WM_APP_GO: u32 = WM_APP + 26;
+/// Uygulamanın içinden açılış (Ayarlar düğmesi, iPhone kipi): ikon tıklaması değil, hep asıl pencere.
+const WM_APP_OPEN: u32 = WM_APP + 34;
 const TIMER_TICK: usize = 1;
 /// Ctrl basılı tutulurken sayaç (fare kilidinden çıkış).
 const TIMER_HOLD: usize = 2;
@@ -126,6 +129,8 @@ struct View {
     clip_digest: u64,
     clip_written: u32,
     clip_retries: u8,
+    /// Mac'e en son bildirilen ana görüntü duraklatma durumu (bağlantı başına).
+    stream_paused: Option<bool>,
 }
 
 thread_local! {
@@ -197,6 +202,23 @@ fn clipboard_received(hwnd: HWND) {
             v.clip_digest = clip.digest();
         });
     }
+}
+
+/// Mac imlecinin şekli (ek ekran pencereleri de kullanır); yoksa geçersiz.
+pub fn mac_cursor() -> HCURSOR {
+    with(|v| v.mac.connected().then_some(v.mac_cursor)).flatten().unwrap_or_default()
+}
+
+/// Ana görüntü yalnız onu gösteren bir pencere açıkken akar: Mac penceresi ya da (aynı ekran kipinde)
+/// bir ek pencere.
+pub fn update_pause() {
+    let needed = unsafe { IsWindowVisible(main_hwnd()).as_bool() } || macscreens::mirror_visible();
+    with(|v| {
+        if v.mac.connected() && v.stream_paused != Some(!needed) {
+            v.stream_paused = Some(!needed);
+            v.mac.pause(!needed);
+        }
+    });
 }
 
 /// Ayarlardaki pano paylaşımı anahtarı.
@@ -273,11 +295,11 @@ pub fn open() {
         set_enabled(true);
     }
     unsafe {
-        let _ = PostMessageW(main_hwnd(), WM_APP_SHOW, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(main_hwnd(), WM_APP_OPEN, WPARAM(0), LPARAM(0));
     }
 }
 
-fn size_percent() -> u32 {
+pub fn size_percent() -> u32 {
     util::read_setting(SIZE_SETTING).unwrap_or(SIZE_DEFAULT).clamp(SIZE_MIN, SIZE_MAX)
 }
 
@@ -410,6 +432,7 @@ pub fn create() -> Option<HWND> {
             clip_digest: 0,
             clip_written: 0,
             clip_retries: 0,
+            stream_paused: None,
             was_connected: false,
             decided: false,
             last_pos: (u16::MAX / 2, u16::MAX / 2),
@@ -485,6 +508,7 @@ unsafe fn show(hwnd: HWND) {
             }
         }
         v.mac.pause(false);
+        v.stream_paused = Some(false);
     });
     place(hwnd);
     let _ = ShowWindow(hwnd, SW_SHOW);
@@ -494,11 +518,9 @@ unsafe fn show(hwnd: HWND) {
 }
 
 unsafe fn hide(hwnd: HWND) {
-    with(|v| {
-        v.release_input();
-        v.mac.pause(true);
-    });
+    with(|v| v.release_input());
     let _ = ShowWindow(hwnd, SW_HIDE);
+    update_pause();
     taskbar::refresh();
 }
 
@@ -665,7 +687,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => {
             let after = with(|v| v.tick()).unwrap_or(After::None);
             phoneview::sync();
+            macscreens::sync();
             after
+        }
+        mac::WM_APP_SCREENS => {
+            macscreens::sync();
+            return LRESULT(0);
         }
         mac::WM_APP_PHONE => {
             phoneview::sync();
@@ -681,8 +708,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         mac::WM_APP_MAC => After::Mode,
+        // Çoklu ekran kipinde ek monitördeki Mac ikonu o monitörün Mac penceresini açar.
+        WM_APP_TOGGLE | WM_APP_SHOW if macscreens::handle_click(msg == WM_APP_SHOW) => return LRESULT(0),
         WM_APP_TOGGLE => After::Toggle,
-        WM_APP_SHOW => After::Show,
+        WM_APP_SHOW | WM_APP_OPEN => After::Show,
         WM_APP_PLACE => After::Place,
         WM_APP_SIZER => After::Sizer,
         WM_APP_DISCONNECT => {
@@ -775,7 +804,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             After::Place
         }
-        WM_DISPLAYCHANGE => After::Place,
+        WM_DISPLAYCHANGE => {
+            // Monitör eklendi/çıkarıldı ya da çözünürlük değişti: ek ekranlar yeniden düzenlenir.
+            macscreens::apply();
+            After::Place
+        }
         WM_CLOSE => After::Hide,
         WM_ACTIVATE => {
             if wp.0 & 0xFFFF != 0 {
@@ -975,8 +1008,10 @@ impl View {
             if !self.was_connected {
                 self.backoff = Duration::from_secs(3);
                 // Pencere kapalıyken bağlandı (açılışta ya da yeniden bağlanınca): görüntü bekler.
-                if unsafe { !IsWindowVisible(self.hwnd).as_bool() } {
+                self.stream_paused = None;
+                if unsafe { !IsWindowVisible(self.hwnd).as_bool() } && !macscreens::mirror_visible() {
                     self.mac.pause(true);
+                    self.stream_paused = Some(true);
                 }
             }
             self.reconnect_at = None;
@@ -1215,6 +1250,7 @@ impl View {
             self.last_pos = (x, y);
             // Fare iPhone penceresinden döndüyse olaylar yeniden Mac ekranına eşlensin.
             self.mac.set_target(Some(false), None);
+            self.mac.set_screen_target(0);
             self.mac.send(mac::mouse_move(x, y));
             return After::None;
         }
@@ -1263,6 +1299,7 @@ impl View {
             let (x, y) = self.normalized(pt);
             self.last_pos = (x, y);
             self.mac.set_target(Some(false), None);
+            self.mac.set_screen_target(0);
             unsafe {
                 if down {
                     SetCapture(self.hwnd);
@@ -1519,6 +1556,7 @@ pub fn drop_hover(x: i32, y: i32, count: usize, folder: bool, name: &str, enter:
         }
         // OLE sürüklemesi fare iletisi üretmez: fare iPhone penceresinden geldiyse burada Mac'e dönülür.
         v.mac.set_target(Some(false), None);
+        v.mac.set_screen_target(0);
         if enter {
             v.last_hover = None;
         }
@@ -1556,6 +1594,7 @@ pub fn drop_files(x: i32, y: i32, paths: Vec<std::path::PathBuf>) -> bool {
         }
         let (nx, ny) = v.normalized((pt.x, pt.y));
         v.mac.set_target(Some(false), None);
+        v.mac.set_screen_target(0);
         v.mac.send_files(paths, nx, ny)
     })
     .unwrap_or(false);
@@ -1752,20 +1791,39 @@ const SIZER_H: f32 = 238.0;
 enum SizerButton {
     Phone,
     Connection,
+    /// Çoklu ekran kipinde, ek monitördeki ikondan: bu monitörü Mac'e ekle/kaldır.
+    Screen,
     Settings,
     Exit,
 }
 
-/// Kaydırıcı ve düğmeler: iPhone kipi, bağlantı, ayarlar | çık.
-fn sizer_layout(s: f32) -> ([f32; 4], [(SizerButton, [f32; 4]); 4]) {
+thread_local! {
+    /// Menü açılırken hesaplanır (her fare hareketinde monitörler sayılmasın).
+    static SIZER_SCREEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Menüde ek monitör düğmesi var mı (çoklu ekran kipi ve ikon ek monitörde).
+fn sizer_screen_row() -> bool {
+    SIZER_SCREEN.with(|c| c.get())
+}
+
+fn sizer_height() -> f32 {
+    SIZER_H + if sizer_screen_row() { 44.0 } else { 0.0 }
+}
+
+/// Kaydırıcı ve düğmeler: iPhone kipi, bağlantı, (ek monitör), ayarlar | çık.
+fn sizer_layout(s: f32) -> ([f32; 4], Vec<(SizerButton, [f32; 4])>) {
     let slider = [20.0 * s, 64.0 * s, (SIZER_W - 20.0) * s, 84.0 * s];
     let mid = SIZER_W / 2.0;
-    let buttons = [
-        (SizerButton::Phone, [16.0 * s, 102.0 * s, (SIZER_W - 16.0) * s, 136.0 * s]),
-        (SizerButton::Connection, [16.0 * s, 146.0 * s, (SIZER_W - 16.0) * s, 180.0 * s]),
-        (SizerButton::Settings, [16.0 * s, 190.0 * s, (mid - 5.0) * s, 224.0 * s]),
-        (SizerButton::Exit, [(mid + 5.0) * s, 190.0 * s, (SIZER_W - 16.0) * s, 224.0 * s]),
-    ];
+    let row = |top: f32| [16.0 * s, top * s, (SIZER_W - 16.0) * s, (top + 34.0) * s];
+    let mut buttons = vec![(SizerButton::Phone, row(102.0)), (SizerButton::Connection, row(146.0))];
+    let mut y = 190.0;
+    if sizer_screen_row() {
+        buttons.push((SizerButton::Screen, row(190.0)));
+        y += 44.0;
+    }
+    buttons.push((SizerButton::Settings, [16.0 * s, y * s, (mid - 5.0) * s, (y + 34.0) * s]));
+    buttons.push((SizerButton::Exit, [(mid + 5.0) * s, y * s, (SIZER_W - 16.0) * s, (y + 34.0) * s]));
     (slider, buttons)
 }
 
@@ -1820,6 +1878,7 @@ fn hide_sizer() {
 }
 
 unsafe fn show_sizer() {
+    SIZER_SCREEN.with(|c| c.set(macscreens::anchor_screen().is_some()));
     let existing = SIZER.with(|c| c.borrow().as_ref().map(|z| z.hwnd));
     let hwnd = match existing {
         Some(h) => h,
@@ -1880,7 +1939,7 @@ unsafe fn show_sizer() {
             }
         }
     });
-    let (w, h) = ((SIZER_W * s) as i32, (SIZER_H * s) as i32);
+    let (w, h) = ((SIZER_W * s) as i32, (sizer_height() * s) as i32);
     let m = (MARGIN * s) as i32;
     let x = anchor.left.clamp(work.left + m, (work.right - m - w).max(work.left + m));
     let y = work.bottom - m - h;
@@ -1904,6 +1963,7 @@ fn set_size(pct: u32) {
     unsafe {
         let _ = PostMessageW(main_hwnd(), WM_APP_PLACE, WPARAM(0), LPARAM(0));
     }
+    macscreens::replace();
 }
 
 unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -1947,6 +2007,11 @@ unsafe extern "system" fn sizer_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                         disconnect();
                     } else {
                         open();
+                    }
+                }
+                SizerButton::Screen => {
+                    if let Some((_, m)) = macscreens::anchor_screen() {
+                        macscreens::set_monitor_enabled(&m.name, !macscreens::monitor_enabled(&m.name));
                     }
                 }
                 SizerButton::Settings => taskbar::open_hub(),
@@ -2019,6 +2084,15 @@ unsafe fn paint_sizer(hwnd: HWND, s: f32) {
             ),
             SizerButton::Settings => (p.field, t("Ayarları aç", "Settings"), p.text),
             SizerButton::Exit => (p.field, t("Çık", "Quit"), p.text),
+            SizerButton::Screen => (
+                p.field,
+                if macscreens::anchor_screen().is_some_and(|(_, m)| macscreens::monitor_enabled(&m.name)) {
+                    t("Bu monitörü Mac'ten kaldır", "Remove this monitor from the Mac")
+                } else {
+                    t("Bu monitörü Mac'e ekle", "Add this monitor to the Mac")
+                },
+                p.text,
+            ),
         };
         let alpha = if hover == Some(kind) { 0.8 } else { 1.0 };
         card_bg_alpha(&mut c, b, fill_color, 10.0 * s, alpha);

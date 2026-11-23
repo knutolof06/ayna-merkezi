@@ -38,6 +38,10 @@
 //   Mac görüntüsüyle aynı anda 0x09 PHONE_VIDEO [bayraklar][Annex-B] ve 0x0A PHONE_SCREEN [gen][yük]
 //   ile gider; anahtar kare için 0x1C, pencere gizliyken 0x1D PAUSE [açık]. 0x19 TARGET [fare][klavye] (0 Mac, 1 iPhone) hangi pencerenin
 //   kullanıldığını bildirir.
+// - Ek ekranlar: Windows → Mac 0x1E LAYOUT [n][birincil gen][birincil yük]([sıra][gen u16][yük u16][x i16]
+//   [y i16])×n — Windows'taki ek monitörler (sıra 1..; birincil monitöre göre yer). Mac her biri için sanal ekran açar; görüntü 0x0B
+//   SCREEN_VIDEO [sıra][bayraklar][veri], boyut 0x0C SCREEN_SIZE [sıra][gen][yük]. 0x1F SCREEN [sıra]
+//   farenin hangi ekranda olduğu (0 ana ekran), 0x29 SCREEN_PAUSE [sıra][açık], 0x2A SCREEN_KEY [sıra].
 // - Pano: Mac → Windows 0x36 CLIP [tür: 1 metin UTF-8 | 2 BMP][veri]; Windows → Mac 0x27 CLIP
 //   [tür][bayraklar: 1 ilk, 2 son][parça] (64 KB sınırı yüzünden parçalı). Kopyalanınca gider;
 //   dosyalar ve parola yöneticilerinin gizli işaretlediği içerik gitmez.
@@ -614,7 +618,7 @@ final class Injector {
     /// Göreli hareket (fare kilitliyken): imleç yeri + delta; delta alanları oyunlar için dolu.
     func relMove(_ dx: Int16, _ dy: Int16) {
         let current = CGEvent(source: nil)?.location ?? lastPoint ?? .zero
-        let b = CGDisplayBounds(CGMainDisplayID())
+        let b = area?() ?? CGDisplayBounds(CGMainDisplayID())
         let p = CGPoint(x: min(max(current.x + CGFloat(dx), b.minX), b.maxX - 1),
                         y: min(max(current.y + CGFloat(dy), b.minY), b.maxY - 1))
         let (type, button) = moveTypes()
@@ -1053,6 +1057,115 @@ enum Files {
     }
 }
 
+// MARK: - Ana ekranı koruyan yedek ekran
+
+/// Monitörsüz Mac'te macOS'un kendi sahte ekranı ilk sanal ekran eklenince kalkar ve masaüstü o sanal
+/// ekrana geçer. Sanal ekran isteyen her kullanıcı (iPhone kipi, ek ekranlar) önce bunu ister: özgün
+/// boyutta bir yedek ekran açılır; özgün ekran kalkarsa (monitörsüz Mac) yedek ana ekran olarak kalır,
+/// kalkmazsa (monitörlü Mac) 2 sn'de kapatılır. Son kullanıcı bırakınca yedek de kalkar.
+enum MainKeeper {
+    private static var users = 0
+    private(set) static var standIn: CGVirtualDisplay?
+    private static var original: CGDirectDisplayID = 0
+    private static var since = Date()
+    private static var settled = true
+    /// Ek ekranların yeri (ana ekrana göre) ve ana ekranların sağına konan görünmez ekranlar.
+    static var origins: [CGDirectDisplayID: CGPoint] = [:]
+    static var hidden: Set<CGDirectDisplayID> = []
+
+    private static var pending = false
+    /// Bizim sanal ekranlarımızın üretici numarası ("AY").
+    static let vendor: UInt32 = 0x4159
+
+    static func acquire() {
+        users += 1
+        guard users == 1 else { return }
+        since = Date()
+        settled = false
+        pending = true
+    }
+
+    /// Özgün ekran belirlenip yedek açılır. Az önce bırakılan sanal ekranlarımız henüz kalkmadıysa ana
+    /// ekran onlardan biri görünebilir: kalkmaları beklenir (en çok 3 sn).
+    private static func begin() -> Bool {
+        let main = CGMainDisplayID()
+        if CGDisplayVendorNumber(main) == vendor && Date().timeIntervalSince(since) < 3 { return false }
+        pending = false
+        original = main
+        since = Date()
+        guard CGDisplayIsBuiltin(original) == 0 else {
+            settled = true
+            return true
+        }
+        let mode = CGDisplayCopyDisplayMode(original)
+        let size = (mode?.width ?? 1920, mode?.height ?? 1080)
+        // 96 dpi: bir piksel yaklaşık 0,26 mm.
+        standIn = PhoneMirror.makeDisplay(name: "Ayna Mac", product: 2, pixels: size, hiDPI: false,
+                                          millimeters: CGSize(width: Double(size.0) * 0.26, height: Double(size.1) * 0.26))
+        if standIn == nil { settled = true }
+        return true
+    }
+
+    static func release() {
+        guard users > 0 else { return }
+        users -= 1
+        guard users == 0 else { return }
+        standIn = nil
+        settled = true
+        pending = false
+        origins = [:]
+        hidden = []
+    }
+
+    /// Yedek ekranın sonucu belli mi (true: başka sanal ekran eklenebilir).
+    static func ready() -> Bool {
+        if pending && !begin() { return false }
+        if settled { return true }
+        guard let standIn else {
+            settled = true
+            return true
+        }
+        let waited = Date().timeIntervalSince(since)
+        if !activeDisplays().contains(original) {
+            settled = CGDisplayIsActive(standIn.displayID) != 0 || waited > 5
+            return settled
+        }
+        guard waited > 2 else { return false }
+        self.standIn = nil
+        settled = true
+        return true
+    }
+
+    static func activeDisplays() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        _ = CGGetActiveDisplayList(16, &ids, &count)
+        return Array(ids.prefix(Int(count)))
+    }
+
+    /// Ana ekran (yedek varsa o) 0,0'da; ek ekranlar Windows'taki yerlerinde; görünmez ekranlar hepsinin
+    /// sağında (fare oraya kendiliğinden kaymaz, masaüstü oraya geçmez).
+    static func arrange() {
+        let main = standIn?.displayID ?? CGMainDisplayID()
+        guard CGMainDisplayID() != main || !origins.isEmpty || !hidden.isEmpty else { return }
+        var right = CGDisplayBounds(main).width
+        for (id, p) in origins where id != main {
+            right = max(right, p.x + CGDisplayBounds(id).width)
+        }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success else { return }
+        _ = CGConfigureDisplayOrigin(config, main, 0, 0)
+        for (id, p) in origins where id != main {
+            _ = CGConfigureDisplayOrigin(config, id, Int32(p.x), Int32(p.y))
+        }
+        for id in hidden {
+            _ = CGConfigureDisplayOrigin(config, id, Int32(right), 0)
+            right += CGDisplayBounds(id).width
+        }
+        _ = CGCompleteDisplayConfiguration(config, .forSession)
+    }
+}
+
 // MARK: - iPhone Mirroring (görünmez ekranda)
 
 /// iPhone Mirroring'i Mac'in hiçbir monitöründe görünmeyen bir sanal ekranda açar; yalnız o ekranın
@@ -1063,13 +1176,8 @@ final class PhoneMirror {
     /// Uygulamanın kapanmasını bekleyen sanal ekranlar.
     private static var parked: [CGVirtualDisplay] = []
     private var display: CGVirtualDisplay?
-    /// Monitörsüz Mac: macOS'un kendi sahte ekranı, ilk sanal ekran eklenince kalkar ve masaüstü o sanal
-    /// ekrana geçer. Görünmez ekran masaüstü olmasın diye önce özgün boyutta bu yedek ekran açılır;
-    /// monitörlü Mac'te özgün ekran kalkmaz, yedek hemen kapatılır.
-    private var standIn: CGVirtualDisplay?
-    private var original: CGDirectDisplayID = 0
-    private var standInSince = Date()
-    private var standInStarted = false
+    /// Ana ekranı koruyan yedek ekran istendi (MainKeeper); bırakılması iPhone Mirroring kapanınca.
+    private var acquired = false
     private var mainChecked = false
     private var appURL: URL?
     private var timer: Timer?
@@ -1112,35 +1220,6 @@ final class PhoneMirror {
         timer = t
     }
 
-    /// Yedek ekranı açar. Yerleşik ekranı olan Mac'te gerekmez.
-    private func beginStandIn() {
-        standInStarted = true
-        original = CGMainDisplayID()
-        standInSince = Date()
-        guard CGDisplayIsBuiltin(original) == 0 else { return }
-        let mode = CGDisplayCopyDisplayMode(original)
-        let size = (mode?.width ?? 1920, mode?.height ?? 1080)
-        // 96 dpi: bir piksel yaklaşık 0,26 mm.
-        standIn = Self.makeDisplay(name: "Ayna Mac", product: 2, pixels: size, hiDPI: false,
-                                   millimeters: CGSize(width: Double(size.0) * 0.26, height: Double(size.1) * 0.26))
-    }
-
-    /// Yedek ekranın sonucu belli oldu mu? Özgün ekran kalktıysa (monitörsüz Mac) yedek kalır; 2 sn'de
-    /// kalkmadıysa yedek gereksizdir ve kapatılır.
-    private func settleStandIn() -> Bool {
-        guard let standIn else { return true }
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
-        var count: UInt32 = 0
-        _ = CGGetActiveDisplayList(16, &ids, &count)
-        let waited = Date().timeIntervalSince(standInSince)
-        if !ids.prefix(Int(count)).contains(original) {
-            return CGDisplayIsActive(standIn.displayID) != 0 || waited > 5
-        }
-        guard waited > 2 else { return false }
-        self.standIn = nil
-        return true
-    }
-
     /// Görünmez ekranı açar ve iPhone Mirroring'i başlatır.
     private func openHidden() {
         guard let url = appURL else { return }
@@ -1163,18 +1242,6 @@ final class PhoneMirror {
         }
     }
 
-    /// Ana ekran yedek ekran kalsın (masaüstü ve Dock görünmez ekrana geçmesin).
-    private func keepStandInMain(hidden: CGDirectDisplayID) {
-        guard !mainChecked, let standIn else { return }
-        mainChecked = true
-        guard CGMainDisplayID() != standIn.displayID else { return }
-        var config: CGDisplayConfigRef?
-        guard CGBeginDisplayConfiguration(&config) == .success else { return }
-        _ = CGConfigureDisplayOrigin(config, standIn.displayID, 0, 0)
-        _ = CGConfigureDisplayOrigin(config, hidden, Int32(CGDisplayBounds(standIn.displayID).width), 0)
-        _ = CGCompleteDisplayConfiguration(config, .forSession)
-    }
-
     /// Uygulamayı kapatır; sanal ekran uygulama kapanınca kaldırılır.
     func stop() {
         guard !finished else { return }
@@ -1182,14 +1249,14 @@ final class PhoneMirror {
         frame = nil
         timer?.invalidate()
         timer = nil
+        let acquired = self.acquired
         // iPhone Mirroring henüz açılmadıysa kapatılacak bir şey yok (kullanıcının kendi açtığına dokunulmaz).
-        guard display != nil else {
-            standIn = nil
+        guard let hiddenDisplay = display else {
+            if acquired { MainKeeper.release() }
             return
         }
-        let displays = [display, standIn].compactMap { $0 }
+        let displays = [hiddenDisplay]
         display = nil
-        standIn = nil
         Self.parked += displays
         let begun = Date()
         let openFinished = { [weak self] in self?.openFinished ?? true }
@@ -1200,6 +1267,9 @@ final class PhoneMirror {
             // Açılış isteği sonuçlanmadıysa uygulama birazdan belirebilir: o da kapatılana dek beklenir.
             if (apps.isEmpty && (openFinished() || waited > 8)) || waited > 20 {
                 PhoneMirror.parked.removeAll { p in displays.contains { $0 === p } }
+                MainKeeper.hidden.remove(hiddenDisplay.displayID)
+                // Görünmez ekran kalkınca yedek de bırakılır (önce kalksa pencere ana ekrana düşerdi).
+                DispatchQueue.main.async { if acquired { MainKeeper.release() } }
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { check() }
@@ -1244,10 +1314,13 @@ final class PhoneMirror {
     private func tick() {
         guard !finished else { return }
         guard let display else {
-            if !standInStarted {
-                // Önceki kipin ekranları kalkmadan başlanmaz: özgün ekran yanlış belirlenirdi.
-                if Self.parked.isEmpty { beginStandIn() }
-            } else if settleStandIn() {
+            if !acquired {
+                // Önceki kipin ekranları kalkmadan başlanmaz: ana ekran yanlış belirlenirdi.
+                if Self.parked.isEmpty {
+                    acquired = true
+                    MainKeeper.acquire()
+                }
+            } else if MainKeeper.ready() {
                 openHidden()
             }
             return
@@ -1264,7 +1337,11 @@ final class PhoneMirror {
             if elapsed > 15 { fail(L("Görünmez ekran hazır olmadı.", "The hidden display did not become ready.")) }
             return
         }
-        keepStandInMain(hidden: id)
+        if !mainChecked {
+            mainChecked = true
+            MainKeeper.hidden.insert(id)
+            MainKeeper.arrange()
+        }
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first(where: { !$0.isTerminated })
         else {
             if seenRunning { fail(L("iPhone Mirroring kapandı.", "iPhone Mirroring quit.")) } else if elapsed > 20 { fail(L("iPhone Mirroring açılmadı.", "iPhone Mirroring did not open.")) }
@@ -1346,7 +1423,7 @@ final class PhoneMirror {
     }
 
     /// 900×1000 noktalık Retina sanal ekran (iPhone penceresine yeter).
-    private static func makeDisplay(name: String, product: UInt32, pixels: (Int, Int), hiDPI: Bool,
+    static func makeDisplay(name: String, product: UInt32, pixels: (Int, Int), hiDPI: Bool,
                                     millimeters: CGSize) -> CGVirtualDisplay? {
         guard NSClassFromString("CGVirtualDisplay") != nil else { return nil }
         let descriptor = CGVirtualDisplayDescriptor()
@@ -1446,6 +1523,23 @@ final class DragPreview {
 
 // MARK: - Oturum
 
+/// Windows'taki bir ek monitörün Mac'teki sanal ekranı.
+final class ExtraScreen {
+    let index: UInt8
+    let display: CGVirtualDisplay
+    let width: Int
+    let height: Int
+    var capturer: Capturer?
+    var lookingUp = false
+
+    init(index: UInt8, display: CGVirtualDisplay, width: Int, height: Int) {
+        self.index = index
+        self.display = display
+        self.width = width
+        self.height = height
+    }
+}
+
 final class Session {
     let conn: NWConnection
     let ip: String
@@ -1472,6 +1566,24 @@ final class Session {
     private var screenObserver: NSObjectProtocol?
     private var lastLayout = ""
     private var restartWork: DispatchWorkItem?
+    /// Ek ekranlar (Windows'taki ek monitörler). Windows'un istediği düzen, açılan ekranlar, duraklatılanlar.
+    private var wantedScreens: [(index: UInt8, width: Int, height: Int, x: Int, y: Int)] = []
+    private var screens: [UInt8: ExtraScreen] = [:]
+    private var screenPaused: [UInt8: Bool] = [:]
+    private var screensAcquired = false
+    private var screenTimer: Timer?
+    private var screensArranged = true
+    private var screenRestarts: [UInt8: [Date]] = [:]
+    /// Ek ekran başına açma denemesi (sanal ekran açılamazsa sonsuza dek denenmez).
+    private var screenAttempts: [UInt8: Int] = [:]
+    /// Windows'un istediği ekran (henüz açılmamış olabilir: açılınca uygulanır).
+    private var wantedMouse: UInt8 = 0
+    /// Windows'un birincil monitörünün boyutu (ek ekranların yeri buna göre).
+    private var windowsPrimary = (width: 1920, height: 1080)
+    /// Yalnız `sendQueue` üzerinde: ekran başına anahtar kare bekleniyor mu.
+    private var screenNeedKey: [UInt8: Bool] = [:]
+    /// Farenin bulunduğu ek ekran (0: ana ekran).
+    private var screenMouse: UInt8 = 0
     /// Pano: en son görülen değişiklik sayacı, en son gönderilen ya da alınan içeriğin özeti ve
     /// Windows'tan parça parça gelen içerik.
     private var clipTimer: Timer?
@@ -2134,6 +2246,7 @@ final class Session {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.stage == .streaming else { return }
             self.startCapture()
+            self.restartScreens()
         }
         restartWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
@@ -2181,6 +2294,194 @@ final class Session {
         }
     }
 
+    /// Fare olaylarının eşlendiği alan: iPhone penceresi, ek ekran ya da ana ekran.
+    private func updateArea() {
+        if phoneMouse, let p = phone {
+            injector.area = { [weak p] in p?.frame }
+        } else if wantedMouse != 0, let s = screens[wantedMouse] {
+            screenMouse = wantedMouse
+            let id = s.display.displayID
+            injector.area = { CGDisplayBounds(id) }
+        } else {
+            screenMouse = 0
+            injector.area = nil
+        }
+    }
+
+    // --- Ek ekranlar
+
+    /// Windows ek monitör düzenini bildirdi: eksik ekranlar açılır, fazlalar kaldırılır.
+    private func setLayout(_ b: [UInt8]) {
+        var wanted: [(index: UInt8, width: Int, height: Int, x: Int, y: Int)] = []
+        let n = Int(b[1])
+        if n > 0, b.count >= 6 {
+            windowsPrimary = (Int(b[2]) << 8 | Int(b[3]), Int(b[4]) << 8 | Int(b[5]))
+        }
+        for i in 0..<n {
+            let o = 6 + i * 9
+            guard b.count >= o + 9 else { break }
+            let w = Int(b[o + 1]) << 8 | Int(b[o + 2]), h = Int(b[o + 3]) << 8 | Int(b[o + 4])
+            let x = Int(Int16(bitPattern: UInt16(b[o + 5]) << 8 | UInt16(b[o + 6])))
+            let y = Int(Int16(bitPattern: UInt16(b[o + 7]) << 8 | UInt16(b[o + 8])))
+            guard b[o] != 0, (320...7680).contains(w), (240...4320).contains(h),
+                  !wanted.contains(where: { $0.index == b[o] }) else { continue }
+            wanted.append((b[o], w, h, x, y))
+        }
+        screenAttempts = [:]
+        wantedScreens = Array(wanted.prefix(8))
+        applyScreens()
+    }
+
+    private func applyScreens() {
+        for (index, s) in screens {
+            let keep = wantedScreens.contains { $0.index == index && $0.width == s.width && $0.height == s.height }
+            guard !keep else { continue }
+            removeScreen(index)
+        }
+        for want in wantedScreens {
+            if let s = screens[want.index] { MainKeeper.origins[s.display.displayID] = macOrigin(want.x, want.y) }
+        }
+        if wantedScreens.isEmpty {
+            screenTimer?.invalidate()
+            screenTimer = nil
+            if screensAcquired {
+                screensAcquired = false
+                MainKeeper.release()
+            }
+            return
+        }
+        if !screensAcquired {
+            screensAcquired = true
+            MainKeeper.acquire()
+        }
+        screensArranged = false
+        startScreenTimer()
+    }
+
+    private func removeScreen(_ index: UInt8) {
+        guard let s = screens.removeValue(forKey: index) else { return }
+        s.capturer?.stop()
+        MainKeeper.origins.removeValue(forKey: s.display.displayID)
+        if screenMouse == index { updateArea() }
+    }
+
+    /// Windows'taki yer (birincil monitöre göre) → Mac'teki yer (ana ekrana göre). Mac'in ana ekranı
+    /// Windows'un birincil monitöründen farklı boyutta olabilir: sağdaki/alttaki ekranlar ana ekranın
+    /// kenarına bitiştirilir (üst üste binmesin).
+    private func macOrigin(_ x: Int, _ y: Int) -> CGPoint {
+        let main = CGDisplayBounds(MainKeeper.standIn?.displayID ?? CGMainDisplayID())
+        let mx = x >= windowsPrimary.width ? x - windowsPrimary.width + Int(main.width) : x
+        let my = y >= windowsPrimary.height ? y - windowsPrimary.height + Int(main.height) : y
+        return CGPoint(x: mx, y: my)
+    }
+
+    private func startScreenTimer() {
+        guard screenTimer == nil else { return }
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.screenTick() }
+        RunLoop.main.add(t, forMode: .common)
+        screenTimer = t
+    }
+
+    /// Yedek ekran hazır olunca ek ekranlar açılır, yerlerine konur, yakalanır.
+    private func screenTick() {
+        guard stage == .streaming, MainKeeper.ready() else { return }
+        for want in wantedScreens where screens[want.index] == nil {
+            let tries = screenAttempts[want.index, default: 0]
+            guard tries < 20 else { continue }
+            screenAttempts[want.index] = tries + 1
+            let mm = CGSize(width: Double(want.width) * 0.26, height: Double(want.height) * 0.26)
+            guard let d = PhoneMirror.makeDisplay(name: "Ayna Mac \(Int(want.index) + 1)", product: 10 + UInt32(want.index),
+                                                  pixels: (want.width, want.height), hiDPI: false, millimeters: mm) else {
+                if tries + 1 == 20 {
+                    sendState(mode: 2, ok: true, L("Ek Mac ekranı açılamadı.", "An extra Mac display could not be created."))
+                }
+                continue
+            }
+            screens[want.index] = ExtraScreen(index: want.index, display: d, width: want.width, height: want.height)
+            MainKeeper.origins[d.displayID] = macOrigin(want.x, want.y)
+            screensArranged = false
+            if wantedMouse == want.index { updateArea() }
+        }
+        let active = screens.values.allSatisfy { CGDisplayIsActive($0.display.displayID) != 0 }
+        guard active else { return }
+        if !screensArranged {
+            screensArranged = true
+            MainKeeper.arrange()
+        }
+        var done = wantedScreens.allSatisfy { screens[$0.index] != nil || screenAttempts[$0.index, default: 0] >= 20 }
+        for s in screens.values where s.capturer == nil {
+            done = false
+            if !s.lookingUp { startScreenCapture(s) }
+        }
+        if done {
+            screenTimer?.invalidate()
+            screenTimer = nil
+        }
+    }
+
+    private func startScreenCapture(_ s: ExtraScreen) {
+        s.lookingUp = true
+        let id = s.display.displayID
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+            let found = content?.displays.first(where: { $0.displayID == id })
+            DispatchQueue.main.async { [weak self, weak s] in
+                guard let self, let s else { return }
+                s.lookingUp = false
+                guard let found, self.stage == .streaming, self.screens[s.index] === s else { return }
+                let index = s.index
+                let bounds = CGDisplayBounds(id)
+                let cap = Capturer(
+                    region: (found, CGRect(origin: .zero, size: bounds.size), 1),
+                    paused: self.screenPaused[index] ?? true,
+                    cursor: false,
+                    onFrame: { [weak self] data, key in self?.sendScreenVideo(index, data, key: key) },
+                    onSize: { [weak self] w, h in
+                        self?.send(Data([0x0C, index] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
+                    },
+                    onError: { [weak self] _ in DispatchQueue.main.async { self?.screenCaptureFailed(index) } })
+                s.capturer?.stop()
+                s.capturer = cap
+                cap.start()
+            }
+        }
+    }
+
+    private func screenCaptureFailed(_ index: UInt8) {
+        guard stage == .streaming, let s = screens[index], allowRestart(&screenRestarts[index, default: []]) else { return }
+        s.capturer?.stop()
+        s.capturer = nil
+        startScreenTimer()
+    }
+
+    /// Ekran düzeni değişti: ek ekranların yakalaması yeniden kurulur.
+    private func restartScreens() {
+        guard !screens.isEmpty else { return }
+        for s in screens.values {
+            s.capturer?.stop()
+            s.capturer = nil
+        }
+        startScreenTimer()
+    }
+
+    private func sendScreenVideo(_ index: UInt8, _ data: Data, key: Bool) {
+        sendQueue.async { [weak self] in
+            guard let self else { return }
+            let pending = self.inFlight - self.fileInFlight
+            if pending > 512_000 {
+                self.screenNeedKey[index] = true
+                return
+            }
+            if self.screenNeedKey[index] == true && !key {
+                if pending < 128_000 {
+                    DispatchQueue.main.async { self.screens[index]?.capturer?.requestKeyframe() }
+                }
+                return
+            }
+            if key { self.screenNeedKey[index] = false }
+            self.sendNow(Data([0x0B, index, key ? 1 : 0]) + data)
+        }
+    }
+
     private func endPhone() {
         setPhoneTarget(mouse: false, keyboard: false)
         phoneCapturer?.stop()
@@ -2218,11 +2519,8 @@ final class Session {
                     injector.relative = false
                     send(Data([0x08, 0]))
                 }
-                let p = phone
-                injector.area = { [weak p] in p?.frame }
-            } else {
-                injector.area = nil
             }
+            updateArea()
         }
         if keyboard != phoneKeyboard {
             phoneKeyboard = keyboard
@@ -2302,6 +2600,16 @@ final class Session {
             setPhoneTarget(mouse: b[1] == 1, keyboard: b[2] == 1)
         case 0x1C:
             phoneCapturer?.requestKeyframe()
+        case 0x1E where b.count >= 2:
+            setLayout(b)
+        case 0x1F where b.count >= 2:
+            wantedMouse = b[1]
+            updateArea()
+        case 0x29 where b.count >= 3:
+            screenPaused[b[1]] = b[2] == 1
+            screens[b[1]]?.capturer?.setPaused(b[2] == 1)
+        case 0x2A where b.count >= 2:
+            screens[b[1]]?.capturer?.requestKeyframe()
         case 0x1D where b.count >= 2:
             phonePaused = b[1] == 1
             phoneCapturer?.setPaused(phonePaused)
@@ -2531,6 +2839,9 @@ final class Session {
         capturer?.stop()
         capturer = nil
         endPhone()
+        wantedScreens = []
+        for index in Array(screens.keys) { removeScreen(index) }
+        applyScreens()
         injector.releaseAll()
         sendQueue.async { [self] in filesCancelled = true }
         fileQueue.async { [self] in

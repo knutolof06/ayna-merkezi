@@ -181,6 +181,20 @@ pub fn icon_rect_for(device: Device) -> Option<RECT> {
     })
 }
 
+/// Cihazın verilen monitördeki (görünür) ikonunun yeri.
+pub fn icon_rect_on(device: Device, monitor: &RECT) -> Option<RECT> {
+    ICONS.with(|c| {
+        let v = c.try_borrow().ok()?;
+        v.iter()
+            .filter(|i| i.device == device && i.shown)
+            .find(|i| {
+                let (x, y) = ((i.bounds.left + i.bounds.right) / 2, (i.bounds.top + i.bounds.bottom) / 2);
+                x >= monitor.left && x < monitor.right && y >= monitor.top && y < monitor.bottom
+            })
+            .map(|i| i.bounds)
+    })
+}
+
 /// iPhone ikonunun yeri (yansıtma penceresi ve bildirimler bunu kullanır).
 pub fn icon_rect() -> Option<RECT> {
     icon_rect_for(Device::IPhone)

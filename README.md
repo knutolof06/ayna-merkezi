@@ -83,6 +83,11 @@ devices prove their identity with a pairing key and connect automatically.
   **hold Ctrl for 10 seconds** (a countdown appears; nothing is sent to the game besides Ctrl). Click the window
   to capture again; Alt+Tab also releases it.
 - **Mac icon right-click:** Mac screen size, *Show iPhone via Mac*, *Disconnect*, *Settings*, *Quit*.
+- **Several monitors:** Settings › Mac › *Screens*: *Single window* (default), *Same screen* (the Mac icon on each
+  extra monitor opens a window with the same Mac screen) or *Separate screens* (each extra monitor becomes its own
+  Mac display, arranged like the Windows monitors; the Mac desktop spans them). Windows open only from that
+  monitor's Mac icon; its right-click menu can remove the monitor from the Mac or add it back. Separate screens
+  need the current Ayna Ajan and use more bandwidth (one video stream per screen).
 - **iPhone via Mac (experimental):** *Show iPhone via Mac* starts the Mac's iPhone Mirroring without opening a
   window; the **iPhone taskbar icon** then shows it in the usual iPhone window, next to the Mac window, while the
   iPhone stays locked with its screen off. The mouse follows the window under the pointer, the keyboard follows

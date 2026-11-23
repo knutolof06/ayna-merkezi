@@ -84,6 +84,17 @@ const MSG_TARGET: u8 = 0x19;
 const MSG_PHONE_KEYFRAME: u8 = 0x1C;
 /// Windows → Mac: iPhone penceresi gizli, görüntü dursun [açık].
 const MSG_PHONE_PAUSE: u8 = 0x1D;
+/// Windows → Mac: ek monitörler [n][birincil gen u16][birincil yük u16]([sıra][gen u16][yük u16][x i16][y i16])×n
+/// (ayrı ekranlar kipi; yer birincil monitörün sol üstüne göre).
+const MSG_LAYOUT: u8 = 0x1E;
+/// Windows → Mac: fare hangi ek ekranda [sıra] (0 ana ekran).
+const MSG_SCREEN_TARGET: u8 = 0x1F;
+/// Windows → Mac: ek ekran penceresi gizli [sıra][açık]; anahtar kare [sıra].
+const MSG_SCREEN_PAUSE: u8 = 0x29;
+const MSG_SCREEN_KEYFRAME: u8 = 0x2A;
+/// Mac → Windows: ek ekranın görüntüsü [sıra][bayraklar][Annex-B] ve boyutu [sıra][gen][yük].
+const MSG_SCREEN_VIDEO: u8 = 0x0B;
+const MSG_SCREEN_SIZE: u8 = 0x0C;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -132,6 +143,8 @@ pub const WM_APP_LOCK: u32 = WM_APP + 30;
 pub const WM_APP_PHONE: u32 = WM_APP + 31;
 /// Mac'te bir şey kopyalandı (`Mac::take_clipboard`).
 pub const WM_APP_CLIP: u32 = WM_APP + 32;
+/// Bir ek ekranın görüntü boyutu geldi.
+pub const WM_APP_SCREENS: u32 = WM_APP + 33;
 /// Mac'te sürüklenen dosyalar bildirildi; alınmaya başlanabilir.
 pub const FILES_LISTED: usize = 1;
 /// Mac'ten sürüklenen dosyaların hepsi geldi.
@@ -218,6 +231,16 @@ struct Shared {
     clip_in: Mutex<Option<(u8, Vec<u8>)>>,
     /// Aynı anda tek pano gönderilir.
     clip_lock: Mutex<()>,
+    /// Ek Mac ekranlarının oynatıcıları ve görüntü boyutları (Windows'taki sıra numarasıyla).
+    screen_players: Mutex<HashMap<u8, Player>>,
+    screen_sizes: Mutex<HashMap<u8, (u16, u16)>>,
+    /// Aynı ekran kipi: ana görüntü ek pencerelere de gider.
+    mirror: AtomicBool,
+    /// Mac'e bildirilen düzen iletisi (yeniden bağlanınca yinelenir), duraklatılan ek ekranlar ve
+    /// farenin bulunduğu ek ekran.
+    layout: Mutex<Vec<u8>>,
+    screen_paused: Mutex<HashMap<u8, bool>>,
+    screen_target: AtomicU32,
     /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
     phone_player: Mutex<Option<Player>>,
     phone_screen: Mutex<Option<(u16, u16)>>,
@@ -314,6 +337,12 @@ impl Mac {
                 pointer_lock: AtomicBool::new(false),
                 clip_in: Mutex::new(None),
                 clip_lock: Mutex::new(()),
+                screen_players: Mutex::new(HashMap::new()),
+                screen_sizes: Mutex::new(HashMap::new()),
+                mirror: AtomicBool::new(false),
+                layout: Mutex::new(vec![MSG_LAYOUT, 0]),
+                screen_paused: Mutex::new(HashMap::new()),
+                screen_target: AtomicU32::new(0),
                 phone_player: Mutex::new(None),
                 phone_screen: Mutex::new(None),
                 phone_paused: AtomicBool::new(true),
@@ -527,6 +556,79 @@ impl Mac {
                 }
             }
         });
+    }
+
+    // --- Ek ekranlar
+
+    /// Aynı ekran kipi: ana görüntü ek pencerelerde de gösterilir.
+    pub fn set_mirror(&self, on: bool) {
+        self.shared.mirror.store(on, Ordering::SeqCst);
+    }
+
+    /// Ayrı ekranlar kipinde Mac'te açılacak ek ekranlar (boşsa hepsi kapanır).
+    pub fn set_layout(&self, primary: (u16, u16), screens: &[(u8, u16, u16, i16, i16)]) {
+        let mut m = vec![MSG_LAYOUT, screens.len() as u8];
+        if !screens.is_empty() {
+            m.extend_from_slice(&primary.0.to_be_bytes());
+            m.extend_from_slice(&primary.1.to_be_bytes());
+        }
+        for &(index, w, h, x, y) in screens {
+            m.push(index);
+            m.extend_from_slice(&w.to_be_bytes());
+            m.extend_from_slice(&h.to_be_bytes());
+            m.extend_from_slice(&x.to_be_bytes());
+            m.extend_from_slice(&y.to_be_bytes());
+        }
+        let mut layout = self.shared.layout.lock().unwrap();
+        if *layout == m {
+            return;
+        }
+        *layout = m.clone();
+        drop(layout);
+        self.shared.screen_sizes.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
+        self.shared.screen_paused.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
+        self.send(m);
+    }
+
+    pub fn screen_size(&self, index: u8) -> Option<(u16, u16)> {
+        self.shared.screen_sizes.lock().unwrap().get(&index).copied()
+    }
+
+    pub fn has_screen_player(&self, index: u8) -> bool {
+        self.shared.screen_players.lock().unwrap().contains_key(&index)
+    }
+
+    /// Ek ekran penceresinin oynatıcısı; yenisi kurulunca anahtar kare istenir.
+    pub fn set_screen_player(&self, index: u8, player: Option<Player>) {
+        let fresh = player.is_some();
+        let old = match player {
+            Some(p) => self.shared.screen_players.lock().unwrap().insert(index, p),
+            None => self.shared.screen_players.lock().unwrap().remove(&index),
+        };
+        // Eski hat kilit dışında ve ayrı iş parçacığında kapatılır.
+        if let Some(old) = old {
+            std::thread::spawn(move || drop(old));
+        }
+        if fresh {
+            if self.shared.mirror.load(Ordering::SeqCst) {
+                self.send(vec![MSG_KEYFRAME]);
+            } else {
+                self.send(vec![MSG_SCREEN_KEYFRAME, index]);
+            }
+        }
+    }
+
+    /// Ek ekran penceresi gizlendi ya da açıldı (Mac o ekranın görüntüsünü durdurur/sürdürür).
+    pub fn set_screen_paused(&self, index: u8, paused: bool) {
+        self.shared.screen_paused.lock().unwrap().insert(index, paused);
+        self.send(vec![MSG_SCREEN_PAUSE, index, u8::from(paused)]);
+    }
+
+    /// Fare bu ek ekranda (0: ana ekran); değiştiyse Mac'e bildirilir.
+    pub fn set_screen_target(&self, index: u8) {
+        if self.shared.screen_target.swap(index as u32, Ordering::SeqCst) != index as u32 {
+            self.send(vec![MSG_SCREEN_TARGET, index]);
+        }
     }
 
     /// Ayarlarda pano paylaşımı açıldı ya da kapandı.
@@ -1028,6 +1130,16 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     }
     let _ = tx.send(vec![MSG_LOCAL_CURSOR]);
     let _ = tx.send(vec![MSG_CLIP_ENABLE, u8::from(crate::clipboard::enabled())]);
+    // Ek ekranlar: düzen ve pencere durumları yeni oturuma yinelenir.
+    // Ek ekran yoksa (tek pencere / aynı ekran) hiçbir şey gönderilmez: eski davranışla aynı.
+    let layout = shared.layout.lock().unwrap().clone();
+    if layout.len() > 2 {
+        let _ = tx.send(layout);
+    }
+    for (&index, &paused) in shared.screen_paused.lock().unwrap().iter() {
+        let _ = tx.send(vec![MSG_SCREEN_PAUSE, index, u8::from(paused)]);
+    }
+    shared.screen_target.store(0, Ordering::SeqCst);
     if shared.phone.load(Ordering::SeqCst) {
         shared.phone_quiet.store(true, Ordering::SeqCst);
         *shared.phone_asked.lock().unwrap() = Some(Instant::now());
@@ -1071,6 +1183,27 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                 stats.frame(plain.len(), plain[1] & 1 == 1);
                 if let Some(p) = shared.player.lock().unwrap().as_ref() {
                     p.push(&plain[2..]);
+                }
+                if shared.mirror.load(Ordering::SeqCst) {
+                    for p in shared.screen_players.lock().unwrap().values() {
+                        p.push(&plain[2..]);
+                    }
+                }
+            }
+            MSG_SCREEN_VIDEO if plain.len() > 3 => {
+                if !shared.mirror.load(Ordering::SeqCst) {
+                    if let Some(p) = shared.screen_players.lock().unwrap().get(&plain[1]) {
+                        p.push(&plain[3..]);
+                    }
+                }
+            }
+            MSG_SCREEN_SIZE if plain.len() >= 6 => {
+                let size = (u16::from_be_bytes([plain[2], plain[3]]), u16::from_be_bytes([plain[4], plain[5]]));
+                if size.0 > 0 && size.1 > 0 {
+                    shared.screen_sizes.lock().unwrap().insert(plain[1], size);
+                    unsafe {
+                        let _ = PostMessageW(HWND(notify as _), WM_APP_SCREENS, WPARAM(0), LPARAM(0));
+                    }
                 }
             }
             MSG_CLIP_IN if plain.len() >= 2 => {

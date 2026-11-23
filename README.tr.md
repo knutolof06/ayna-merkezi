@@ -154,6 +154,12 @@ penceresine hapsedilir ve gizlenir; farenin ham hareketi Mac'e göreli gider, ka
 bırakmak için **Ctrl'yi 10 saniye basılı tutun** (ekranda sayaç çıkar; oyuna Ctrl dışında hiçbir şey gitmez);
 yeniden kilitlemek için pencereye tıklayın. Pencereden çıkınca (Alt+Tab) kilit kendiliğinden açılır.
 
+**Birden çok monitör:** Ayarlar › Mac › "Ekranlar": "Tek pencere" (varsayılan), "Aynı ekran" (her ek monitördeki
+Mac ikonu aynı Mac ekranını gösteren bir pencere açar) ya da "Ayrı ekranlar" (her ek monitör Mac'in ayrı bir
+ekranı olur, Windows'taki gibi dizilir; Mac masaüstü monitörlere yayılır). Pencereler yalnız o monitördeki Mac
+ikonuyla açılır; ikonun sağ tık menüsünden monitör Mac'ten kaldırılıp geri eklenebilir. Ayrı ekranlar güncel
+Ayna Ajan ister ve ekran başına bir görüntü akışı olduğu için daha çok bant kullanır.
+
 **Mac ikonuna sağ tık:** Mac ekran boyutu (kaydırıcı), "iPhone'u Mac üzerinden göster", "Bağlantıyı kes",
 "Ayarları aç" ve "Çık". iPhone ikonunun sağ tık menüsünde de "Bağlantıyı kes", "Ayarları aç",
 "Güncellemeleri denetle" ve "Çık" var.
