@@ -4,3 +4,4 @@
 *.log
 /_eski_aethercast/
 /mac-agent/build/
+/graphify-out/
