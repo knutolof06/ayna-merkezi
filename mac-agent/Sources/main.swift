@@ -42,6 +42,7 @@
 //   [y i16])×n — Windows'taki ek monitörler (sıra 1..; birincil monitöre göre yer). Mac her biri için sanal ekran açar; görüntü 0x0B
 //   SCREEN_VIDEO [sıra][bayraklar][veri], boyut 0x0C SCREEN_SIZE [sıra][gen][yük]. 0x1F SCREEN [sıra]
 //   farenin hangi ekranda olduğu (0 ana ekran), 0x29 SCREEN_PAUSE [sıra][açık], 0x2A SCREEN_KEY [sıra].
+// - Tanı: Mac → Windows 0x0D LOG [metin] (Windows günlüğüne yazılır), 0x0E AGENT [sürüm u32] oturum başında.
 // - Pano: Mac → Windows 0x36 CLIP [tür: 1 metin UTF-8 | 2 BMP][veri]; Windows → Mac 0x27 CLIP
 //   [tür][bayraklar: 1 ilk, 2 son][parça] (64 KB sınırı yüzünden parçalı). Kopyalanınca gider;
 //   dosyalar ve parola yöneticilerinin gizli işaretlediği içerik gitmez.
@@ -1578,6 +1579,8 @@ final class Session {
     private var screenAttempts: [UInt8: Int] = [:]
     /// Windows'un istediği ekran (henüz açılmamış olabilir: açılınca uygulanır).
     private var wantedMouse: UInt8 = 0
+    private var screenWaitLogged = false
+    private var screenWaitSince = Date()
     /// Windows'un birincil monitörünün boyutu (ek ekranların yeri buna göre).
     private var windowsPrimary = (width: 1920, height: 1080)
     /// Yalnız `sendQueue` üzerinde: ekran başına anahtar kare bekleniyor mu.
@@ -1919,6 +1922,8 @@ final class Session {
         lastData = Date()
         app?.sessionStarted(self)
         startCapture()
+        // Windows, eski bir ajanla konuştuğunu anlasın (yeni özellikler için güncelleme uyarısı).
+        send(Data([0x0E]) + Data(be32(UInt32(clamping: max(0, Updater.build)))))
         lastLayout = displayLayout()
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
@@ -2310,6 +2315,11 @@ final class Session {
 
     // --- Ek ekranlar
 
+    /// Windows günlüğüne bir satır (ek ekranlar gibi Mac'te görünmeyen adımlar izlenebilsin).
+    private func remoteLog(_ text: String) {
+        send(Data([0x0D]) + Data(text.utf8))
+    }
+
     /// Windows ek monitör düzenini bildirdi: eksik ekranlar açılır, fazlalar kaldırılır.
     private func setLayout(_ b: [UInt8]) {
         var wanted: [(index: UInt8, width: Int, height: Int, x: Int, y: Int)] = []
@@ -2328,6 +2338,8 @@ final class Session {
             wanted.append((b[o], w, h, x, y))
         }
         screenAttempts = [:]
+        remoteLog("Ek ekranlar istendi: \(wanted.map { "\($0.index) \($0.width)×\($0.height) @\($0.x),\($0.y)" }.joined(separator: ", "))")
+        screenWaitLogged = false
         wantedScreens = Array(wanted.prefix(8))
         applyScreens()
     }
@@ -2355,6 +2367,7 @@ final class Session {
             MainKeeper.acquire()
         }
         screensArranged = false
+        screenWaitSince = Date()
         startScreenTimer()
     }
 
@@ -2384,7 +2397,14 @@ final class Session {
 
     /// Yedek ekran hazır olunca ek ekranlar açılır, yerlerine konur, yakalanır.
     private func screenTick() {
-        guard stage == .streaming, MainKeeper.ready() else { return }
+        guard stage == .streaming else { return }
+        guard MainKeeper.ready() else {
+            if !screenWaitLogged && Date().timeIntervalSince(screenWaitSince) > 6 {
+                screenWaitLogged = true
+                remoteLog("Ek ekranlar: ana ekran yedeği hazır olmadı (ana ekran \(CGMainDisplayID()))")
+            }
+            return
+        }
         for want in wantedScreens where screens[want.index] == nil {
             let tries = screenAttempts[want.index, default: 0]
             guard tries < 20 else { continue }
@@ -2393,17 +2413,26 @@ final class Session {
             guard let d = PhoneMirror.makeDisplay(name: "Ayna Mac \(Int(want.index) + 1)", product: 10 + UInt32(want.index),
                                                   pixels: (want.width, want.height), hiDPI: false, millimeters: mm) else {
                 if tries + 1 == 20 {
+                    remoteLog("Ek ekran \(want.index): sanal ekran açılamadı")
                     sendState(mode: 2, ok: true, L("Ek Mac ekranı açılamadı.", "An extra Mac display could not be created."))
                 }
                 continue
             }
+            remoteLog("Ek ekran \(want.index): sanal ekran \(d.displayID) açıldı")
             screens[want.index] = ExtraScreen(index: want.index, display: d, width: want.width, height: want.height)
             MainKeeper.origins[d.displayID] = macOrigin(want.x, want.y)
             screensArranged = false
             if wantedMouse == want.index { updateArea() }
         }
         let active = screens.values.allSatisfy { CGDisplayIsActive($0.display.displayID) != 0 }
-        guard active else { return }
+        guard active else {
+            if !screenWaitLogged && Date().timeIntervalSince(screenWaitSince) > 8 {
+                screenWaitLogged = true
+                let idle = screens.values.filter { CGDisplayIsActive($0.display.displayID) == 0 }.map { "\($0.index)" }
+                remoteLog("Ek ekranlar: etkinleşmeyen ekran(lar) \(idle.joined(separator: ", ")); etkin ekranlar \(MainKeeper.activeDisplays())")
+            }
+            return
+        }
         if !screensArranged {
             screensArranged = true
             MainKeeper.arrange()
@@ -2427,9 +2456,14 @@ final class Session {
             DispatchQueue.main.async { [weak self, weak s] in
                 guard let self, let s else { return }
                 s.lookingUp = false
-                guard let found, self.stage == .streaming, self.screens[s.index] === s else { return }
+                guard self.stage == .streaming, self.screens[s.index] === s else { return }
+                guard let found else {
+                    self.remoteLog("Ek ekran \(s.index): ekran yakalama listesinde yok (yeniden denenecek)")
+                    return
+                }
                 let index = s.index
                 let bounds = CGDisplayBounds(id)
+                self.remoteLog("Ek ekran \(index): yakalanıyor \(Int(bounds.width))×\(Int(bounds.height)) @\(Int(bounds.minX)),\(Int(bounds.minY))")
                 let cap = Capturer(
                     region: (found, CGRect(origin: .zero, size: bounds.size), 1),
                     paused: self.screenPaused[index] ?? true,
@@ -2438,7 +2472,12 @@ final class Session {
                     onSize: { [weak self] w, h in
                         self?.send(Data([0x0C, index] + be16(UInt16(clamping: w)) + be16(UInt16(clamping: h))))
                     },
-                    onError: { [weak self] _ in DispatchQueue.main.async { self?.screenCaptureFailed(index) } })
+                    onError: { [weak self] message in
+                        DispatchQueue.main.async {
+                            self?.remoteLog("Ek ekran \(index): \(message)")
+                            self?.screenCaptureFailed(index)
+                        }
+                    })
                 s.capturer?.stop()
                 s.capturer = cap
                 cap.start()

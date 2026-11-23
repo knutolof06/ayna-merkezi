@@ -576,8 +576,9 @@ unsafe fn paint(hwnd: HWND) {
     if waiting {
         let mut c = RECT::default();
         let _ = GetClientRect(hwnd, &mut c);
-        let text = if mode() == Mode::Extended {
-            t("Mac ekranı açılıyor… (Mac'teki Ayna Ajan güncel olmalı)", "Opening the Mac screen… (Ayna Ajan on the Mac must be up to date)")
+        let old_agent = macview::with_mac(|m| m.connected() && m.agent_build() == 0).unwrap_or(false);
+        let text = if mode() == Mode::Extended && old_agent {
+            t("Mac'teki Ayna Ajan güncel değil: Mac'te menüden güncelleyin.", "Ayna Ajan on the Mac is out of date: update it from its menu.")
         } else {
             t("Mac ekranı açılıyor…", "Opening the Mac screen…")
         };

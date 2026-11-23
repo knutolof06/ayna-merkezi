@@ -95,6 +95,9 @@ const MSG_SCREEN_KEYFRAME: u8 = 0x2A;
 /// Mac → Windows: ek ekranın görüntüsü [sıra][bayraklar][Annex-B] ve boyutu [sıra][gen][yük].
 const MSG_SCREEN_VIDEO: u8 = 0x0B;
 const MSG_SCREEN_SIZE: u8 = 0x0C;
+/// Mac → Windows: günlük satırı [metin]; ajanın sürümü [u32] (oturum başında; eski ajan göndermez).
+const MSG_LOG: u8 = 0x0D;
+const MSG_AGENT: u8 = 0x0E;
 // Windows → Mac
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -241,6 +244,8 @@ struct Shared {
     layout: Mutex<Vec<u8>>,
     screen_paused: Mutex<HashMap<u8, bool>>,
     screen_target: AtomicU32,
+    /// Mac'teki Ayna Ajan'ın sürümü (0: bildirmedi, yani eski).
+    agent_build: AtomicU32,
     /// iPhone penceresinin oynatıcısı ve görüntü boyutu.
     phone_player: Mutex<Option<Player>>,
     phone_screen: Mutex<Option<(u16, u16)>>,
@@ -343,6 +348,7 @@ impl Mac {
                 layout: Mutex::new(vec![MSG_LAYOUT, 0]),
                 screen_paused: Mutex::new(HashMap::new()),
                 screen_target: AtomicU32::new(0),
+                agent_build: AtomicU32::new(0),
                 phone_player: Mutex::new(None),
                 phone_screen: Mutex::new(None),
                 phone_paused: AtomicBool::new(true),
@@ -585,9 +591,15 @@ impl Mac {
         }
         *layout = m.clone();
         drop(layout);
+        util::log(&format!("Mac ek ekran düzeni: {screens:?}"));
         self.shared.screen_sizes.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
         self.shared.screen_paused.lock().unwrap().retain(|i, _| screens.iter().any(|s| s.0 == *i));
         self.send(m);
+    }
+
+    /// Mac'teki Ayna Ajan'ın sürümü (0: bilinmiyor, eski bir sürüm).
+    pub fn agent_build(&self) -> u32 {
+        self.shared.agent_build.load(Ordering::SeqCst)
     }
 
     pub fn screen_size(&self, index: u8) -> Option<(u16, u16)> {
@@ -1140,6 +1152,7 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
         let _ = tx.send(vec![MSG_SCREEN_PAUSE, index, u8::from(paused)]);
     }
     shared.screen_target.store(0, Ordering::SeqCst);
+    shared.agent_build.store(0, Ordering::SeqCst);
     if shared.phone.load(Ordering::SeqCst) {
         shared.phone_quiet.store(true, Ordering::SeqCst);
         *shared.phone_asked.lock().unwrap() = Some(Instant::now());
@@ -1197,7 +1210,19 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
                     }
                 }
             }
+            MSG_LOG => {
+                let text: String = String::from_utf8_lossy(&plain[1..]).chars().take(300).collect();
+                util::log(&format!("Mac: {text}"));
+            }
+            MSG_AGENT if plain.len() >= 5 => {
+                let build = u32::from_be_bytes([plain[1], plain[2], plain[3], plain[4]]);
+                shared.agent_build.store(build, Ordering::SeqCst);
+                util::log(&format!("Mac'teki Ayna Ajan sürümü: {build}"));
+            }
             MSG_SCREEN_SIZE if plain.len() >= 6 => {
+                if shared.screen_sizes.lock().unwrap().get(&plain[1]).is_none() {
+                    util::log(&format!("Mac ek ekran {}: görüntü geliyor", plain[1]));
+                }
                 let size = (u16::from_be_bytes([plain[2], plain[3]]), u16::from_be_bytes([plain[4], plain[5]]));
                 if size.0 > 0 && size.1 > 0 {
                     shared.screen_sizes.lock().unwrap().insert(plain[1], size);
