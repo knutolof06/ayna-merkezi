@@ -1,9 +1,13 @@
 //! Kısa süre görünen bildirim balonu ("3 dosya gönderildi" gibi).
 //!
 //! Yansıtma penceresi açıksa onun üst kenarında, kapalıysa görev çubuğu ikonunun üstünde
-//! belirir; odak çalmaz, birkaç saniye sonra ya da tıklanınca kaybolur.
+//! belirir; odak çalmaz, birkaç saniye sonra kaybolur. Tıklamaları altındaki pencereye geçirir: oyun
+//! fareyi kilitliyken ileti kuyruğu ham fare iletileriyle dolar, Windows zamanlayıcı ve çizim iletilerini
+//! ancak kuyruk boşalınca üretir; balon o sırada gizlenemeyip ekranda görünmez bir engel olarak
+//! kalmasın diye süre fare iletileri arasında da denetlenir (`expire`).
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -22,6 +26,8 @@ struct Toast {
     hwnd: HWND,
     text: String,
     font: HFONT,
+    /// Bu andan sonra gizlenir.
+    until: Option<Instant>,
 }
 
 thread_local! {
@@ -40,6 +46,7 @@ pub fn show(owner: HWND, text: &str) {
             let mut t = t.borrow_mut();
             let toast = t.as_mut()?;
             toast.text = text.to_string();
+            toast.until = Some(Instant::now() + Duration::from_millis(VISIBLE_MS as u64));
             Some(std::mem::replace(&mut toast.font, font))
         });
         if let Some(old) = old {
@@ -64,8 +71,34 @@ pub fn show(owner: HWND, text: &str) {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let radius = (16.0 * scale) as i32;
         SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), true);
+        // Hemen çizilir (kuyruk doluyken WM_PAINT gecikebilir).
         let _ = InvalidateRect(hwnd, None, false);
+        let _ = UpdateWindow(hwnd);
         SetTimer(hwnd, TIMER_HIDE, VISIBLE_MS, None);
+    }
+}
+
+/// Süresi dolduysa gizler (zamanlayıcı gecikse de; fare iletileri arasında çağrılır).
+pub fn expire() {
+    let due = TOAST.with(|t| {
+        t.try_borrow().ok().and_then(|t| t.as_ref().and_then(|x| x.until.filter(|u| Instant::now() >= *u).map(|_| x.hwnd)))
+    });
+    if let Some(hwnd) = due {
+        hide(hwnd);
+    }
+}
+
+fn hide(hwnd: HWND) {
+    TOAST.with(|t| {
+        if let Ok(mut t) = t.try_borrow_mut() {
+            if let Some(x) = t.as_mut() {
+                x.until = None;
+            }
+        }
+    });
+    unsafe {
+        let _ = KillTimer(hwnd, TIMER_HIDE);
+        let _ = ShowWindow(hwnd, SW_HIDE);
     }
 }
 
@@ -102,7 +135,8 @@ unsafe fn ensure_window(owner: HWND) -> HWND {
     };
     RegisterClassExW(&wc);
     let Ok(hwnd) = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        // Katmanlı + saydam: tıklamalar her zaman alttaki pencereye geçer.
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
         CLASS,
         w!(""),
         WS_POPUP,
@@ -117,15 +151,15 @@ unsafe fn ensure_window(owner: HWND) -> HWND {
     ) else {
         return HWND::default();
     };
-    TOAST.with(|t| *t.borrow_mut() = Some(Toast { hwnd, text: String::new(), font: HFONT::default() }));
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    TOAST.with(|t| *t.borrow_mut() = Some(Toast { hwnd, text: String::new(), font: HFONT::default(), until: None }));
     hwnd
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER | WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
-            let _ = KillTimer(hwnd, TIMER_HIDE);
-            let _ = ShowWindow(hwnd, SW_HIDE);
+        WM_TIMER => {
+            hide(hwnd);
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),

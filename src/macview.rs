@@ -750,6 +750,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         WM_INPUT => {
+            toast::expire();
             // Fare kilitliyken ham hareket (ivmesiz, pencere kenarında durmayan) Mac'e göreli gider.
             let mut raw = RAWINPUT::default();
             let mut size = std::mem::size_of::<RAWINPUT>() as u32;
