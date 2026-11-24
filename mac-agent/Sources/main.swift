@@ -43,6 +43,8 @@
 //   SCREEN_VIDEO [sıra][bayraklar][veri], boyut 0x0C SCREEN_SIZE [sıra][gen][yük]. 0x1F SCREEN [sıra]
 //   farenin hangi ekranda olduğu (0 ana ekran), 0x29 SCREEN_PAUSE [sıra][açık], 0x2A SCREEN_KEY [sıra].
 //   Mac → Windows 0x0F SCREEN_FAIL [sıra][etkin ekran sayısı]: Mac o ekranı etkinleştiremedi (çipin ekran sınırı).
+// - Görüntü kalitesi: Windows → Mac 0x2B QUALITY [0 normal | 1 2K | 2 4K]. Monitörsüz Mac'te ana ekran
+//   yedek sanal ekrana alınır: 2K = 2560×1440 masaüstü, 4K = Retina 3840×2160 (1920×1080 boyutunda).
 // - Tanı: Mac → Windows 0x0D LOG [metin] (Windows günlüğüne yazılır), 0x0E AGENT [sürüm u32] oturum başında.
 // - Pano: Mac → Windows 0x36 CLIP [tür: 1 metin UTF-8 | 2 BMP][veri]; Windows → Mac 0x27 CLIP
 //   [tür][bayraklar: 1 ilk, 2 son][parça] (64 KB sınırı yüzünden parçalı). Kopyalanınca gider;
@@ -65,7 +67,8 @@ import VideoToolbox
 
 let agentPort: UInt16 = 21130
 /// Görüntünün en uzun kenarı (bant genişliği ve gecikme dengesi).
-let maxVideoSide = 1920
+/// Akışın uzun kenarı en çok (kalite ayarıyla 3840'a çıkar).
+var maxVideoSide = 1920
 
 // MARK: - Yardımcılar
 
@@ -451,7 +454,9 @@ final class Capturer: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,
                              value: lowLatency != nil ? kVTProfileLevel_H264_ConstrainedHigh_AutoLevel : kVTProfileLevel_H264_Main_AutoLevel)
-        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: 15_000_000))
+        // 1080p için 15 Mbit/sn; daha büyük görüntüde alanla orantılı (4K'da 40 Mbit/sn'de durur).
+        let rate = min(40_000_000, max(15_000_000, 15_000_000 * width * height / (1920 * 1080)))
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: rate))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 60))
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: 600))
         VTCompressionSessionPrepareToEncodeFrames(s)
@@ -1074,6 +1079,10 @@ enum MainKeeper {
     /// Ek ekranların yeri (ana ekrana göre) ve ana ekranların sağına konan görünmez ekranlar.
     static var origins: [CGDirectDisplayID: CGPoint] = [:]
     static var hidden: Set<CGDirectDisplayID> = []
+    /// Kalite ayarının istediği ana ekran kipi (nil: özgün boyut, Retina'sız).
+    typealias Mode = (pixels: (Int, Int), hiDPI: Bool)
+    static var preferred: Mode?
+    private static var originalSize = (1920, 1080)
 
     private static var pending = false
     /// Bizim sanal ekranlarımızın üretici numarası ("AY").
@@ -1101,12 +1110,29 @@ enum MainKeeper {
         }
         let mode = CGDisplayCopyDisplayMode(original)
         let size = (mode?.width ?? 1920, mode?.height ?? 1080)
-        // 96 dpi: bir piksel yaklaşık 0,26 mm.
-        standIn = PhoneMirror.makeDisplay(name: "Ayna Mac", product: 2, pixels: size, hiDPI: false,
-                                          millimeters: CGSize(width: Double(size.0) * 0.26, height: Double(size.1) * 0.26))
+        originalSize = size
+        let want: Mode = preferred ?? (pixels: size, hiDPI: false)
+        // 96 dpi: bir piksel yaklaşık 0,26 mm. Kip sonradan 4K'ya kadar değiştirilebilsin.
+        standIn = PhoneMirror.makeDisplay(name: "Ayna Mac", product: 2, pixels: want.pixels, hiDPI: want.hiDPI,
+                                          millimeters: CGSize(width: Double(size.0) * 0.26, height: Double(size.1) * 0.26),
+                                          maxPixels: (3840, 2160))
         if standIn == nil { settled = true }
         return true
     }
+
+    /// Yedek ekran açıksa istenen kipe geçer (pencereler yerinde kalır, yalnız çözünürlük değişir).
+    @discardableResult
+    static func applyMode() -> Bool {
+        guard let standIn else { return true }
+        let mode: Mode = preferred ?? (pixels: originalSize, hiDPI: false)
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = mode.hiDPI ? 1 : 0
+        settings.modes = [CGVirtualDisplayMode(width: UInt32(mode.pixels.0), height: UInt32(mode.pixels.1), refreshRate: 60)]
+        return standIn.apply(settings)
+    }
+
+    /// Yedeği bırakan son kullanıcı değilse (başkası da tutuyorsa) true.
+    static var shared: Bool { users > 1 }
 
     static func release() {
         guard users > 0 else { return }
@@ -1426,7 +1452,7 @@ final class PhoneMirror {
 
     /// 900×1000 noktalık Retina sanal ekran (iPhone penceresine yeter).
     static func makeDisplay(name: String, product: UInt32, pixels: (Int, Int), hiDPI: Bool,
-                                    millimeters: CGSize) -> CGVirtualDisplay? {
+                                    millimeters: CGSize, maxPixels: (Int, Int)? = nil) -> CGVirtualDisplay? {
         guard NSClassFromString("CGVirtualDisplay") != nil else { return nil }
         let descriptor = CGVirtualDisplayDescriptor()
         if descriptor.responds(to: NSSelectorFromString("setDispatchQueue:")) {
@@ -1437,8 +1463,8 @@ final class PhoneMirror {
             return nil
         }
         descriptor.name = name
-        descriptor.maxPixelsWide = UInt32(pixels.0)
-        descriptor.maxPixelsHigh = UInt32(pixels.1)
+        descriptor.maxPixelsWide = UInt32(max(pixels.0, maxPixels?.0 ?? 0))
+        descriptor.maxPixelsHigh = UInt32(max(pixels.1, maxPixels?.1 ?? 0))
         descriptor.sizeInMillimeters = millimeters
         descriptor.vendorID = 0x4159
         descriptor.productID = product
@@ -1582,6 +1608,10 @@ final class Session {
     private var screenAttempts: [UInt8: Int] = [:]
     /// Windows'un istediği ekran (henüz açılmamış olabilir: açılınca uygulanır).
     private var wantedMouse: UInt8 = 0
+    /// Görüntü kalitesi (0 normal, 1 2K, 2 4K) ve bunun için yedek ekran istendi mi.
+    private var quality: UInt8 = 0
+    private var qualityAcquired = false
+    private var qualityTimer: Timer?
     private var screenWaitLogged = false
     /// Etkinleşmediği için bırakılan ek ekranlar (yeni düzene dek yeniden denenmez).
     private var failedScreens: Set<UInt8> = []
@@ -2320,6 +2350,52 @@ final class Session {
 
     // --- Ek ekranlar
 
+    /// Görüntü kalitesi: monitörsüz Mac'te ana ekran istenen çözünürlükteki yedek ekrana alınır. Monitörlü
+    /// Mac'te (yedek kapatılır) yalnız akış sınırı değişir.
+    private func setQuality(_ value: UInt8) {
+        let q = min(value, 2)
+        guard q != quality else { return }
+        quality = q
+        maxVideoSide = q == 0 ? 1920 : 3840
+        switch q {
+        case 1: MainKeeper.preferred = (pixels: (2560, 1440), hiDPI: false)
+        case 2: MainKeeper.preferred = (pixels: (3840, 2160), hiDPI: true)
+        default: MainKeeper.preferred = nil
+        }
+        // Yedek yalnız bu ayar için açıksa ve normale dönülüyorsa birazdan kalkacak: kipi değiştirmeye gerek yok.
+        if q != 0 || MainKeeper.shared || !qualityAcquired {
+            if !MainKeeper.applyMode() { remoteLog("Görüntü kalitesi: ana ekran kipi değiştirilemedi") }
+        }
+        remoteLog("Görüntü kalitesi: \(["normal", "2K", "4K"][Int(q)])")
+        if q == 0 {
+            qualityTimer?.invalidate()
+            qualityTimer = nil
+            if qualityAcquired {
+                qualityAcquired = false
+                MainKeeper.release()
+            }
+            restartCapture()
+            return
+        }
+        guard !qualityAcquired else {
+            restartCapture()
+            return
+        }
+        qualityAcquired = true
+        MainKeeper.acquire()
+        // Yedek ekran hazır olunca (monitörsüz Mac'te ana ekran olur) yakalama yeni boyutla başlar.
+        qualityTimer?.invalidate()
+        let t = Timer(timeInterval: 0.2, repeats: true) { [weak self] timer in
+            guard MainKeeper.ready() else { return }
+            timer.invalidate()
+            self?.qualityTimer = nil
+            if MainKeeper.standIn == nil { self?.remoteLog("Görüntü kalitesi: Mac'te monitör var, ana ekran çözünürlüğü değişmedi") }
+            self?.restartCapture()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        qualityTimer = t
+    }
+
     /// Windows günlüğüne bir satır (ek ekranlar gibi Mac'te görünmeyen adımlar izlenebilsin).
     private func remoteLog(_ text: String) {
         send(Data([0x0D]) + Data(text.utf8))
@@ -2652,6 +2728,8 @@ final class Session {
             setPhoneTarget(mouse: b[1] == 1, keyboard: b[2] == 1)
         case 0x1C:
             phoneCapturer?.requestKeyframe()
+        case 0x2B where b.count >= 2:
+            setQuality(b[1])
         case 0x1E where b.count >= 2:
             setLayout(b)
         case 0x1F where b.count >= 2:
@@ -2894,6 +2972,15 @@ final class Session {
         wantedScreens = []
         for index in Array(screens.keys) { removeScreen(index) }
         applyScreens()
+        qualityTimer?.invalidate()
+        qualityTimer = nil
+        MainKeeper.preferred = nil
+        maxVideoSide = 1920
+        if qualityAcquired {
+            qualityAcquired = false
+            if MainKeeper.shared { MainKeeper.applyMode() }
+            MainKeeper.release()
+        }
         injector.releaseAll()
         sendQueue.async { [self] in filesCancelled = true }
         fileQueue.async { [self] in

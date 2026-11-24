@@ -92,6 +92,22 @@ const MSG_SCREEN_TARGET: u8 = 0x1F;
 /// Windows → Mac: ek ekran penceresi gizli [sıra][açık]; anahtar kare [sıra].
 const MSG_SCREEN_PAUSE: u8 = 0x29;
 const MSG_SCREEN_KEYFRAME: u8 = 0x2A;
+/// Windows → Mac: görüntü kalitesi [0 normal | 1 2K | 2 4K].
+const MSG_QUALITY: u8 = 0x2B;
+const QUALITY_SETTING: PCWSTR = w!("MacKalite");
+
+/// Ayarlardaki Mac görüntü kalitesi (0 normal, 1 2K, 2 4K).
+pub fn quality() -> u8 {
+    util::read_setting(QUALITY_SETTING).unwrap_or(0).min(2) as u8
+}
+
+pub fn quality_label(q: u8) -> &'static str {
+    match q {
+        1 => i18n::t("2K (2560×1440)", "2K (2560×1440)"),
+        2 => i18n::t("4K (Retina)", "4K (Retina)"),
+        _ => i18n::t("Normal (1080p)", "Normal (1080p)"),
+    }
+}
 /// Mac → Windows: ek ekranın görüntüsü [sıra][bayraklar][Annex-B] ve boyutu [sıra][gen][yük].
 const MSG_SCREEN_VIDEO: u8 = 0x0B;
 const MSG_SCREEN_SIZE: u8 = 0x0C;
@@ -654,6 +670,13 @@ impl Mac {
         }
     }
 
+    /// Ayarlardaki görüntü kalitesi değişti (sıradakine geçer).
+    pub fn cycle_quality(&self) {
+        let next = (quality() + 1) % 3;
+        util::write_setting(QUALITY_SETTING, next as u32);
+        self.send(vec![MSG_QUALITY, next]);
+    }
+
     /// Ayarlarda pano paylaşımı açıldı ya da kapandı.
     pub fn set_clipboard_enabled(&self, on: bool) {
         self.send(vec![MSG_CLIP_ENABLE, u8::from(on)]);
@@ -1153,6 +1176,10 @@ fn session(code: &str, shared: &Arc<Shared>, attempt: u32, notify: isize) -> Res
     }
     let _ = tx.send(vec![MSG_LOCAL_CURSOR]);
     let _ = tx.send(vec![MSG_CLIP_ENABLE, u8::from(crate::clipboard::enabled())]);
+    // Normalde gönderilmez (eski davranış); seçildiyse yeni oturumda da uygulanır.
+    if quality() != 0 {
+        let _ = tx.send(vec![MSG_QUALITY, quality()]);
+    }
     // Ek ekranlar: düzen ve pencere durumları yeni oturuma yinelenir.
     // Ek ekran yoksa (tek pencere / aynı ekran) hiçbir şey gönderilmez: eski davranışla aynı.
     let layout = shared.layout.lock().unwrap().clone();

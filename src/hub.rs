@@ -31,7 +31,7 @@ const W: f32 = 400.0;
 const PAD: f32 = 16.0;
 const TITLE_H: f32 = 56.0;
 const IPHONE_H: f32 = 142.0;
-const MAC_H: f32 = 196.0;
+const MAC_H: f32 = 242.0;
 const GENERAL_H: f32 = 270.0;
 const GAP: f32 = 12.0;
 
@@ -43,6 +43,7 @@ enum Ctl {
     MacSwitch,
     MacButton,
     Screens,
+    Quality,
     AutostartSwitch,
     ZoomSwitch,
     ClipSwitch,
@@ -268,6 +269,7 @@ struct Layout {
     mac_switch: [f32; 4],
     mac_button: [f32; 4],
     screens: [f32; 4],
+    quality: [f32; 4],
     general: [f32; 4],
     autostart_switch: [f32; 4],
     zoom_switch: [f32; 4],
@@ -292,6 +294,7 @@ fn layout(s: f32) -> Layout {
         mac_switch: sw(my + 18.0 * s),
         mac_button: [x0 + 16.0 * s, my + 78.0 * s, x1 - 16.0 * s, my + 112.0 * s],
         screens: [x1 - (16.0 + 140.0) * s, my + 154.0 * s, x1 - 16.0 * s, my + 182.0 * s],
+        quality: [x1 - (16.0 + 140.0) * s, my + 200.0 * s, x1 - 16.0 * s, my + 228.0 * s],
         general: [x0, gy, x1, gy + GENERAL_H * s],
         autostart_switch: sw(gy + 13.0 * s),
         zoom_switch: sw(gy + 67.0 * s),
@@ -318,6 +321,7 @@ enum Action {
     ToggleMac,
     MacButton,
     Screens,
+    Quality,
     Autostart,
     Zoom,
     Clip,
@@ -432,6 +436,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else {
                 macview::open();
             }
+            invalidate(hwnd);
+        }
+        Action::Quality => {
+            macview::with_mac(|m| m.cycle_quality());
             invalidate(hwnd);
         }
         Action::Screens => {
@@ -554,6 +562,7 @@ impl Hub {
             (Ctl::MacSwitch, l.mac_switch),
             (Ctl::MacButton, l.mac_button),
             (Ctl::Screens, l.screens),
+            (Ctl::Quality, l.quality),
             (Ctl::AutostartSwitch, l.autostart_switch),
             (Ctl::ZoomSwitch, l.zoom_switch),
             (Ctl::ClipSwitch, l.clip_switch),
@@ -629,6 +638,7 @@ impl Hub {
             Some(Ctl::MacSwitch) => Action::ToggleMac,
             Some(Ctl::MacButton) => Action::MacButton,
             Some(Ctl::Screens) => Action::Screens,
+            Some(Ctl::Quality) => Action::Quality,
             Some(Ctl::AutostartSwitch) => Action::Autostart,
             Some(Ctl::ZoomSwitch) => Action::Zoom,
             Some(Ctl::ClipSwitch) => Action::Clip,
@@ -704,7 +714,7 @@ impl Hub {
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 108.0 * s, p.separator, s);
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 162.0 * s, p.separator, s);
             separator(&mut c, gb[0] + 16.0 * s, gb[2], gb[1] + 216.0 * s, p.separator, s);
-            let mut buttons = vec![(Ctl::Language, l.language), (Ctl::Screens, l.screens)];
+            let mut buttons = vec![(Ctl::Language, l.language), (Ctl::Screens, l.screens), (Ctl::Quality, l.quality)];
             if update::build() > 0 {
                 buttons.push((Ctl::Update, l.update));
             }
@@ -748,6 +758,8 @@ impl Hub {
 
                 text(mem, f.body, p.text, t("Ekranlar", "Screens"), [mb[0] + 16.0 * s, mb[1] + 155.0 * s, mb[2] - 160.0 * s, mb[1] + 181.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, crate::macscreens::mode_label(crate::macscreens::mode()), l.screens, DT_CENTER);
+                text(mem, f.body, p.text, t("Görüntü kalitesi", "Picture quality"), [mb[0] + 16.0 * s, mb[1] + 201.0 * s, mb[2] - 160.0 * s, mb[1] + 227.0 * s], DT_LEFT);
+                text(mem, f.body, p.text, crate::mac::quality_label(crate::mac::quality()), l.quality, DT_CENTER);
                 text(mem, f.body, p.text, t("Windows ile başlat", "Start with Windows"), [gb[0] + 16.0 * s, gb[1] + 14.0 * s, gb[2] - 80.0 * s, gb[1] + 40.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, t("Dil", "Language"), [gb[0] + 16.0 * s, gb[1] + 122.0 * s, gb[2] - 140.0 * s, gb[1] + 148.0 * s], DT_LEFT);
                 text(mem, f.body, p.text, t("Mac ile pano paylaşımı", "Share clipboard with Mac"), [gb[0] + 16.0 * s, gb[1] + 230.0 * s, gb[2] - 80.0 * s, gb[1] + 256.0 * s], DT_LEFT);
